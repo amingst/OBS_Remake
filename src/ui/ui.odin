@@ -34,7 +34,7 @@ draw :: proc(state: ^State, clear_color: ^im.Vec4) {
     draw_controls(&state.controls)
 }
 
-init :: proc() -> State {
+init_state :: proc() -> State {
     return State{
         show_demo = false,
         scenes = init_scenes_state(),
@@ -43,4 +43,9 @@ init :: proc() -> State {
         mixer = init_mixer_state(),
         controls = init_controls_state()
     }
+}
+
+destroy :: proc(state: ^State) {
+    destroy_scenes(&state.scenes)
+    // future panels' destroyers go here
 }

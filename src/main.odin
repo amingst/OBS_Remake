@@ -83,9 +83,9 @@ main :: proc() {
 	//io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf")
 
 	// Our state
-    ui_state := ui.init()
+    ui_state := ui.init_state()
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
-
+    defer ui.destroy(&ui_state)
 
     done := false
 	// Main loop
@@ -138,6 +138,7 @@ main :: proc() {
 		// Present
 		hr := win.swap_chain->Present(1, {}) // Present with vsync
 		//hr := win.swap_chain->Present(0, {}) // Present without vsync
+        free_all(context.temp_allocator)
 		win.swap_chain_occluded = (hr == dxgi.STATUS_OCCLUDED)
 	}
 }
