@@ -1,0 +1,1 @@
+odin build src -out:build/app.exe -collection:libs=libs
