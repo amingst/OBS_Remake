@@ -8,7 +8,7 @@ import imdx11  "libs:odin-imgui/backends/dx11"
 
 // Import from platform module
 import "platform"
-
+import "ui"
 
 main :: proc() {
 	// Make process DPI aware and obtain main monitor scale
@@ -83,9 +83,9 @@ main :: proc() {
 	//io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf")
 
 	// Our state
-	show_demo_window := true
-	show_another_window := false
+    ui_state := ui.init()
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
+
 
     done := false
 	// Main loop
@@ -115,45 +115,7 @@ main :: proc() {
 		imwin32.NewFrame()
 		im.NewFrame()
 
-		// 1. Show the big demo window
-		if show_demo_window {
-			im.ShowDemoWindow(&show_demo_window)
-		}
-
-		// 2. Show a simple window that we create ourselves.
-		{
-			@static f: f32
-			@static counter: i32
-
-			im.Begin("Hello, world!")
-
-			im.Text("This is some useful text.")
-			im.Checkbox("Demo Window", &show_demo_window)
-			im.Checkbox("Another Window", &show_another_window)
-
-			im.SliderFloat("float", &f, 0.0, 1.0)
-			im.ColorEdit3("clear color", cast(^[3]f32)&clear_color)
-
-			if im.Button("Button") {
-				counter += 1
-			}
-			im.SameLine()
-			im.Text("counter = %d", counter)
-
-			im.Text("Application average %.3f ms/frame (%.1f FPS)",
-				1000.0 / io.Framerate, io.Framerate)
-			im.End()
-		}
-
-		// 3. Show another simple window.
-		if show_another_window {
-			im.Begin("Another Window", &show_another_window)
-			im.Text("Hello from another window!")
-			if im.Button("Close Me") {
-				show_another_window = false
-			}
-			im.End()
-		}
+        ui.draw(&ui_state, &clear_color)
 
 		// Rendering
 		im.Render()
