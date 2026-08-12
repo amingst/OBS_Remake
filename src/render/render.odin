@@ -10,6 +10,11 @@ Target :: struct {
     width, height: u32,
 }
 
+Quad :: struct {
+    x, y, w, h: f32,
+    color:      [4]f32,
+}
+
 create_target :: proc(device: ^d3d11.IDevice, w, h: u32) -> (Target, bool) {
     desc := d3d11.TEXTURE2D_DESC{
         Width      = w,
@@ -65,7 +70,7 @@ destroy_target :: proc(target: ^Target) {
 
 @(private) _draw_scene_warned := false
 
-draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, clear: [4]f32) {
+draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, pipeline: ^Pipeline, quads: []Quad, clear: [4]f32) {
     if ctx == nil || target == nil || target.rtv == nil {
         if !_draw_scene_warned {
             log.error("draw_scene: skipping draw (nil context, target, or rtv)")
@@ -78,4 +83,45 @@ draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, clear: [4]f32) {
     color := clear
     ctx->OMSetRenderTargets(1, &target.rtv, nil)
     ctx->ClearRenderTargetView(target.rtv, &color)
+
+    vp := d3d11.VIEWPORT{
+        Width    = f32(target.width),
+        Height   = f32(target.height),
+        MinDepth = 0,
+        MaxDepth = 1,
+    }
+    ctx->RSSetViewports(1, &vp)
+
+    ctx->IASetInputLayout(pipeline.input_layout)
+    stride := u32(size_of([2]f32))
+    offset := u32(0)
+    ctx->IASetVertexBuffers(0, 1, &pipeline.vertex_buffer, &stride, &offset)
+    ctx->IASetPrimitiveTopology(.TRIANGLESTRIP)
+    ctx->VSSetShader(pipeline.vs, nil, 0)
+    ctx->PSSetShader(pipeline.ps, nil, 0)
+    ctx->VSSetConstantBuffers(0, 1, &pipeline.const_buffer)
+    ctx->PSSetConstantBuffers(0, 1, &pipeline.const_buffer)
+    blend_factor := [4]f32{0, 0, 0, 0}
+    ctx->OMSetBlendState(pipeline.blend_state, &blend_factor, 0xFFFFFFFF)
+
+    W := f32(target.width)
+    H := f32(target.height)
+
+    for quad in quads {
+        // log.debugf("quad x=%v y=%v w=%v h=%v color=%v", quad.x, quad.y, quad.w, quad.h, quad.color)
+        consts := Quad_Constants{
+            scale  = { 2 * quad.w / W, -2 * quad.h / H },
+            offset = { 2 * quad.x / W - 1, 1 - 2 * quad.y / H },
+            color  = quad.color,
+        }
+
+        mapped: d3d11.MAPPED_SUBRESOURCE
+        if hr := ctx->Map(pipeline.const_buffer, 0, .WRITE_DISCARD, {}, &mapped); hr != 0 {
+            continue
+        }
+        (^Quad_Constants)(mapped.pData)^ = consts
+        ctx->Unmap(pipeline.const_buffer, 0)
+
+        ctx->Draw(4, 0)
+    }
 }

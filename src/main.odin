@@ -71,6 +71,10 @@ main :: proc() {
 	}
 	defer render.destroy_target(&preview_target)
 
+	pipeline, pok := render.create_pipeline(win.device)
+	if !pok do return
+	defer render.destroy_pipeline(&pipeline)
+
 	// Show the window
 	win32.ShowWindow(win.hwnd, win32.SW_SHOWDEFAULT)
 	win32.UpdateWindow(win.hwnd)
@@ -195,8 +199,18 @@ main :: proc() {
 		// starts. Render targets are global context state, and the code below
 		// rebinds the swap chain's RTV before RenderDrawData -- so doing this
 		// first means our binding here is harmlessly replaced rather than
-		// clobbering ImGui's.
-		render.draw_scene(win.device_context, &preview_target, scene_clear)
+		// clobbering ImGui's.quads := make([dynamic]render.Quad, context.temp_allocator)
+		quads := make([dynamic]render.Quad, context.temp_allocator)
+		if scene := ui.find_scene(&ui_state.scenes, ui_state.scenes.selected_id); scene != nil {
+			for src in scene.sources {
+				if !src.visible do continue
+				append(&quads, render.Quad{
+					x = src.x, y = src.y, w = src.w, h = src.h,
+					color = src.color,
+				})
+			}
+		}
+		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 
 		// Start the Dear ImGui frame
 		imdx11.NewFrame()

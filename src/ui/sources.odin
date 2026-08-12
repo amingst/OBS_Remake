@@ -39,8 +39,13 @@ draw_sources :: proc(state: ^Sources_State, scenes: ^Scenes_State) {
                         id := alloc_id(scenes)
                         append(&scene.sources, Source{
                             id      = id,
-                            name    = strings.clone(name), // owned by the Source
+                            name    = strings.clone(name),
                             visible = true,
+                            x       = 100,
+                            y       = 100,
+                            w       = 400,
+                            h       = 300,
+                            color   = {0.9, 0.3, 0.2, 1.0},
                         })
                         log.debugf("source added: id=%v name=%q scene=%v", id, name, scene.id)
                         state.selected_id = id
@@ -73,6 +78,16 @@ draw_sources :: proc(state: ^Sources_State, scenes: ^Scenes_State) {
                     state.selected_id = src.id
                 }
 
+                // in draw_sources, after the list, when a source is selected
+                if src := find_source(scene, state.selected_id); src != nil {
+                    im.Separator()
+                    im.DragFloat("X", &src.x)
+                    im.DragFloat("Y", &src.y)
+                    im.DragFloat("W", &src.w)
+                    im.DragFloat("H", &src.h)
+                    im.ColorEdit4("Color", &src.color)
+                }
+
                 if im.BeginPopupContextItem() {
                     if im.MenuItem("Delete") {
                         to_delete = i
@@ -92,6 +107,16 @@ draw_sources :: proc(state: ^Sources_State, scenes: ^Scenes_State) {
     im.End()
 }
 
+find_source :: proc(scene: ^Scene, id: u64) -> ^Source {
+    for &src in scene.sources {
+        if src.id == id {
+            return &src
+        }
+    }
+
+    return nil
+}
+
 // Private Helpers
 @(private="file")
 remove_source :: proc(state: ^Sources_State, scene: ^Scene, index: int) {
@@ -107,3 +132,4 @@ remove_source :: proc(state: ^Sources_State, scene: ^Scene, index: int) {
         }
     }
 }
+

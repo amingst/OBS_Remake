@@ -4,12 +4,21 @@ import "core:log"
 import "core:strings"
 import im "libs:odin-imgui"
 
-Source :: struct {
-    id:      u64,
-    name:    string, // owned; cloned on create, deleted on remove
-    visible: bool,
+Source_Kind :: enum {
+    Color,
+    Text,
+    Image,
 }
 
+Source :: struct {
+    id:      u64,
+    name:    string,
+    kind:    Source_Kind,
+    visible: bool,
+    x, y:    f32,
+    w, h:    f32,
+    color:   [4]f32,
+}
 Scene :: struct {
     id:      u64,
     name:    string, // owned; cloned on create, deleted on remove
