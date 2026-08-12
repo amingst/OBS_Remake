@@ -1,5 +1,6 @@
 package ui
 
+import "core:log"
 import im "libs:odin-imgui"
 
 State :: struct {
@@ -46,7 +47,7 @@ init_state :: proc() -> State {
 }
 
 destroy :: proc(state: ^State) {
-    // TODO(log): .Debug UI state torn down (scene count) -- pairs with init_state for leak triage.
+    log.debugf("UI state torn down (%v scenes)", len(state.scenes.scenes))
     destroy_scenes(&state.scenes)
     // future panels' destroyers go here
 }

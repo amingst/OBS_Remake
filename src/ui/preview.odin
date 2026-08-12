@@ -1,9 +1,10 @@
 package ui
 
+import "core:log"
 import im "libs:odin-imgui"
 
 Preview_State :: struct {
-
+    logged_collapsed: bool,
 }
 
 init_preview_state :: proc() -> Preview_State {
@@ -17,8 +18,11 @@ draw_preview :: proc(state: ^Preview_State, tex: im.TextureRef) {
     if im.Begin("Preview") {
         avail := im.GetContentRegionAvail()
 
-        // TODO(log): .Warning RATE-LIMITED -- silent per-frame skip when the panel is collapsed; needs log-once state in Preview_State (SIGNATURE).
         if avail.x > 0 && avail.y > 0 {
+            if state.logged_collapsed {
+                log.debug("preview panel visible again")
+                state.logged_collapsed = false
+            }
             size := im.Vec2{avail.x, avail.x / PREVIEW_ASPECT}
             if size.y > avail.y {
                 size = {avail.y * PREVIEW_ASPECT, avail.y}
@@ -31,6 +35,9 @@ draw_preview :: proc(state: ^Preview_State, tex: im.TextureRef) {
             })
 
             im.Image(tex, size)
+        } else if !state.logged_collapsed {
+            log.warn("preview panel collapsed or too small to render")
+            state.logged_collapsed = true
         }
     }
     im.End()

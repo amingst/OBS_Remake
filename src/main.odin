@@ -3,6 +3,7 @@ package obs_remake
 // @(require) keeps these imports legal under -vet in non-debug builds, where the
 // `when ODIN_DEBUG` block below compiles away and nothing references them.
 @(require) import "core:fmt"
+import "core:log"
 @(require) import "core:mem"
 import win32 "core:sys/windows"
 import "vendor:directx/dxgi"
@@ -40,6 +41,14 @@ main :: proc() {
 		}
 	}
 
+	// Set up logging -- console logger to stderr, debug level in debug builds.
+	when ODIN_DEBUG {
+		context.logger = log.create_console_logger(.Debug)
+	} else {
+		context.logger = log.create_console_logger(.Info)
+	}
+	defer log.destroy_console_logger(context.logger)
+
 	// Make process DPI aware and obtain main monitor scale
 	imwin32.EnableDpiAwareness()
 	main_scale := imwin32.GetDpiScaleForMonitor(
@@ -47,7 +56,7 @@ main :: proc() {
 
     win: platform.Window
     if (!platform.create_window(&win, "OBS Remake", 1280, 800)) {
-        // TODO(log): .Fatal window/device creation failed, exiting -- currently a bare `return` with no output.
+        log.fatal("window/device creation failed, exiting")
         return
     }
     defer platform.destroy_window(&win)
@@ -57,7 +66,7 @@ main :: proc() {
 	// create_window because it needs win.device.
 	preview_target, target_ok := render.create_target(win.device, 1920, 1080)
 	if !target_ok {
-		// TODO(log): .Fatal preview target creation failed, exiting -- bare `return`, cause logged in render.create_target.
+		log.fatal("preview target creation failed, exiting (cause logged above)")
 		return
 	}
 	defer render.destroy_target(&preview_target)
@@ -68,9 +77,12 @@ main :: proc() {
 
 	// Setup Dear ImGui context
 	im.CHECKVERSION()
-	// TODO(log): .Debug ImGui context created / destroyed (pair with the defer below).
 	im.CreateContext()
-	defer im.DestroyContext()
+	log.debug("ImGui context created")
+	defer {
+		im.DestroyContext()
+		log.debug("ImGui context destroyed")
+	}
 
 	io := im.GetIO()
 	io.ConfigFlags |= {
@@ -108,13 +120,17 @@ main :: proc() {
 	}
 
 	// Setup Platform/Renderer backends
-	// TODO(log): .Fatal imwin32.Init returns bool and it is discarded -- a false here means no input, silently.
-	imwin32.Init(win.hwnd)
+	if !imwin32.Init(win.hwnd) {
+		log.fatal("ImGui Win32 backend initialization failed")
+		return
+	}
 	defer imwin32.Shutdown()
-	// TODO(log): .Fatal imdx11.Init returns bool and it is discarded -- a false here means nothing ever renders.
-	imdx11.Init(win.device, win.device_context)
+	if !imdx11.Init(win.device, win.device_context) {
+		log.fatal("ImGui DirectX11 backend initialization failed")
+		return
+	}
 	defer imdx11.Shutdown()
-	// TODO(log): .Debug backends initialised (one .Info line with device + backend versions is worth it at startup).
+	log.info("ImGui backends initialised")
 
 	// Load Fonts
 	// - If fonts are not explicitly loaded, Dear ImGui will select an embedded
@@ -131,6 +147,7 @@ main :: proc() {
     defer ui.destroy(&ui_state)
 
     done := false
+	was_occluded := false
 	// Main loop
 	for !done {
 		// Poll and handle messages (inputs, window resize, etc.)
@@ -139,20 +156,27 @@ main :: proc() {
         }
 
 		// Handle window being minimized or screen locked
-		// TODO(log): .Debug RATE-LIMITED -- this spins every 10ms while occluded; log only on the false->true edge.
 		if win.swap_chain_occluded && win.swap_chain->Present(0, {.TEST}) == dxgi.STATUS_OCCLUDED {
+			if !was_occluded {
+				log.debug("swap chain occluded, throttling to 10ms poll")
+				was_occluded = true
+			}
 			win32.Sleep(10)
 			continue
 		}
-		// TODO(log): .Debug occlusion cleared -- only when this actually flips true->false, not every frame.
+		if was_occluded {
+			log.debug("occlusion cleared, resuming rendering")
+			was_occluded = false
+		}
 		win.swap_chain_occluded = false
 
 		// Handle window resize (we don't resize directly in the WM_SIZE handler)
 		if win.resize_width != 0 && win.resize_height != 0 {
-			// TODO(log): .Debug swapchain resize w x h -- fires once per settled resize, safe unthrottled.
+			log.debugf("swapchain resize %vx%v", win.resize_width, win.resize_height)
 			platform.cleanup_render_target(&win)
-			// TODO(log): .Error ResizeBuffers HRESULT is discarded entirely -- DEVICE_REMOVED surfaces here first during capture.
-			win.swap_chain->ResizeBuffers(0, win.resize_width, win.resize_height, .UNKNOWN, {})
+			if hr := win.swap_chain->ResizeBuffers(0, win.resize_width, win.resize_height, .UNKNOWN, {}); hr < 0 {
+				log.errorf("ResizeBuffers failed: HRESULT 0x%08X", u32(hr))
+			}
 			win.resize_width, win.resize_height = 0, 0
 			platform.create_render_target(&win)
 		}
@@ -206,11 +230,12 @@ main :: proc() {
 		}
 
 		// Present
-		// TODO(log): .Error RATE-LIMITED -- log only when hr is a real failure (DEVICE_REMOVED/DEVICE_RESET), never on the OK path.
 		hr := win.swap_chain->Present(1, {}) // Present with vsync
 		//hr := win.swap_chain->Present(0, {}) // Present without vsync
         free_all(context.temp_allocator)
-		// TODO(log): .Debug occlusion entered -- only on the false->true edge; see the RATE-LIMITED note at the top of the loop.
+		if hr < 0 && hr != dxgi.STATUS_OCCLUDED {
+			log.errorf("Present failed: HRESULT 0x%08X", u32(hr))
+		}
 		win.swap_chain_occluded = (hr == dxgi.STATUS_OCCLUDED)
 	}
 }

@@ -1,6 +1,6 @@
 package render
 
-import "core:fmt"
+import "core:log"
 import "vendor:directx/d3d11"
 
 Target :: struct {
@@ -25,33 +25,30 @@ create_target :: proc(device: ^d3d11.IDevice, w, h: u32) -> (Target, bool) {
     target := Target{width = w, height = h}
 
     if hr := device->CreateTexture2D(&desc, nil, &target.texture); hr != 0 {
-        // TODO(log): .Error replace this eprintfln -- include w/h/format/BindFlags; this is where capture-size changes will fail on other GPUs.
-        fmt.eprintfln("render: CreateTexture2D(%v x %v) failed: HRESULT 0x%08X", w, h, u32(hr))
+        log.errorf("CreateTexture2D(%vx%v, R8G8B8A8_UNORM, RENDER_TARGET|SHADER_RESOURCE) failed: HRESULT 0x%08X", w, h, u32(hr))
         destroy_target(&target)
         return {}, false
     }
 
     if hr := device->CreateRenderTargetView((^d3d11.IResource)(target.texture), nil, &target.rtv); hr != 0 {
-        // TODO(log): .Error replace this eprintfln -- usually means BindFlags lost .RENDER_TARGET.
-        fmt.eprintfln("render: CreateRenderTargetView failed: HRESULT 0x%08X", u32(hr))
+        log.errorf("CreateRenderTargetView failed: HRESULT 0x%08X (BindFlags may be missing RENDER_TARGET)", u32(hr))
         destroy_target(&target)
         return {}, false
     }
 
     if hr := device->CreateShaderResourceView((^d3d11.IResource)(target.texture), nil, &target.srv); hr != 0 {
-        // TODO(log): .Error replace this eprintfln -- usually means BindFlags lost .SHADER_RESOURCE.
-        fmt.eprintfln("render: CreateShaderResourceView failed: HRESULT 0x%08X", u32(hr))
+        log.errorf("CreateShaderResourceView failed: HRESULT 0x%08X (BindFlags may be missing SHADER_RESOURCE)", u32(hr))
         destroy_target(&target)
         return {}, false
     }
 
-    // TODO(log): .Info render target created (w x h, format) -- one-time, worth having in every log.
+    log.infof("render target created: %vx%v R8G8B8A8_UNORM", w, h)
     return target, true
 }
 
 destroy_target :: proc(target: ^Target) {
     if target == nil { return }
-    // TODO(log): .Debug releasing target (w x h); will fire per-recreation once capture resizes targets.
+    log.debugf("releasing render target (%vx%v)", target.width, target.height)
     if target.srv != nil {
         target.srv->Release()
         target.srv = nil
@@ -66,9 +63,17 @@ destroy_target :: proc(target: ^Target) {
     }
 }
 
+@(private) _draw_scene_warned := false
+
 draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, clear: [4]f32) {
-    // TODO(log): .Error RATE-LIMITED -- silent per-frame bail; needs a log-once-per-state-change guard, which means state somewhere (Target field or package global).
-    if ctx == nil || target == nil || target.rtv == nil { return }
+    if ctx == nil || target == nil || target.rtv == nil {
+        if !_draw_scene_warned {
+            log.error("draw_scene: skipping draw (nil context, target, or rtv)")
+            _draw_scene_warned = true
+        }
+        return
+    }
+    _draw_scene_warned = false
 
     color := clear
     ctx->OMSetRenderTargets(1, &target.rtv, nil)
