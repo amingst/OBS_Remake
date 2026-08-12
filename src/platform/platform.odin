@@ -1,6 +1,7 @@
 package platform
 
 import "base:runtime"
+import "core:fmt"
 import win32 "core:sys/windows"
 import "vendor:directx/d3d11"
 import "vendor:directx/dxgi"
@@ -78,10 +79,6 @@ present :: proc(win: ^Window) {
 
 // Helper functions
 create_device_d3d :: proc(win: ^Window) -> bool {
-	
-	// Setup swap chain
-	// This is a basic setup. Optimally could use e.g. DXGI_SWAP_EFFECT_FLIP_DISCARD
-	// and handle fullscreen mode differently. See imgui #8979 for suggestions.
 	sd := dxgi.SWAP_CHAIN_DESC{
 		BufferCount = 2,
 		BufferDesc = {
@@ -99,7 +96,7 @@ create_device_d3d :: proc(win: ^Window) -> bool {
 	}
 
 	create_device_flags: d3d11.CREATE_DEVICE_FLAGS
-	//create_device_flags += {.DEBUG}
+	when ODIN_DEBUG do create_device_flags += {.DEBUG}
 	feature_level: d3d11.FEATURE_LEVEL
 	feature_level_array := [2]d3d11.FEATURE_LEVEL{._11_0, ._10_0}
 
@@ -113,17 +110,27 @@ create_device_d3d :: proc(win: ^Window) -> bool {
 			&feature_level_array[0], 2, d3d11.SDK_VERSION,
 			&sd, &win.swap_chain, &win.device, &feature_level, &win.device_context)
 	}
+	when ODIN_DEBUG {
+		if res != 0 && .DEBUG in create_device_flags {
+			fmt.eprintln("D3D11 debug layer unavailable (install the Windows 'Graphics Tools' optional feature); retrying without it")
+			create_device_flags -= {.DEBUG}
+			res = d3d11.CreateDeviceAndSwapChain(
+				nil, .HARDWARE, nil, create_device_flags,
+				&feature_level_array[0], 2, d3d11.SDK_VERSION,
+				&sd, &win.swap_chain, &win.device, &feature_level, &win.device_context)
+			if res == dxgi.ERROR_UNSUPPORTED {
+				res = d3d11.CreateDeviceAndSwapChain(
+					nil, .WARP, nil, create_device_flags,
+					&feature_level_array[0], 2, d3d11.SDK_VERSION,
+					&sd, &win.swap_chain, &win.device, &feature_level, &win.device_context)
+			}
+		}
+	}
 	if res != 0 {
+		fmt.eprintfln("D3D11 device/swap chain creation failed: HRESULT 0x%08X", u32(res))
 		return false
 	}
 
-	// Disable DXGI's default Alt+Enter fullscreen behavior.
-	//
-	// - You are free to leave this enabled, but it will not work properly with
-	//   multiple viewports.
-	// - This must be done for all windows associated to the device. Our DX11
-	//   backend does this automatically for secondary viewports that it
-	//   creates.
 	pSwapChainFactory: ^dxgi.IFactory
 	if id := win.swap_chain->GetParent(dxgi.IFactory_UUID, (^rawptr)(&pSwapChainFactory)); id >= 0 {
 		pSwapChainFactory->MakeWindowAssociation(dxgi.HWND(win.hwnd), {.NO_ALT_ENTER})
@@ -165,9 +172,6 @@ cleanup_render_target :: proc(win: ^Window) {
 	}
 }
 
-// Win32 message handler
-// You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if
-// dear imgui wants to use your inputs.
 wnd_proc :: proc "system" (
 	hwnd: win32.HWND,
 	msg: win32.UINT,

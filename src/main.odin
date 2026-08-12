@@ -1,5 +1,9 @@
 package obs_remake
 
+// @(require) keeps these imports legal under -vet in non-debug builds, where the
+// `when ODIN_DEBUG` block below compiles away and nothing references them.
+@(require) import "core:fmt"
+@(require) import "core:mem"
 import win32 "core:sys/windows"
 import "vendor:directx/dxgi"
 import im      "libs:odin-imgui"
@@ -8,9 +12,34 @@ import imdx11  "libs:odin-imgui/backends/dx11"
 
 // Import from platform module
 import "platform"
+import "render"
 import "ui"
 
 main :: proc() {
+	// Wrap the heap allocator so we get a leak/bad-free report at exit.
+	// Registered first, so its `defer` runs last -- after every other `defer`
+	// below has had its chance to free.
+	when ODIN_DEBUG {
+		track: mem.Tracking_Allocator
+		mem.tracking_allocator_init(&track, context.allocator)
+		context.allocator = mem.tracking_allocator(&track)
+		defer {
+			if len(track.allocation_map) > 0 {
+				fmt.eprintfln("=== %v allocation(s) not freed: ===", len(track.allocation_map))
+				for _, entry in track.allocation_map {
+					fmt.eprintfln("  %v bytes @ %v", entry.size, entry.location)
+				}
+			}
+			if len(track.bad_free_array) > 0 {
+				fmt.eprintfln("=== %v bad free(s): ===", len(track.bad_free_array))
+				for entry in track.bad_free_array {
+					fmt.eprintfln("  %p @ %v", entry.memory, entry.location)
+				}
+			}
+			mem.tracking_allocator_destroy(&track)
+		}
+	}
+
 	// Make process DPI aware and obtain main monitor scale
 	imwin32.EnableDpiAwareness()
 	main_scale := imwin32.GetDpiScaleForMonitor(
@@ -22,6 +51,14 @@ main :: proc() {
     }
     defer platform.destroy_window(&win)
     win.msg_hook = imwin32.WndProcHandler
+
+	// Offscreen target the scene is composited into. Created after
+	// create_window because it needs win.device.
+	preview_target, target_ok := render.create_target(win.device, 1920, 1080)
+	if !target_ok {
+		return
+	}
+	defer render.destroy_target(&preview_target)
 
 	// Show the window
 	win32.ShowWindow(win.hwnd, win32.SW_SHOWDEFAULT)
@@ -110,12 +147,35 @@ main :: proc() {
 			platform.create_render_target(&win)
 		}
 
+		// Neutral fallback for "no scene selected" -- selected_id 0, or the
+		// selected scene was deleted. find_scene's pointer is invalidated by
+		// the next append to scenes, so copy the colour straight out instead of
+		// holding the pointer. Reads last frame's selection, since this runs
+		// before ui.draw; one frame of latency is invisible here.
+		scene_clear := [4]f32{0.10, 0.10, 0.12, 1.0}
+		if scene := ui.find_scene(&ui_state.scenes, ui_state.scenes.selected_id); scene != nil {
+			scene_clear = scene.color
+		}
+
+		// Composite the scene into the offscreen target before ImGui's frame
+		// starts. Render targets are global context state, and the code below
+		// rebinds the swap chain's RTV before RenderDrawData -- so doing this
+		// first means our binding here is harmlessly replaced rather than
+		// clobbering ImGui's.
+		render.draw_scene(win.device_context, &preview_target, scene_clear)
+
 		// Start the Dear ImGui frame
 		imdx11.NewFrame()
 		imwin32.NewFrame()
 		im.NewFrame()
 
-        ui.draw(&ui_state, &clear_color)
+        // This ImGui version identifies textures by ImTextureRef, not a raw
+        // pointer. im.TextureID is a u64, so the SRV goes pointer -> uintptr ->
+        // u64; wrapping it in a TextureRef with _TexData left nil means "this
+        // is an already-uploaded backend texture, use _TexID directly".
+        // Rebuilt each frame so it stays correct if the target is recreated.
+        preview_tex := im.TextureRef{_TexID = im.TextureID(uintptr(preview_target.srv))}
+        ui.draw(&ui_state, &clear_color, preview_tex)
 
 		// Rendering
 		im.Render()

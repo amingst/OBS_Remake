@@ -11,7 +11,7 @@ State :: struct {
     sources: Sources_State
 }
 
-draw :: proc(state: ^State, clear_color: ^im.Vec4) {
+draw :: proc(state: ^State, clear_color: ^im.Vec4, preview_tex: im.TextureRef) {
     im.DockSpaceOverViewport(0, im.GetMainViewport(), {.PassthruCentralNode}, nil)
 
     // TODO: Refactor this to a menubar.odin
@@ -27,9 +27,9 @@ draw :: proc(state: ^State, clear_color: ^im.Vec4) {
 
     if state.show_demo do im.ShowDemoWindow(&state.show_demo)
 
-    draw_preview(&state.preview)
+    draw_preview(&state.preview, preview_tex)
     draw_scenes(&state.scenes)
-    draw_sources(&state.sources)
+    draw_sources(&state.sources, &state.scenes)
     draw_mixer(&state.mixer)
     draw_controls(&state.controls)
 }
