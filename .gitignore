@@ -1,2 +1,4 @@
 build/
 imgui.ini
+libs/odin-imgui/build/
+libs/odin-imgui/imgui_windows_x64.lib
