@@ -46,6 +46,7 @@ init_state :: proc() -> State {
 }
 
 destroy :: proc(state: ^State) {
+    // TODO(log): .Debug UI state torn down (scene count) -- pairs with init_state for leak triage.
     destroy_scenes(&state.scenes)
     // future panels' destroyers go here
 }

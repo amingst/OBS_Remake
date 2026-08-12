@@ -25,12 +25,15 @@ draw_sources :: proc(state: ^Sources_State, scenes: ^Scenes_State) {
             if im.BeginPopupModal("Add Source") {
                 im.InputText("Name", cstring(&state.name_buf[0]), len(state.name_buf))
                 if im.Button("Add") {
+                    // TODO(log): FLAG bounds -- same 128-byte no-NUL truncation as scenes.odin, silent.
                     n := strings.index_byte(string(state.name_buf[:]), 0)
                     if n < 0 do n = len(state.name_buf)
                     name := string(state.name_buf[:n])
 
+                    // TODO(log): .Debug empty name rejected -- currently silent.
                     if len(name) > 0 {
                         id := alloc_id(scenes)
+                        // TODO(log): .Debug source added (id, name, owning scene id); FLAG allocation -- clone/append failures dropped.
                         append(&scene.sources, Source{
                             id      = id,
                             name    = strings.clone(name), // owned by the Source
@@ -88,6 +91,7 @@ draw_sources :: proc(state: ^Sources_State, scenes: ^Scenes_State) {
 // Private Helpers
 @(private="file")
 remove_source :: proc(state: ^Sources_State, scene: ^Scene, index: int) {
+    // TODO(log): .Debug source deleted (id, name) -- log before the delete below frees the name.
     removed_id := scene.sources[index].id
     delete(scene.sources[index].name)
     ordered_remove(&scene.sources, index)

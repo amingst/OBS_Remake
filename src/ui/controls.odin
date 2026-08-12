@@ -13,7 +13,7 @@ init_controls_state :: proc() -> Controls_State {
 }
 
 draw_controls :: proc(state: ^Controls_State) {
-    if im.Begin("Sources") {
+    if im.Begin("Controls") {
 
     }
     im.End()

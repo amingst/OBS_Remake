@@ -25,6 +25,7 @@ Scenes_State :: struct {
 }
 
 init_scenes_state :: proc() -> Scenes_State {
+    // TODO(log): FLAG allocation -- strings.clone and append below can fail; both errors are dropped, no diagnostic.
     state := Scenes_State{next_id = 1}
     id := alloc_id(&state)
     append(&state.scenes, Scene{
@@ -46,10 +47,12 @@ draw_scenes :: proc(state: ^Scenes_State) {
         if im.BeginPopupModal("Create Scene") {
             im.InputText("Name", cstring(&state.name_buf[0]), len(state.name_buf))
             if im.Button("Create") {
+                // TODO(log): FLAG bounds -- n < 0 means InputText filled all 128 bytes with no NUL; name is silently truncated.
                 n := strings.index_byte(string(state.name_buf[:]), 0)
                 if n < 0 do n = len(state.name_buf)
                 name := string(state.name_buf[:n])
 
+                // TODO(log): .Debug empty name rejected -- currently silent, the button just does nothing.
                 if len(name) > 0 {
                     id := alloc_id(state)
                     append(&state.scenes, Scene{
@@ -58,6 +61,7 @@ draw_scenes :: proc(state: ^Scenes_State) {
                         order = i32(len(state.scenes)),
                         color = scene_color(id),
                     })
+                    // TODO(log): .Debug scene created (id, name) -- user-driven, not frame-rate.
                     state.selected_id = id
                     state.name_buf = {}
                     im.CloseCurrentPopup()
@@ -139,6 +143,7 @@ SCENE_PALETTE := [?][4]f32{
 
 @(private="file")
 scene_color :: proc(id: u64) -> [4]f32 {
+    // TODO(log): FLAG bounds -- int(id) wraps negative if id ever exceeds max(int), giving a negative index. Unreachable in practice, undiagnosed if not.
     return SCENE_PALETTE[int(id) % len(SCENE_PALETTE)]
 }
 
@@ -154,6 +159,7 @@ destroy_scene :: proc(scene: ^Scene) {
 
 @(private="file")
 remove_scene :: proc(state: ^Scenes_State, index: int) {
+    // TODO(log): .Debug scene deleted (id, name, source count) -- log before destroy_scene frees the name.
     removed_id := state.scenes[index].id
     destroy_scene(&state.scenes[index])
     ordered_remove(&state.scenes, index)

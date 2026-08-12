@@ -47,6 +47,7 @@ main :: proc() {
 
     win: platform.Window
     if (!platform.create_window(&win, "OBS Remake", 1280, 800)) {
+        // TODO(log): .Fatal window/device creation failed, exiting -- currently a bare `return` with no output.
         return
     }
     defer platform.destroy_window(&win)
@@ -56,6 +57,7 @@ main :: proc() {
 	// create_window because it needs win.device.
 	preview_target, target_ok := render.create_target(win.device, 1920, 1080)
 	if !target_ok {
+		// TODO(log): .Fatal preview target creation failed, exiting -- bare `return`, cause logged in render.create_target.
 		return
 	}
 	defer render.destroy_target(&preview_target)
@@ -66,6 +68,7 @@ main :: proc() {
 
 	// Setup Dear ImGui context
 	im.CHECKVERSION()
+	// TODO(log): .Debug ImGui context created / destroyed (pair with the defer below).
 	im.CreateContext()
 	defer im.DestroyContext()
 
@@ -105,10 +108,13 @@ main :: proc() {
 	}
 
 	// Setup Platform/Renderer backends
+	// TODO(log): .Fatal imwin32.Init returns bool and it is discarded -- a false here means no input, silently.
 	imwin32.Init(win.hwnd)
 	defer imwin32.Shutdown()
+	// TODO(log): .Fatal imdx11.Init returns bool and it is discarded -- a false here means nothing ever renders.
 	imdx11.Init(win.device, win.device_context)
 	defer imdx11.Shutdown()
+	// TODO(log): .Debug backends initialised (one .Info line with device + backend versions is worth it at startup).
 
 	// Load Fonts
 	// - If fonts are not explicitly loaded, Dear ImGui will select an embedded
@@ -133,15 +139,19 @@ main :: proc() {
         }
 
 		// Handle window being minimized or screen locked
+		// TODO(log): .Debug RATE-LIMITED -- this spins every 10ms while occluded; log only on the false->true edge.
 		if win.swap_chain_occluded && win.swap_chain->Present(0, {.TEST}) == dxgi.STATUS_OCCLUDED {
 			win32.Sleep(10)
 			continue
 		}
+		// TODO(log): .Debug occlusion cleared -- only when this actually flips true->false, not every frame.
 		win.swap_chain_occluded = false
 
 		// Handle window resize (we don't resize directly in the WM_SIZE handler)
 		if win.resize_width != 0 && win.resize_height != 0 {
+			// TODO(log): .Debug swapchain resize w x h -- fires once per settled resize, safe unthrottled.
 			platform.cleanup_render_target(&win)
+			// TODO(log): .Error ResizeBuffers HRESULT is discarded entirely -- DEVICE_REMOVED surfaces here first during capture.
 			win.swap_chain->ResizeBuffers(0, win.resize_width, win.resize_height, .UNKNOWN, {})
 			win.resize_width, win.resize_height = 0, 0
 			platform.create_render_target(&win)
@@ -196,9 +206,11 @@ main :: proc() {
 		}
 
 		// Present
+		// TODO(log): .Error RATE-LIMITED -- log only when hr is a real failure (DEVICE_REMOVED/DEVICE_RESET), never on the OK path.
 		hr := win.swap_chain->Present(1, {}) // Present with vsync
 		//hr := win.swap_chain->Present(0, {}) // Present without vsync
         free_all(context.temp_allocator)
+		// TODO(log): .Debug occlusion entered -- only on the false->true edge; see the RATE-LIMITED note at the top of the loop.
 		win.swap_chain_occluded = (hr == dxgi.STATUS_OCCLUDED)
 	}
 }
