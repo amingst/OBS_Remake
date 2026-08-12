@@ -14,12 +14,20 @@ Pipeline :: struct {
     vertex_buffer: ^d3d11.IBuffer,
     const_buffer:  ^d3d11.IBuffer,
     blend_state:   ^d3d11.IBlendState,
+    white_texture: ^d3d11.ITexture2D,
+    white_srv:     ^d3d11.IShaderResourceView,
+    sampler: ^d3d11.ISamplerState,
 }
 
 Quad_Constants :: struct {
     scale:  [2]f32,
     offset: [2]f32,
     color:  [4]f32,
+}
+
+Vertex :: struct {
+    pos: [2]f32,
+    uv:  [2]f32
 }
 
 create_pipeline :: proc(device: ^d3d11.IDevice) -> (Pipeline, bool) {
@@ -45,20 +53,23 @@ create_pipeline :: proc(device: ^d3d11.IDevice) -> (Pipeline, bool) {
         return p, false
     }
 
-    elements := [1]d3d11.INPUT_ELEMENT_DESC{
-    {
-        SemanticName      = "POSITION",
-        SemanticIndex     = 0,
-        Format            = .R32G32_FLOAT,
-        InputSlot         = 0,
-        AlignedByteOffset = 0,
-        InputSlotClass    = .VERTEX_DATA,
-        InstanceDataStepRate = 0,
-    },
-}
+    elements := [2]d3d11.INPUT_ELEMENT_DESC{
+        {
+            SemanticName      = "POSITION",
+            Format            = .R32G32_FLOAT,
+            AlignedByteOffset = 0,
+            InputSlotClass    = .VERTEX_DATA,
+        },
+        {
+            SemanticName      = "TEXCOORD",
+            Format            = .R32G32_FLOAT,
+            AlignedByteOffset = 8,
+            InputSlotClass    = .VERTEX_DATA,
+        },
+    }
 
     if hr := device->CreateInputLayout(
-        &elements[0], 1,
+        &elements[0], 2,
         vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
         &p.input_layout,
     ); hr != 0 {
@@ -67,11 +78,11 @@ create_pipeline :: proc(device: ^d3d11.IDevice) -> (Pipeline, bool) {
         return p, false
     }
 
-    verts := [4][2]f32{
-        {0, 0},
-        {1, 0},
-        {0, 1},
-        {1, 1},
+    verts := [4]Vertex{
+        {pos = {0, 0}, uv = {0, 0}},
+        {pos = {1, 0}, uv = {1, 0}},
+        {pos = {0, 1}, uv = {0, 1}},
+        {pos = {1, 1}, uv = {1, 1}},
     }
 
     vb_desc := d3d11.BUFFER_DESC{
@@ -118,12 +129,54 @@ create_pipeline :: proc(device: ^d3d11.IDevice) -> (Pipeline, bool) {
         return p, false
     }
 
+    samp_desc := d3d11.SAMPLER_DESC{
+        Filter   = .MIN_MAG_MIP_LINEAR,
+        AddressU = .CLAMP,
+        AddressV = .CLAMP,
+        AddressW = .CLAMP,
+        MaxLOD   = d3d11.FLOAT32_MAX,
+    }
+
+    if hr := device->CreateSamplerState(&samp_desc, &p.sampler); hr != 0 {
+        log.errorf("CreateSamplerState failed: HRESULT 0x%08X", u32(hr))
+        destroy_pipeline(&p)
+        return p, false
+    }
+
+    white := [4]u8{255, 255, 255, 255}
+    white_desc := d3d11.TEXTURE2D_DESC{
+        Width      = 1,
+        Height     = 1,
+        MipLevels  = 1,
+        ArraySize  = 1,
+        Format     = .R8G8B8A8_UNORM,
+        SampleDesc = {Count = 1},
+        Usage      = .IMMUTABLE,
+        BindFlags  = {.SHADER_RESOURCE},
+    }
+    white_data := d3d11.SUBRESOURCE_DATA{ pSysMem = &white[0], SysMemPitch = 4 }
+
+    if hr := device->CreateTexture2D(&white_desc, &white_data, &p.white_texture); hr != 0 {
+        log.errorf("CreateTexture2D(white 1x1) failed: HRESULT 0x%08X", u32(hr))
+        destroy_pipeline(&p)
+        return p, false
+    }
+
+    if hr := device->CreateShaderResourceView((^d3d11.IResource)(p.white_texture), nil, &p.white_srv); hr != 0 {
+        log.errorf("CreateShaderResourceView(white) failed: HRESULT 0x%08X", u32(hr))
+        destroy_pipeline(&p)
+        return p, false
+    }
+
     log.info("shaders created")
     return p, true
 }
 
 destroy_pipeline :: proc(p: ^Pipeline) {
     if p == nil { return }
+    if p.white_srv != nil { p.white_srv->Release(); p.white_srv = nil}
+    if p.white_texture != nil {p.white_texture->Release(); p.white_texture = nil}
+    if p.sampler != nil { p.sampler->Release(); p.sampler = nil }
     if p.blend_state != nil   { p.blend_state->Release();   p.blend_state = nil }
     if p.const_buffer != nil  { p.const_buffer->Release();  p.const_buffer = nil }
     if p.vertex_buffer != nil { p.vertex_buffer->Release(); p.vertex_buffer = nil }

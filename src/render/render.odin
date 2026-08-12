@@ -13,6 +13,7 @@ Target :: struct {
 Quad :: struct {
     x, y, w, h: f32,
     color:      [4]f32,
+    texture: ^d3d11.IShaderResourceView
 }
 
 create_target :: proc(device: ^d3d11.IDevice, w, h: u32) -> (Target, bool) {
@@ -93,7 +94,7 @@ draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, pipeline: ^Pipel
     ctx->RSSetViewports(1, &vp)
 
     ctx->IASetInputLayout(pipeline.input_layout)
-    stride := u32(size_of([2]f32))
+    stride := u32(size_of(Vertex))
     offset := u32(0)
     ctx->IASetVertexBuffers(0, 1, &pipeline.vertex_buffer, &stride, &offset)
     ctx->IASetPrimitiveTopology(.TRIANGLESTRIP)
@@ -103,10 +104,10 @@ draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, pipeline: ^Pipel
     ctx->PSSetConstantBuffers(0, 1, &pipeline.const_buffer)
     blend_factor := [4]f32{0, 0, 0, 0}
     ctx->OMSetBlendState(pipeline.blend_state, &blend_factor, 0xFFFFFFFF)
+    ctx->PSSetSamplers(0, 1, &pipeline.sampler)
 
     W := f32(target.width)
     H := f32(target.height)
-
     for quad in quads {
         // log.debugf("quad x=%v y=%v w=%v h=%v color=%v", quad.x, quad.y, quad.w, quad.h, quad.color)
         consts := Quad_Constants{
@@ -122,6 +123,9 @@ draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, pipeline: ^Pipel
         (^Quad_Constants)(mapped.pData)^ = consts
         ctx->Unmap(pipeline.const_buffer, 0)
 
+        srv := quad.texture
+        if srv == nil do srv = pipeline.white_srv
+        ctx->PSSetShaderResources(0, 1, &srv)
         ctx->Draw(4, 0)
     }
 }
