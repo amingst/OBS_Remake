@@ -13,6 +13,7 @@ import imdx11  "libs:odin-imgui/backends/dx11"
 import time "core:time"
 
 // Import from platform module
+import "settings"
 import "platform"
 import "render"
 import "scene"
@@ -153,6 +154,8 @@ main :: proc() {
 	capture.log_device_adapter(win.device)
 
 	// Our state
+	cfg := settings.init()
+
 	doc := scene.init()
 	defer scene.destroy_all(&doc)
 
@@ -193,6 +196,44 @@ main :: proc() {
 			}
 			win.resize_width, win.resize_height = 0, 0
 			platform.create_render_target(&win)
+		}
+
+		// Reconcile the canvas resolution the settings modal published against
+		// the live target. This has to happen before im.NewFrame(): ImGui holds
+		// preview_target.srv as a TextureRef for the duration of a frame, so
+		// releasing the old target mid-frame is a use-after-free in the DX11
+		// backend. preview_tex is rebuilt from the current SRV every frame, so
+		// swapping between frames is safe.
+		//
+		// Source x/y/w/h are in canvas coordinates and are deliberately left
+		// alone -- a composition laid out for 1920x1080 will occupy a different
+		// fraction of a 2560x1440 canvas. Rescaling is a separate decision.
+		if cfg.video.canvas_width != i32(preview_target.width) ||
+		   cfg.video.canvas_height != i32(preview_target.height) {
+			if cfg.video.canvas_width <= 0 || cfg.video.canvas_height <= 0 {
+				log.warnf("ignoring invalid canvas resolution %vx%v, keeping %vx%v",
+					cfg.video.canvas_width, cfg.video.canvas_height,
+					preview_target.width, preview_target.height)
+				cfg.video.canvas_width  = i32(preview_target.width)
+				cfg.video.canvas_height = i32(preview_target.height)
+			} else if new_target, new_ok := render.create_target(
+				win.device, u32(cfg.video.canvas_width), u32(cfg.video.canvas_height)); new_ok {
+				// Only now is the old target expendable.
+				log.infof("canvas resolution %vx%v -> %vx%v",
+					preview_target.width, preview_target.height,
+					new_target.width, new_target.height)
+				render.destroy_target(&preview_target)
+				preview_target = new_target
+			} else {
+				// create_target already released whatever partial target it
+				// built, so there is nothing to clean up here -- just fall back
+				// to the target we still have and stop asking for the new size.
+				log.errorf("canvas resize to %vx%v failed, staying at %vx%v (cause logged above)",
+					cfg.video.canvas_width, cfg.video.canvas_height,
+					preview_target.width, preview_target.height)
+				cfg.video.canvas_width  = i32(preview_target.width)
+				cfg.video.canvas_height = i32(preview_target.height)
+			}
 		}
 
 		// Neutral fallback for "no scene selected" -- selected_id 0, or the
@@ -271,7 +312,7 @@ main :: proc() {
         // is an already-uploaded backend texture, use _TexID directly".
         // Rebuilt each frame so it stays correct if the target is recreated.
         preview_tex := im.TextureRef{_TexID = im.TextureID(uintptr(preview_target.srv))}
-        ui.draw(&ui_state, &doc, &clear_color, preview_tex, outputs,
+        ui.draw(&ui_state, &cfg, &doc, &clear_color, preview_tex, outputs,
             f32(preview_target.width), f32(preview_target.height))
 
 		// Rendering
