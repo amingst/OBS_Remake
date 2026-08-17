@@ -10,11 +10,14 @@ import "vendor:directx/dxgi"
 import im      "libs:odin-imgui"
 import imwin32 "libs:odin-imgui/backends/win32"
 import imdx11  "libs:odin-imgui/backends/dx11"
+import time "core:time"
 
 // Import from platform module
 import "platform"
 import "render"
+import "scene"
 import "ui"
+import "capture"
 
 main :: proc() {
 	// Wrap the heap allocator so we get a leak/bad-free report at exit.
@@ -145,8 +148,15 @@ main :: proc() {
 	//io.Fonts->AddFontDefaultVector()
 	//io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf")
 
+	outputs := capture.enumerate_outputs(win.device)
+	defer capture.destroy_outputs(outputs)
+	capture.log_device_adapter(win.device)
+
 	// Our state
-    ui_state := ui.init_state()
+	doc := scene.init()
+	defer scene.destroy_all(&doc)
+
+    ui_state := ui.init_state(&doc)
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
     defer ui.destroy(&ui_state)
 
@@ -186,13 +196,13 @@ main :: proc() {
 		}
 
 		// Neutral fallback for "no scene selected" -- selected_id 0, or the
-		// selected scene was deleted. find_scene's pointer is invalidated by
-		// the next append to scenes, so copy the colour straight out instead of
-		// holding the pointer. Reads last frame's selection, since this runs
+		// selected scene was deleted. scene.find's pointer is invalidated by
+		// the next append to doc.scenes, so copy the colour straight out instead
+		// of holding the pointer. Reads last frame's selection, since this runs
 		// before ui.draw; one frame of latency is invisible here.
 		scene_clear := [4]f32{0.10, 0.10, 0.12, 1.0}
-		if scene := ui.find_scene(&ui_state.scenes, ui_state.scenes.selected_id); scene != nil {
-			scene_clear = scene.color
+		if sel := scene.find(&doc, ui_state.scenes.selected_id); sel != nil {
+			scene_clear = sel.color
 		}
 
 		// Composite the scene into the offscreen target before ImGui's frame
@@ -201,13 +211,51 @@ main :: proc() {
 		// first means our binding here is harmlessly replaced rather than
 		// clobbering ImGui's.quads := make([dynamic]render.Quad, context.temp_allocator)
 		quads := make([dynamic]render.Quad, context.temp_allocator)
-		if scene := ui.find_scene(&ui_state.scenes, ui_state.scenes.selected_id); scene != nil {
-			for src in scene.sources {
+		if sel := scene.find(&doc, ui_state.scenes.selected_id); sel != nil {
+			for &src in sel.sources {
 				if !src.visible do continue
-				append(&quads, render.Quad{
-					x = src.x, y = src.y, w = src.w, h = src.h,
-					color = src.color,
-				})
+				switch &d in src.data {
+					case scene.Color_Data:
+						append(&quads, render.Quad{
+							x = src.x, y = src.y, w = src.w, h = src.h,
+							color = src.color,
+						})
+					case scene.Display_Data:
+						if d.dupl == nil && time.now()._nsec >= d.next_retry._nsec {
+							if dupl, ok := capture.start_duplication(win.device, u32(d.adapter_index), u32(d.output_index)); ok {
+								d.dupl = dupl
+							} else {
+								d.next_retry = time.time_add(time.now(), 2 * time.Second)
+							}
+						}
+
+						if d.dupl != nil && d.texture == nil {
+							desc: dxgi.OUTDUPL_DESC
+							d.dupl->GetDesc(&desc)
+							tex, srv, ok := capture.create_capture_texture(
+								win.device, desc.ModeDesc.Width, desc.ModeDesc.Height)
+							if ok {
+								d.texture = tex
+								d.srv = srv
+							}
+						}
+						if d.dupl != nil && d.texture != nil {
+							ok, lost := capture.acquire_frame(win.device_context, d.dupl, d.texture)
+							if lost {
+								log.warn("duplication access lost, will restart")
+								capture.stop_duplication(d.dupl)
+								d.dupl = nil
+								d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
+							}
+							_ = ok
+						}
+
+						append(&quads, render.Quad{
+							x = src.x, y = src.y, w = src.w, h = src.h,
+							color = {1, 1, 1, 1},
+							texture = d.srv,
+						})
+				}
 			}
 		}
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
@@ -223,7 +271,8 @@ main :: proc() {
         // is an already-uploaded backend texture, use _TexID directly".
         // Rebuilt each frame so it stays correct if the target is recreated.
         preview_tex := im.TextureRef{_TexID = im.TextureID(uintptr(preview_target.srv))}
-        ui.draw(&ui_state, &clear_color, preview_tex)
+        ui.draw(&ui_state, &doc, &clear_color, preview_tex, outputs,
+            f32(preview_target.width), f32(preview_target.height))
 
 		// Rendering
 		im.Render()

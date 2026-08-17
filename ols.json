@@ -2,7 +2,9 @@
 	"collections": [
 		{ "name": "libs", "path": "libs" },
 		{ "name": "platform", "path": "src/platform" },
-		{ "name": "ui", "path": "src/ui" }
+		{ "name": "ui", "path": "src/ui" },
+		{ "name": "scene", "path": "src/scene" },
+		{ "name": "capture", "path": "src/capture" }
 	],
 	"enable_semantic_tokens": true,
 	"enable_document_symbols": true,
