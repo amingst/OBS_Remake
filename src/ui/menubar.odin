@@ -5,15 +5,18 @@ import im "libs:odin-imgui"
 import "../capture"
 import "../settings"
 
-// The Settings modal edits a private copy of the video settings rather than
-// writing through to cfg. Canvas resolution is destructive -- applying it tears
-// down and rebuilds the render target -- so typing "1920" into a width field
-// must not be read as a request for a 1px, then 19px, then 192px canvas.
-// Apply/OK are the only things that publish pending back to cfg.
+Save_Trigger :: enum {
+    None,
+    File_Menu,
+    Settings_Apply,
+    Settings_OK,
+}
+
 Settings_State :: struct {
-    pending:    settings.Video_Settings,
-    preset_idx: int,  // index into the preset list; == len(presets) means Custom
-    was_open:   bool, // last frame's show_settings, so we can seed on the opening edge
+    pending:      settings.Video_Settings,
+    preset_idx:   int,          // index into the preset list; == len(presets) means Custom
+    was_open:     bool,         // last frame's show_settings, so we can seed on the opening edge
+    save_request: Save_Trigger, // raised here, consumed and cleared by main
 }
 
 init_settings_state :: proc() -> Settings_State {
@@ -27,9 +30,7 @@ Canvas_Preset :: struct {
     height: i32,
 }
 
-// Common canvas sizes plus every enumerated display's native resolution.
-// Temp-allocated, so it lives to the end of the frame -- long enough for ImGui
-// to copy the labels it draws.
+
 @(private="file")
 build_presets :: proc(outputs: []capture.Output_Info) -> []Canvas_Preset {
     presets := make([dynamic]Canvas_Preset, 0, 3 + len(outputs), context.temp_allocator)
@@ -74,6 +75,12 @@ draw_menubar :: proc(state: ^State, cfg: ^settings.Settings, outputs: []capture.
 @(private="file")
 draw_file_menu :: proc(state: ^State) {
     if im.BeginMenu("File") {
+        if im.MenuItem("Save Settings") {
+            state.settings.save_request = .File_Menu
+        }
+
+        im.Separator()
+
         if im.MenuItem("Settings") {
             state.show_settings = true
             im.OpenPopup("Settings")
@@ -88,8 +95,6 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Settings, outputs: []capture
     s := &state.settings
     presets := build_presets(outputs)
 
-    // Seed the pending copy on the frame the modal opens, so it always starts
-    // from live state and a previous Cancel leaves nothing behind.
     if state.show_settings && !s.was_open {
         s.pending = cfg.video
         s.preset_idx = match_preset(presets, s.pending.canvas_width, s.pending.canvas_height)
@@ -133,8 +138,10 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Settings, outputs: []capture
         }
 
         im.Separator()
+
         if im.Button("OK") {
             cfg.video = s.pending
+            s.save_request = .Settings_OK
             state.show_settings = false
             im.CloseCurrentPopup()
         }
@@ -146,6 +153,7 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Settings, outputs: []capture
         im.SameLine()
         if im.Button("Apply") {
             cfg.video = s.pending
+            s.save_request = .Settings_Apply
         }
 
         im.EndPopup()

@@ -5,6 +5,8 @@ package obs_remake
 @(require) import "core:fmt"
 import "core:log"
 @(require) import "core:mem"
+import "core:os"
+import "core:path/filepath"
 import win32 "core:sys/windows"
 import "vendor:directx/dxgi"
 import im      "libs:odin-imgui"
@@ -19,6 +21,61 @@ import "render"
 import "scene"
 import "ui"
 import "capture"
+
+// Resolves %APPDATA%\OBSRemake, creating it if it isn't there yet.
+//
+// This lives in main rather than in settings/ because scene collections will
+// want the same directory, and neither package should own the policy of where
+// on disk this app keeps its state -- they take a path and do as they're told.
+//
+// Returns an owned string the caller must delete. ok=false means we could not
+// resolve or create the directory; that is a "settings won't persist" problem,
+// not a "can't run" problem, so callers should carry on with defaults.
+@(require_results)
+resolve_config_dir :: proc() -> (dir: string, ok: bool) {
+	// SHGetKnownFolderPath in preference to %APPDATA%: it is what the shell
+	// itself consults, and it still answers when the environment block has been
+	// stripped (services, some launchers). The env var is the fallback.
+	roaming: string
+	folder_id := win32.FOLDERID_RoamingAppData // needs an addressable copy
+	wpath: win32.LPWSTR
+	if hr := win32.SHGetKnownFolderPath(&folder_id, 0, nil, &wpath); hr >= 0 && wpath != nil {
+		defer win32.CoTaskMemFree(wpath)
+		// LPWSTR is a single-pointer type; wstring_to_utf8 wants the multi-
+		// pointer form, and -1 tells it to scan for the terminator itself.
+		if s, err := win32.wstring_to_utf8(win32.wstring(wpath), -1, context.temp_allocator);
+		   err == nil && s != "" {
+			roaming = s
+			log.debugf("config root from SHGetKnownFolderPath: %v", roaming)
+		}
+	} else {
+		log.warnf("SHGetKnownFolderPath(FOLDERID_RoamingAppData) failed: HRESULT 0x%08X", u32(hr))
+	}
+
+	if roaming == "" {
+		env, found := os.lookup_env("APPDATA", context.temp_allocator)
+		if !found || env == "" {
+			log.warn("no roaming AppData directory available (known folder and APPDATA both failed); settings will not persist")
+			return "", false
+		}
+		roaming = env
+		log.debugf("config root from APPDATA: %v", roaming)
+	}
+
+	jerr: mem.Allocator_Error
+	dir, jerr = filepath.join({roaming, "OBSRemake"})
+	if jerr != nil {
+		log.warnf("could not build config directory path: %v; settings will not persist", jerr)
+		return "", false
+	}
+	// Already-there is the steady state, not a failure.
+	if err := os.make_directory(dir); err != nil && err != os.General_Error.Exist {
+		log.warnf("could not create config directory %v: %v; settings will not persist", dir, err)
+		delete(dir)
+		return "", false
+	}
+	return dir, true
+}
 
 main :: proc() {
 	// Wrap the heap allocator so we get a leak/bad-free report at exit.
@@ -53,6 +110,29 @@ main :: proc() {
 	}
 	defer log.destroy_console_logger(context.logger)
 
+	// Config location and persisted state. Done up here, before any device
+	// objects exist, because the loaded canvas resolution decides how big the
+	// preview target is created below -- see the create_target call.
+	//
+	// Only the joined file path is kept; the directory string was scaffolding.
+	settings_path: string
+	if config_dir, config_ok := resolve_config_dir(); config_ok {
+		joined, jerr := filepath.join({config_dir, "settings.json"})
+		delete(config_dir)
+		if jerr != nil {
+			log.warnf("could not build settings path: %v; settings will not persist", jerr)
+		} else {
+			settings_path = joined
+		}
+	}
+	defer if settings_path != "" do delete(settings_path)
+
+	cfg := settings.init()
+	if settings_path != "" && settings.load(&cfg, settings_path) {
+		log.infof("settings loaded from %v (canvas %vx%v)",
+			settings_path, cfg.video.canvas_width, cfg.video.canvas_height)
+	}
+
 	// Make process DPI aware and obtain main monitor scale
 	imwin32.EnableDpiAwareness()
 	main_scale := imwin32.GetDpiScaleForMonitor(
@@ -67,8 +147,13 @@ main :: proc() {
     win.msg_hook = imwin32.WndProcHandler
 
 	// Offscreen target the scene is composited into. Created after
-	// create_window because it needs win.device.
-	preview_target, target_ok := render.create_target(win.device, 1920, 1080)
+	// create_window because it needs win.device, and sized from cfg rather than
+	// a constant so a saved canvas resolution is honoured on the very first
+	// frame. The reconciliation step in the loop below would eventually catch a
+	// divergence, but only after rendering one frame at the wrong size and then
+	// tearing the target down again -- pointless when the size is already known.
+	preview_target, target_ok := render.create_target(
+		win.device, u32(cfg.video.canvas_width), u32(cfg.video.canvas_height))
 	if !target_ok {
 		log.fatal("preview target creation failed, exiting (cause logged above)")
 		return
@@ -153,9 +238,7 @@ main :: proc() {
 	defer capture.destroy_outputs(outputs)
 	capture.log_device_adapter(win.device)
 
-	// Our state
-	cfg := settings.init()
-
+	// Our state (cfg was established above, before the preview target)
 	doc := scene.init()
 	defer scene.destroy_all(&doc)
 
@@ -233,6 +316,28 @@ main :: proc() {
 					preview_target.width, preview_target.height)
 				cfg.video.canvas_width  = i32(preview_target.width)
 				cfg.video.canvas_height = i32(preview_target.height)
+			}
+		}
+
+		// Service a pending save. Deliberately placed *after* the reconciliation
+		// above rather than next to the ui.draw call that raises the request: the
+		// block above is the only place canvas dimensions are validated, and it
+		// may well have overwritten cfg.video with the live target's size. Writing
+		// first would put a rejected resolution on disk and then revert it in
+		// memory, leaving the file disagreeing with the running app until the next
+		// save. So a request raised during frame N is consumed here at the top of
+		// frame N+1, once cfg is settled -- one frame of latency, and what gets
+		// written is exactly what the app is actually running.
+		//
+		// The write itself lives here rather than in ui because ui has no idea
+		// where the config file is, and shouldn't.
+		if trigger := ui_state.settings.save_request; trigger != .None {
+			ui_state.settings.save_request = .None
+			if settings_path != "" {
+				log.infof("save requested (%v)", trigger)
+				settings.save(&cfg, settings_path)
+			} else {
+				log.warnf("save requested (%v), but no config path is available", trigger)
 			}
 		}
 
@@ -341,6 +446,14 @@ main :: proc() {
 			log.errorf("Present failed: HRESULT 0x%08X", u32(hr))
 		}
 		win.swap_chain_occluded = (hr == dxgi.STATUS_OCCLUDED)
+	}
+
+	// Persist on a clean shutdown. Everything that reaches here left the loop
+	// normally; the early `return`s above (device/backend init failure) skip it
+	// deliberately, since that state isn't worth writing out.
+	if settings_path != "" {
+		log.info("save on exit")
+		settings.save(&cfg, settings_path)
 	}
 }
 
