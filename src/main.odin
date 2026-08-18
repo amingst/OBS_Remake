@@ -13,6 +13,7 @@ import imdx11  "libs:odin-imgui/backends/dx11"
 import time "core:time"
 
 // Import from platform module
+import "config"
 import "settings"
 import "platform"
 import "render"
@@ -53,6 +54,23 @@ main :: proc() {
 	}
 	defer log.destroy_console_logger(context.logger)
 
+	// Config locations and persisted state. Done up here, before any device
+	// objects exist, because the loaded canvas resolution decides how big the
+	// preview target is created below -- see the create_target call.
+	//
+	// resolve_paths failing is non-fatal and already logged at .Warning: the app
+	// runs fine without a writable config directory, it just cannot persist. A
+	// zeroed Paths leaves every field "", which is the "no persistence" signal
+	// used below, and destroy_paths tolerates it.
+	paths, _ := config.resolve_paths()
+	defer config.destroy_paths(&paths)
+
+	cfg := settings.init()
+	if paths.settings != "" && settings.load(&cfg, paths.settings) {
+		log.infof("settings loaded from %v (canvas %vx%v)",
+			paths.settings, cfg.video.canvas_width, cfg.video.canvas_height)
+	}
+
 	// Make process DPI aware and obtain main monitor scale
 	imwin32.EnableDpiAwareness()
 	main_scale := imwin32.GetDpiScaleForMonitor(
@@ -67,13 +85,22 @@ main :: proc() {
     win.msg_hook = imwin32.WndProcHandler
 
 	// Offscreen target the scene is composited into. Created after
-	// create_window because it needs win.device.
-	preview_target, target_ok := render.create_target(win.device, 1920, 1080)
+	// create_window because it needs win.device, and sized from cfg rather than
+	// a constant so a saved canvas resolution is honoured on the very first
+	// frame. The reconciliation step in the loop below would eventually catch a
+	// divergence, but only after rendering one frame at the wrong size and then
+	// tearing the target down again -- pointless when the size is already known.
+	preview_target, target_ok := render.create_target(
+		win.device, u32(cfg.video.canvas_width), u32(cfg.video.canvas_height))
 	if !target_ok {
 		log.fatal("preview target creation failed, exiting (cause logged above)")
 		return
 	}
 	defer render.destroy_target(&preview_target)
+
+	// The target that was just built *is* the applied state, so seed from the
+	// same cfg it was sized from. Any later divergence is a real request.
+	applied := Applied{video = cfg.video}
 
 	pipeline, pok := render.create_pipeline(win.device)
 	if !pok do return
@@ -153,9 +180,7 @@ main :: proc() {
 	defer capture.destroy_outputs(outputs)
 	capture.log_device_adapter(win.device)
 
-	// Our state
-	cfg := settings.init()
-
+	// Our state (cfg was established above, before the preview target)
 	doc := scene.init()
 	defer scene.destroy_all(&doc)
 
@@ -198,41 +223,31 @@ main :: proc() {
 			platform.create_render_target(&win)
 		}
 
-		// Reconcile the canvas resolution the settings modal published against
-		// the live target. This has to happen before im.NewFrame(): ImGui holds
-		// preview_target.srv as a TextureRef for the duration of a frame, so
-		// releasing the old target mid-frame is a use-after-free in the DX11
-		// backend. preview_tex is rebuilt from the current SRV every frame, so
-		// swapping between frames is safe.
+		// Bring the live objects in line with what the settings modal published.
+		// Ordering constraints and the reasoning live in reconcile.odin; the
+		// only thing that matters here is that this runs well before
+		// im.NewFrame().
+		reconcile(&applied, &cfg, win.device, &preview_target)
+
+		// Service a pending save. Deliberately placed *after* the reconciliation
+		// above rather than next to the ui.draw call that raises the request: the
+		// block above is the only place canvas dimensions are validated, and it
+		// may well have overwritten cfg.video with the live target's size. Writing
+		// first would put a rejected resolution on disk and then revert it in
+		// memory, leaving the file disagreeing with the running app until the next
+		// save. So a request raised during frame N is consumed here at the top of
+		// frame N+1, once cfg is settled -- one frame of latency, and what gets
+		// written is exactly what the app is actually running.
 		//
-		// Source x/y/w/h are in canvas coordinates and are deliberately left
-		// alone -- a composition laid out for 1920x1080 will occupy a different
-		// fraction of a 2560x1440 canvas. Rescaling is a separate decision.
-		if cfg.video.canvas_width != i32(preview_target.width) ||
-		   cfg.video.canvas_height != i32(preview_target.height) {
-			if cfg.video.canvas_width <= 0 || cfg.video.canvas_height <= 0 {
-				log.warnf("ignoring invalid canvas resolution %vx%v, keeping %vx%v",
-					cfg.video.canvas_width, cfg.video.canvas_height,
-					preview_target.width, preview_target.height)
-				cfg.video.canvas_width  = i32(preview_target.width)
-				cfg.video.canvas_height = i32(preview_target.height)
-			} else if new_target, new_ok := render.create_target(
-				win.device, u32(cfg.video.canvas_width), u32(cfg.video.canvas_height)); new_ok {
-				// Only now is the old target expendable.
-				log.infof("canvas resolution %vx%v -> %vx%v",
-					preview_target.width, preview_target.height,
-					new_target.width, new_target.height)
-				render.destroy_target(&preview_target)
-				preview_target = new_target
+		// The write itself lives here rather than in ui because ui has no idea
+		// where the config file is, and shouldn't.
+		if trigger := ui_state.settings.save_request; trigger != .None {
+			ui_state.settings.save_request = .None
+			if paths.settings != "" {
+				log.infof("save requested (%v)", trigger)
+				settings.save(&cfg, paths.settings)
 			} else {
-				// create_target already released whatever partial target it
-				// built, so there is nothing to clean up here -- just fall back
-				// to the target we still have and stop asking for the new size.
-				log.errorf("canvas resize to %vx%v failed, staying at %vx%v (cause logged above)",
-					cfg.video.canvas_width, cfg.video.canvas_height,
-					preview_target.width, preview_target.height)
-				cfg.video.canvas_width  = i32(preview_target.width)
-				cfg.video.canvas_height = i32(preview_target.height)
+				log.warnf("save requested (%v), but no config path is available", trigger)
 			}
 		}
 
@@ -341,6 +356,14 @@ main :: proc() {
 			log.errorf("Present failed: HRESULT 0x%08X", u32(hr))
 		}
 		win.swap_chain_occluded = (hr == dxgi.STATUS_OCCLUDED)
+	}
+
+	// Persist on a clean shutdown. Everything that reaches here left the loop
+	// normally; the early `return`s above (device/backend init failure) skip it
+	// deliberately, since that state isn't worth writing out.
+	if paths.settings != "" {
+		log.info("save on exit")
+		settings.save(&cfg, paths.settings)
 	}
 }
 

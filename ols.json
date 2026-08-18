@@ -5,7 +5,8 @@
 		{ "name": "ui", "path": "src/ui" },
 		{ "name": "scene", "path": "src/scene" },
 		{ "name": "capture", "path": "src/capture" },
-		{ "name": "settings", "path": "src/settings" }
+		{ "name": "settings", "path": "src/settings" },
+		{ "name": "config", "path": "/src/config" }
 	],
 	"enable_semantic_tokens": true,
 	"enable_document_symbols": true,
