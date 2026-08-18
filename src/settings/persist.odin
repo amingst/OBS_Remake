@@ -3,6 +3,7 @@ package settings
 import json "core:encoding/json"
 import os "core:os"
 import log "core:log"
+import "core:strings"
 
 Video_Settings_DTO :: struct {
     canvas_width, canvas_height: i32,
@@ -12,6 +13,8 @@ Video_Settings_DTO :: struct {
 
 Settings_DTO :: struct {
     version: int,
+    id:      string,
+    name:    string,
     video:   Video_Settings_DTO,
 }
 
@@ -19,10 +22,16 @@ Settings_DTO :: struct {
 // Independent of config.CURRENT_VERSION, which versions app.json -- the two
 // files have separate schemas and separate migration histories, so bumping one
 // says nothing about the other.
+//
+// Stays at 1 across the id/name addition: a version bump exists to tell a
+// reader what an *existing* file on disk means, and nothing has shipped, so no
+// file with the old fieldless shape exists anywhere to be distinguished. Such a
+// file would in any case be caught by dto_is_valid's empty-id check and fall
+// back to defaults, which is the same outcome a version mismatch would produce.
 @(private)
 CURRENT_VERSION :: 1
 
-save :: proc(cfg: ^Settings, path: string) -> bool {
+save :: proc(cfg: ^Profile, path: string) -> bool {
     dto := to_dto(cfg)
     data, merr := json.marshal(dto, {pretty=true}, context.temp_allocator)
     if merr != nil {
@@ -42,7 +51,7 @@ save :: proc(cfg: ^Settings, path: string) -> bool {
     return true
 }
 
-load :: proc(cfg: ^Settings, path: string) -> bool {
+load :: proc(cfg: ^Profile, path: string) -> bool {
     data, rerr := os.read_entire_file(path, context.temp_allocator)
     if rerr != nil {
         // No file is the normal first-run case and must stay quiet. Anything
@@ -73,9 +82,26 @@ load :: proc(cfg: ^Settings, path: string) -> bool {
 // A syntactically valid file can still hold nonsense -- a hand-edited
 // "canvas_width": 0, or a field omitted entirely, which unmarshals to zero.
 // Rejecting the whole file here means main never gets a chance to call
-// create_target with a degenerate size; the defaults init established stand.
+// create_target with a degenerate size; the defaults create_default
+// established stand.
+//
+// Not every bad field is fatal, and the split is by what the field is *for*:
+// an id is how a profile is addressed and saved back, so a file without one
+// describes a profile that cannot be referred to -- there is nothing sensible
+// to invent. A name is a human label; a missing one costs nothing to
+// substitute, so it is repaired in place rather than throwing away an
+// otherwise good file.
 @(private="file")
 dto_is_valid :: proc(dto: ^Settings_DTO, path: string) -> bool {
+    if dto.id == "" {
+        log.warnf("settings rejected (no profile id) — using defaults: %v", path)
+        return false
+    }
+    if dto.name == "" {
+        log.warnf("settings has no profile name, using %q: %v", "Unnamed", path)
+        dto.name = "Unnamed"
+    }
+
     v := dto.video
     if v.canvas_width <= 0 || v.canvas_height <= 0 ||
        v.output_width <= 0 || v.output_height <= 0 || v.fps <= 0 {
@@ -88,9 +114,13 @@ dto_is_valid :: proc(dto: ^Settings_DTO, path: string) -> bool {
 }
 
 @(private="file")
-to_dto :: proc(cfg: ^Settings) -> Settings_DTO {
+to_dto :: proc(cfg: ^Profile) -> Settings_DTO {
+    // id and name are borrowed, not cloned: the DTO lives only until the
+    // json.marshal call in save returns, well inside the profile's lifetime.
     return Settings_DTO {
         version = CURRENT_VERSION,
+        id = cfg.id,
+        name = cfg.name,
         video = {
             canvas_width = cfg.video.canvas_width,
             canvas_height = cfg.video.canvas_height,
@@ -101,8 +131,18 @@ to_dto :: proc(cfg: ^Settings) -> Settings_DTO {
     }
 }
 
+// The first from_dto that does more than copy scalars. Two things follow from
+// that: the DTO's strings point into the temp allocator json.unmarshal was
+// given and are gone at the end of the frame, so they must be cloned; and cfg
+// arrives already populated by create_default, so the strings being replaced
+// have to be freed first or every successful load leaks an id and a name.
 @(private="file")
-from_dto :: proc(dto: ^Settings_DTO, cfg: ^Settings) {
+from_dto :: proc(dto: ^Settings_DTO, cfg: ^Profile) {
+    delete(cfg.id)
+    delete(cfg.name)
+    cfg.id = strings.clone(dto.id)
+    cfg.name = strings.clone(dto.name)
+
     cfg.video = {
         canvas_width  = dto.video.canvas_width,
         canvas_height = dto.video.canvas_height,

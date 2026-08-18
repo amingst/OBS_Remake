@@ -6,11 +6,15 @@ import "vendor:directx/d3d11"
 import "render"
 import "settings"
 
+// Deliberately a Video_Settings and not a Profile: this mirrors what has
+// actually been built on the device, and nothing in a Profile outside `video`
+// drives a resource -- id and name have no live counterpart to reconcile
+// against, so holding them here would only be a second copy to keep in sync.
 Applied :: struct {
 	video: settings.Video_Settings,
 }
 
-reconcile :: proc(applied: ^Applied, desired: ^settings.Settings, device: ^d3d11.IDevice, target: ^render.Target) {
+reconcile :: proc(applied: ^Applied, desired: ^settings.Profile, device: ^d3d11.IDevice, target: ^render.Target) {
 	// Canvas resolution
 	if desired.video.canvas_width  != applied.video.canvas_width ||
 	   desired.video.canvas_height != applied.video.canvas_height {

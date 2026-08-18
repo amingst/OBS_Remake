@@ -20,7 +20,7 @@ State :: struct {
 
 draw :: proc(
     state: ^State,
-    cfg: ^settings.Settings,
+    cfg: ^settings.Profile,
     doc: ^scene.Collection,
     clear_color: ^im.Vec4,
     preview_tex: im.TextureRef,

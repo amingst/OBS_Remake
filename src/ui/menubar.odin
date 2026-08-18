@@ -59,7 +59,7 @@ match_preset :: proc(presets: []Canvas_Preset, w, h: i32) -> int {
     return len(presets)
 }
 
-draw_menubar :: proc(state: ^State, cfg: ^settings.Settings, outputs: []capture.Output_Info) {
+draw_menubar :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.Output_Info) {
     if im.BeginMainMenuBar() {
         draw_file_menu(state)
         draw_view_menu(state)
@@ -91,7 +91,7 @@ draw_file_menu :: proc(state: ^State) {
 }
 
 @(private="file")
-draw_settings :: proc(state: ^State, cfg: ^settings.Settings, outputs: []capture.Output_Info) {
+draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.Output_Info) {
     s := &state.settings
     presets := build_presets(outputs)
 

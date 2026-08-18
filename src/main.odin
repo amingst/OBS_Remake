@@ -65,10 +65,15 @@ main :: proc() {
 	paths, _ := config.resolve_paths()
 	defer config.destroy_paths(&paths)
 
-	cfg := settings.init()
+	// Profile owns two heap strings (id, name), so unlike the old plain-data
+	// Settings it needs a matching destroy. load fills this Profile in place and
+	// frees whatever it replaces, so exactly one destroy_profile is correct
+	// whether or not a config file existed.
+	cfg := settings.create_default()
+	defer settings.destroy_profile(&cfg)
 	if paths.settings != "" && settings.load(&cfg, paths.settings) {
-		log.infof("settings loaded from %v (canvas %vx%v)",
-			paths.settings, cfg.video.canvas_width, cfg.video.canvas_height)
+		log.infof("profile %v (%v) loaded from %v (canvas %vx%v)",
+			cfg.name, cfg.id, paths.settings, cfg.video.canvas_width, cfg.video.canvas_height)
 	}
 
 	// Make process DPI aware and obtain main monitor scale
