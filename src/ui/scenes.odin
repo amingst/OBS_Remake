@@ -34,7 +34,7 @@ draw_scenes :: proc(state: ^Scenes_State, doc: ^scene.Collection) {
                 if len(name) == 0 {
                     log.debug("empty scene name rejected")
                 } else {
-                    state.selected_id = scene.create(doc, name)
+                    state.selected_id = scene.create_scene(doc, name)
                     state.name_buf = {}
                     im.CloseCurrentPopup()
                 }
@@ -64,7 +64,7 @@ draw_scenes :: proc(state: ^Scenes_State, doc: ^scene.Collection) {
         }
 
         if to_delete >= 0 {
-            removed_id := scene.remove(doc, to_delete)
+            removed_id := scene.remove_scene(doc, to_delete)
 
             // Selection is by id, so it only needs repair when the removed scene
             // was the selected one. Prefer whatever slid into the vacated slot,

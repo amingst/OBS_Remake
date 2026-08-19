@@ -18,7 +18,7 @@ App_Config :: struct {           // app.json
 Paths :: struct {
 	root:        string,
 	app_config:  string,   // root/app.json
-	settings:    string,   // root/settings.json  (moves under profiles/ later)
+	settings:    string,   // root/settings.json  (migration-only: read by the one-shot legacy migration in main, nothing else should touch it)
 	profiles:    string,   // root/profiles/
 	collections: string,   // root/collections/
 }

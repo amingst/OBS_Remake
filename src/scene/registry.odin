@@ -1,17 +1,17 @@
-package settings
+package scene
 
 import json "core:encoding/json"
 import os "core:os"
 import log "core:log"
 import "core:strings"
 
-Profile_Info :: struct {
+Collection_Info :: struct {
     id:   string, // owned
     name: string, // owned
     path: string, // owned; full path to the json
 }
 
-destroy_infos :: proc(infos: []Profile_Info) {
+destroy_infos :: proc(infos: []Collection_Info) {
     for info in infos {
         delete(info.id)
         delete(info.name)
@@ -21,19 +21,19 @@ destroy_infos :: proc(infos: []Profile_Info) {
 }
 
 @(private = "file")
-profile_path :: proc(dir, id: string, allocator := context.allocator) -> string {
+collection_path :: proc(dir, id: string, allocator := context.allocator) -> string {
     filename := strings.concatenate({id, ".json"}, context.temp_allocator)
     path, _ := os.join_path({dir, filename}, allocator)
     return path
 }
 
-enumerate :: proc(dir: string) -> []Profile_Info {
-    infos := make([dynamic]Profile_Info, 0)
+enumerate :: proc(dir: string) -> []Collection_Info {
+    infos := make([dynamic]Collection_Info, 0)
 
     entries, err := os.read_all_directory_by_path(dir, context.temp_allocator)
     if err != nil {
         if err != os.General_Error.Not_Exist {
-            log.warnf("registry: could not read directory %v: %v", dir, err)
+            log.warnf("scene registry: could not read directory %v: %v", dir, err)
         }
         return infos[:]
     }
@@ -44,29 +44,29 @@ enumerate :: proc(dir: string) -> []Profile_Info {
 
         data, rerr := os.read_entire_file(entry.fullpath, context.temp_allocator)
         if rerr != nil {
-            log.warnf("registry: could not read %v: %v", entry.fullpath, rerr)
+            log.warnf("scene registry: could not read %v: %v", entry.fullpath, rerr)
             continue
         }
 
-        dto: Settings_DTO
+        dto: Collection_DTO
         if perr := json.unmarshal(data, &dto, allocator = context.temp_allocator); perr != nil {
-            log.warnf("registry: could not parse %v: %v", entry.fullpath, perr)
+            log.warnf("scene registry: could not parse %v: %v", entry.fullpath, perr)
             continue
         }
         if dto.id == "" {
-            log.warnf("registry: skipping %v (no profile id)", entry.fullpath)
+            log.warnf("scene registry: skipping %v (no collection id)", entry.fullpath)
             continue
         }
 
         // A mismatch between the id inside the file and the filename it was
         // found under means someone hand-copied a file. Trusting the
-        // filename means two profiles can never claim the same id, at the
+        // filename means two collections can never claim the same id, at the
         // cost of a possibly-surprising name.
         id := dto.id
         stem := os.stem(entry.name)
         if id != stem {
             log.warnf(
-                "registry: id %q in %v does not match filename %q — trusting filename",
+                "scene registry: id %q in %v does not match filename %q — trusting filename",
                 dto.id, entry.fullpath, stem)
             id = stem
         }
@@ -76,7 +76,7 @@ enumerate :: proc(dir: string) -> []Profile_Info {
             name = "Unnamed"
         }
 
-        append(&infos, Profile_Info{
+        append(&infos, Collection_Info{
             id   = strings.clone(id),
             name = strings.clone(name),
             path = strings.clone(entry.fullpath),
@@ -86,32 +86,32 @@ enumerate :: proc(dir: string) -> []Profile_Info {
     return infos[:]
 }
 
-load_by_id :: proc(dir, id: string) -> (Profile, bool) {
-    path := profile_path(dir, id, context.temp_allocator)
+load_by_id :: proc(dir, id: string) -> (Collection, bool) {
+    path := collection_path(dir, id, context.temp_allocator)
 
-    cfg := create_default()
-    if !load(&cfg, path) {
-        destroy_profile(&cfg)
+    c := create_default()
+    if !load(&c, path) {
+        destroy_all(&c)
         return {}, false
     }
-    return cfg, true
+    return c, true
 }
 
-save_profile :: proc(p: ^Profile, dir: string) -> bool {
-    path := profile_path(dir, p.id, context.temp_allocator)
-    return save(p, path)
+save_collection :: proc(c: ^Collection, dir: string) -> bool {
+    path := collection_path(dir, c.id, context.temp_allocator)
+    return save(c, path)
 }
 
-create :: proc(dir, name: string) -> (Profile, bool) {
-    p := create_default()
-    delete(p.name)
-    p.name = strings.clone(name)
+create :: proc(dir, name: string) -> (Collection, bool) {
+    c := create_default()
+    delete(c.name)
+    c.name = strings.clone(name)
 
-    if !save_profile(&p, dir) {
-        destroy_profile(&p)
+    if !save_collection(&c, dir) {
+        destroy_all(&c)
         return {}, false
     }
-    return p, true
+    return c, true
 }
 
 remove :: proc(dir, id: string) -> bool {
@@ -119,13 +119,13 @@ remove :: proc(dir, id: string) -> bool {
     defer destroy_infos(infos)
 
     if len(infos) <= 1 {
-        log.warnf("registry: refusing to remove %v — it is the last remaining profile in %v", id, dir)
+        log.warnf("scene registry: refusing to remove %v — it is the last remaining collection in %v", id, dir)
         return false
     }
 
-    path := profile_path(dir, id, context.temp_allocator)
+    path := collection_path(dir, id, context.temp_allocator)
     if err := os.remove(path); err != nil {
-        log.warnf("registry: could not remove %v: %v", path, err)
+        log.warnf("scene registry: could not remove %v: %v", path, err)
         return false
     }
     return true

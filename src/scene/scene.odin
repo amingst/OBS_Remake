@@ -1,5 +1,6 @@
 package scene
 
+import "core:encoding/uuid"
 import "core:log"
 import "core:strings"
 
@@ -12,17 +13,23 @@ Scene :: struct {
 }
 
 Collection :: struct {
+    id:      string, // owned
+    name:    string, // owned
     scenes:  [dynamic]Scene,
     next_id: u64,
 }
 
-init :: proc() -> Collection {
-    c := Collection{next_id = 1}
-    create(&c, "Scene 1")
+create_default :: proc() -> Collection {
+    c := Collection{
+        id      = new_id(),
+        name    = strings.clone("Default"),
+        next_id = 1,
+    }
+    create_scene(&c, "Scene 1")
     return c
 }
 
-create :: proc(c: ^Collection, name: string) -> u64 {
+create_scene :: proc(c: ^Collection, name: string) -> u64 {
     id := alloc_id(c)
     append(&c.scenes, Scene{
         id    = id,
@@ -34,7 +41,7 @@ create :: proc(c: ^Collection, name: string) -> u64 {
     return id
 }
 
-remove :: proc(c: ^Collection, index: int) -> u64 {
+remove_scene :: proc(c: ^Collection, index: int) -> u64 {
     log.debugf("scene deleted: id=%v name=%q sources=%v",
         c.scenes[index].id, c.scenes[index].name, len(c.scenes[index].sources))
     removed_id := c.scenes[index].id
@@ -59,11 +66,13 @@ find :: proc(c: ^Collection, id: u64) -> ^Scene {
 }
 
 destroy_all :: proc(c: ^Collection) {
-    log.debugf("scene collection torn down (%v scenes)", len(c.scenes))
+    log.debugf("scene collection %q (%v) torn down (%v scenes)", c.name, c.id, len(c.scenes))
     for &s in c.scenes {
         destroy_scene(&s)
     }
     delete(c.scenes)
+    delete(c.id)
+    delete(c.name)
 }
 
 @(private)
@@ -71,6 +80,14 @@ alloc_id :: proc(c: ^Collection) -> u64 {
     id := c.next_id
     c.next_id += 1
     return id
+}
+
+@(private = "file")
+new_id :: proc() -> string {
+    return uuid.to_string(
+        uuid.generate_v4(),
+        context.allocator
+    )
 }
 
 @(private="file", rodata)
@@ -87,7 +104,7 @@ scene_color :: proc(id: u64) -> [4]f32 {
     return SCENE_PALETTE[id % len(SCENE_PALETTE)]
 }
 
-@(private="file")
+@(private)
 destroy_scene :: proc(s: ^Scene) {
     for &source in s.sources {
         destroy_source(&source)

@@ -15,7 +15,9 @@ State :: struct {
     controls: Controls_State,
     mixer: Mixer_State,
     sources: Sources_State,
-    settings: Settings_State
+    settings: Settings_State,
+    profiles: Profile_State,
+    collections: Collection_State,
 }
 
 draw :: proc(
@@ -25,11 +27,13 @@ draw :: proc(
     clear_color: ^im.Vec4,
     preview_tex: im.TextureRef,
     outputs: []capture.Output_Info,
+    profiles: []settings.Profile_Info,
+    collections: []scene.Collection_Info,
     canvas_w, canvas_h: f32,
 ) {
     im.DockSpaceOverViewport(0, im.GetMainViewport(), {.PassthruCentralNode}, nil)
 
-    draw_menubar(state, cfg, outputs);
+    draw_menubar(state, cfg, doc, outputs, profiles, collections);
 
     draw_preview(&state.preview, preview_tex)
     draw_scenes(&state.scenes, doc)
@@ -47,7 +51,9 @@ init_state :: proc(doc: ^scene.Collection) -> State {
         sources = init_sources_state(),
         mixer = init_mixer_state(),
         controls = init_controls_state(),
-        settings = init_settings_state()
+        settings = init_settings_state(),
+        profiles = init_profiles_state(),
+        collections = init_collections_state(),
     }
     if len(doc.scenes) > 0 {
         state.scenes.selected_id = doc.scenes[0].id

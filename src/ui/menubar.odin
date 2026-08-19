@@ -3,6 +3,7 @@ package ui
 import "core:fmt"
 import im "libs:odin-imgui"
 import "../capture"
+import "../scene"
 import "../settings"
 
 Save_Trigger :: enum {
@@ -59,9 +60,16 @@ match_preset :: proc(presets: []Canvas_Preset, w, h: i32) -> int {
     return len(presets)
 }
 
-draw_menubar :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.Output_Info) {
+draw_menubar :: proc(
+    state: ^State,
+    cfg: ^settings.Profile,
+    doc: ^scene.Collection,
+    outputs: []capture.Output_Info,
+    profiles: []settings.Profile_Info,
+    collections: []scene.Collection_Info,
+) {
     if im.BeginMainMenuBar() {
-        draw_file_menu(state)
+        draw_file_menu(state, cfg, doc, profiles, collections)
         draw_view_menu(state)
         im.EndMainMenuBar()
     }
@@ -70,14 +78,28 @@ draw_menubar :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.O
         im.OpenPopup("Settings")
     }
     draw_settings(state, cfg, outputs)
+
+    draw_profile_popups(&state.profiles, cfg.name)
+    draw_collection_popups(&state.collections, doc.name)
 }
 
 @(private="file")
-draw_file_menu :: proc(state: ^State) {
+draw_file_menu :: proc(
+    state: ^State,
+    cfg: ^settings.Profile,
+    doc: ^scene.Collection,
+    profiles: []settings.Profile_Info,
+    collections: []scene.Collection_Info,
+) {
     if im.BeginMenu("File") {
         if im.MenuItem("Save Settings") {
             state.settings.save_request = .File_Menu
         }
+
+        im.Separator()
+
+        draw_profile_menu(&state.profiles, profiles, cfg.id, cfg.name)
+        draw_collection_menu(&state.collections, collections, doc.id, doc.name)
 
         im.Separator()
 
@@ -101,7 +123,12 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.
     }
     s.was_open = state.show_settings
 
-    if im.BeginPopupModal("Settings", &state.show_settings) {
+    // The trailing ###Settings keeps the popup's ID stable (matching the bare
+    // "Settings" passed to OpenPopup above -- ImGui hashes only the part
+    // after ### when it's present) while the visible title tracks whichever
+    // profile is currently active.
+    title := fmt.ctprintf("Settings — %s###Settings", cfg.name)
+    if im.BeginPopupModal(title, &state.show_settings) {
         if im.BeginTabBar("SettingsTabs") {
             if im.BeginTabItem("Video") {
                 preview: cstring = s.preset_idx < len(presets) ? presets[s.preset_idx].label : "Custom"
