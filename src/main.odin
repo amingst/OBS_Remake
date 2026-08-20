@@ -22,6 +22,7 @@ import "render"
 import "scene"
 import "ui"
 import "capture"
+import "audio"
 
 main :: proc() {
 	// Wrap the heap allocator so we get a leak/bad-free report at exit.
@@ -274,6 +275,25 @@ main :: proc() {
 	defer capture.destroy_outputs(outputs)
 	capture.log_device_adapter(win.device)
 
+	audio_devices := audio.enumerate_devices()
+	defer audio.destroy_devices(audio_devices)
+	defer audio.shutdown()
+	for dev in audio_devices {
+		audio.log_device_format(dev)
+	}
+	
+	// TODO: Remove after testing
+	audio_stream: audio.Stream
+	defer audio.close_stream(&audio_stream)
+	for dev in audio_devices {
+		if dev.is_loopback {
+			if s, ok := audio.open_stream(dev); ok {
+				audio_stream = s
+			}
+			break
+		}
+	}
+
 	// The active scene collection. Same load-active/pick-first/create-Default
 	// shape as the profile selection above; unlike profiles there's no
 	// migration branch, since collections have never been persisted before.
@@ -351,12 +371,15 @@ main :: proc() {
 
     done := false
 	was_occluded := false
+	last_peak_log := time.now()
 	// Main loop
 	for !done {
 		// Poll and handle messages (inputs, window resize, etc.)
         if platform.pump_messages(&win) {
             break
         }
+
+		audio.poll_stream(&audio_stream)
 
 		// Handle window being minimized or screen locked
 		if win.swap_chain_occluded && win.swap_chain->Present(0, {.TEST}) == dxgi.STATUS_OCCLUDED {
@@ -493,6 +516,11 @@ main :: proc() {
 						})
 				}
 			}
+		}
+		if time.diff(last_peak_log, time.now()) > time.Second {
+			log.debugf("audio peak: %.4f", audio_stream.peak)
+			audio_stream.peak = 0
+			last_peak_log = time.now()
 		}
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 
