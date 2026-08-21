@@ -287,9 +287,7 @@ main :: proc() {
 	defer audio.close_stream(&audio_stream)
 	for dev in audio_devices {
 		if dev.is_loopback {
-			if s, ok := audio.open_stream(dev); ok {
-				audio_stream = s
-			}
+			audio.open_stream(&audio_stream, dev)
 			break
 		}
 	}

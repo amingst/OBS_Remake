@@ -3,9 +3,9 @@ package audio
 import "core:sys/windows"
 import "vendor:windows/wasapi"
 import "core:log"
+import "core:thread"
+import "base:intrinsics"
 
-
-AUDCLNT_STREAMFLAGS_LOOPBACK :: u32(0x00020000)
 
 IID_IAudioCaptureClient := &windows.IID{
     0xC8ADBD64, 0xE71E, 0x48a0, {0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17},
@@ -44,21 +44,25 @@ Stream :: struct {
     device:      ^wasapi.IMMDevice,
     client:      ^wasapi.IAudioClient,
     capture:     ^IAudioCaptureClient,
+    event:       windows.HANDLE,
     sample_rate: u32,
     channels:    u16,
     is_loopback: bool,
     peak:        f32,
+    ring: Ring,
+    thread: ^thread.Thread,
+    running: bool,
 }
 
-open_stream  :: proc(dev: Device_Info) -> (Stream, bool) {
+open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
     enumerator := get_enumerator()
-    if enumerator == nil do return {}, false
+    if enumerator == nil do return false
 
     wid := windows.utf8_to_wstring(dev.id, context.temp_allocator)
     device: ^wasapi.IMMDevice
     if hr := enumerator->GetDevice(wid, &device); windows.FAILED(hr) {
         log.errorf("GetDevice(%v) failed: 0x%08X", dev.id, u32(hr))
-        return {}, false
+        return false
     }
 
     client: ^wasapi.IAudioClient
@@ -71,7 +75,7 @@ open_stream  :: proc(dev: Device_Info) -> (Stream, bool) {
         log.errorf("Activate(IAudioClient) failed for %q: 0x%08X", dev.name, u32(hr))
         device->Release()
         device = nil
-        return {}, false
+        return false
     }
 
     wfx: ^wasapi.WAVEFORMATEX
@@ -81,17 +85,35 @@ open_stream  :: proc(dev: Device_Info) -> (Stream, bool) {
         client = nil
         device->Release()
         device = nil
-        return {}, false
+        return false
     }
     defer windows.CoTaskMemFree(wfx)
-        flags: u32 = dev.is_loopback ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0
+    flags := u32(wasapi.AUDCLNT_FLAG.STREAM_EVENTCALLBACK)
+    if dev.is_loopback do flags |= u32(wasapi.AUDCLNT_FLAG.STREAM_LOOPBACK)
     BUFFER_DURATION :: 100_000   // 10ms in 100ns units
+
+    event := windows.CreateEventW(nil, false, false, nil)
+    if event == nil {
+        log.errorf("CreateEventW failed for %q: %v", dev.name, windows.GetLastError())
+        client->Release()
+        device->Release()
+        return false
+    }
 
     if hr := client->Initialize(.SHARED, flags, BUFFER_DURATION, 0, wfx, nil); windows.FAILED(hr) {
         log.errorf("Initialize failed for %q: 0x%08X", dev.name, u32(hr))
         client->Release()
         device->Release()
-        return {}, false
+        windows.CloseHandle(event)
+        return false
+    }
+
+    if hr := client->SetEventHandle(event); windows.FAILED(hr) {
+        log.errorf("SetEventHandle failed for %q: 0x%08X", dev.name, u32(hr))
+        windows.CloseHandle(event)
+        client->Release()
+        device->Release()
+        return false
     }
 
     capture: ^IAudioCaptureClient
@@ -99,7 +121,8 @@ open_stream  :: proc(dev: Device_Info) -> (Stream, bool) {
         log.errorf("GetService(IAudioCaptureClient) failed for %q: 0x%08X", dev.name, u32(hr))
         client->Release()
         device->Release()
-        return {}, false
+        windows.CloseHandle(event)
+        return false
     }
 
     if hr := client->Start(); windows.FAILED(hr) {
@@ -107,52 +130,102 @@ open_stream  :: proc(dev: Device_Info) -> (Stream, bool) {
         capture->Release()
         client->Release()
         device->Release()
-        return {}, false
+        windows.CloseHandle(event)
+        return false
     }
 
     log.infof("stream open: %q %v Hz %v ch loopback=%v",
         dev.name, wfx.nSamplesPerSec, wfx.nChannels, dev.is_loopback)
 
-    return Stream{
-        device      = device,
-        client      = client,
-        capture     = capture,
-        sample_rate = wfx.nSamplesPerSec,
-        channels    = wfx.nChannels,
-        is_loopback = dev.is_loopback,
-    }, true
+    s.device = device
+    s.client = client
+    s.capture = capture
+    s.event = event
+    s.sample_rate = wfx.nSamplesPerSec
+    s.channels = wfx.nChannels
+    s.is_loopback = dev.is_loopback
+    ring_init(&s.ring, 65536)
+
+    intrinsics.atomic_store_explicit(&s.running, true, .Release)
+    s.thread = thread.create(stream_thread)
+    if s.thread == nil {
+        log.error("could not create audio thread")
+    } else {
+        s.thread.data = s
+        thread.start(s.thread)
+    }
+    return true
 }
 
 close_stream :: proc(s: ^Stream) {
+    // Thread needs to be released before anything else
+    // causes random corruption instead of a crash
+    if s.thread != nil {
+        intrinsics.atomic_store_explicit(&s.running, false, .Release)
+        windows.SetEvent(s.event)
+        thread.join(s.thread)
+        thread.destroy(s.thread)
+        s.thread = nil
+    }
+
+
     if s.client != nil do s.client->Stop()
     if s.capture != nil { s.capture->Release(); s.capture = nil }
     if s.client  != nil { s.client->Release();  s.client  = nil }
     if s.device  != nil { s.device->Release();  s.device  = nil }
+    if s.event   != nil { windows.CloseHandle(s.event); s.event = nil }
+    ring_destroy(&s.ring)
     log.debug("audio stream closed")
 }
 
 poll_stream  :: proc(s: ^Stream) {
     if s.capture == nil do return
+    scratch: [4096]f32
+    for {
+        n := ring_read(&s.ring, scratch[:])
+        if n == 0 do break
+        for v in scratch[:n] {
+            a := abs(v)
+            if a > s.peak do s.peak = a
+        }
+    }
+}
+
+@(private="file")
+drain_packets :: proc(s: ^Stream) {
+    if s.capture == nil do return
     for {
         packet: u32
         if hr := s.capture->GetNextPacketSize(&packet); windows.FAILED(hr) do return
-        if packet == 0 do break   // nothing waiting
+        if packet == 0 do break
 
         data: [^]u8
         frames: u32
         flags: u32
-        if hr := s.capture->GetBuffer(&data, &frames, &flags, nil, nil); windows.FAILED(hr) do return
 
-        // 32-bit float, interleaved. AUDCLNT_BUFFERFLAGS_SILENT (0x2) means the
-        // buffer contents are undefined and should be treated as zeroes.
+        if hr := s.capture->GetBuffer(&data, &frames, &flags, nil, nil); windows.FAILED(hr) do return
         if flags & 0x2 == 0 && data != nil {
             samples := (cast([^]f32)data)[:frames * u32(s.channels)]
-            for v in samples {
-                a := abs(v)
-                if a > s.peak do s.peak = a
+            if n := ring_write(&s.ring, samples); n < len(samples) {
+                log.warnf("audio ring overflow: dropped %v samples", len(samples) - n)
             }
         }
 
         s.capture->ReleaseBuffer(frames)
     }
+}
+
+@(private="file")
+stream_thread :: proc(t: ^thread.Thread) {
+    s := (^Stream)(t.data)
+
+    windows.CoInitializeEx(nil, .MULTITHREADED)
+    defer windows.CoUninitialize()
+
+    for intrinsics.atomic_load_explicit(&s.running, .Acquire) {
+        if windows.WaitForSingleObject(s.event, 200) != windows.WAIT_OBJECT_0 do continue
+        drain_packets(s)
+    }
+
+    log.debug("audio thread exiting")
 }
