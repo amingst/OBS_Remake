@@ -5,8 +5,21 @@ import "core:strings"
 import "vendor:directx/d3d11"
 import "vendor:directx/dxgi"
 import time "core:time"
-
+import "../audio"
 import "../capture"
+
+Audio_Params :: struct {
+    volume: f32,
+    muted: bool
+}
+
+Audio_Data :: struct {
+    using params: Audio_Params,
+    device_id: string,
+    is_loopback: bool,
+    stream: ^audio.Stream,
+    next_retry: time.Time,
+}
 
 Color_Data :: struct {
 }
@@ -24,6 +37,7 @@ Display_Data :: struct {
 Source_Data :: union {
     Color_Data,
     Display_Data,
+    Audio_Data,
 }
 
 Source :: struct {
@@ -96,6 +110,12 @@ destroy_source :: proc(src: ^Source) {
             // Nothing to release
         case Display_Data:
             reset_display_capture(&d)
+        case Audio_Data:
+            if d.stream != nil {
+                audio.release_stream(d.device_id)
+                d.stream = nil
+            }
+            delete(d.device_id)
     }
 
     delete(src.name)

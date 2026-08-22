@@ -285,12 +285,12 @@ main :: proc() {
 	// TODO: Remove after testing
 	audio_stream: audio.Stream
 	defer audio.close_stream(&audio_stream)
-	for dev in audio_devices {
-		if dev.is_loopback {
-			audio.open_stream(&audio_stream, dev)
-			break
-		}
-	}
+	// for dev in audio_devices {
+	// 	if dev.is_loopback {
+	// 		audio.open_stream(&audio_stream, dev.id, dev.is_default)
+	// 		break
+	// 	}
+	// }
 
 	// The active scene collection. Same load-active/pick-first/create-Default
 	// shape as the profile selection above; unlike profiles there's no
@@ -472,6 +472,14 @@ main :: proc() {
 			for &src in sel.sources {
 				if !src.visible do continue
 				switch &d in src.data {
+					case scene.Audio_Data:
+						if d.stream == nil && d.device_id != "" && time.now()._nsec >= d.next_retry._nsec {
+							if s := audio.acquire_stream(d.device_id, d.is_loopback); s != nil {
+								d.stream = s
+							} else {
+								d.next_retry = time.time_add(time.now(),2 * time.Second)
+							}
+						}
 					case scene.Color_Data:
 						append(&quads, render.Quad{
 							x = src.x, y = src.y, w = src.w, h = src.h,
@@ -534,7 +542,7 @@ main :: proc() {
         // Rebuilt each frame so it stays correct if the target is recreated.
         preview_tex := im.TextureRef{_TexID = im.TextureID(uintptr(preview_target.srv))}
         ui.draw(&ui_state, &cfg, &doc, &clear_color, preview_tex, outputs, profile_infos, collection_infos,
-            f32(preview_target.width), f32(preview_target.height))
+            f32(preview_target.width), f32(preview_target.height), audio_devices)
 
 		// Rendering
 		im.Render()

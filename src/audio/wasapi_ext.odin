@@ -54,14 +54,14 @@ Stream :: struct {
     running: bool,
 }
 
-open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
+open_stream  :: proc(s: ^Stream, device_id: string, is_loopback: bool) -> bool {
     enumerator := get_enumerator()
     if enumerator == nil do return false
 
-    wid := windows.utf8_to_wstring(dev.id, context.temp_allocator)
+    wid := windows.utf8_to_wstring(device_id, context.temp_allocator)
     device: ^wasapi.IMMDevice
     if hr := enumerator->GetDevice(wid, &device); windows.FAILED(hr) {
-        log.errorf("GetDevice(%v) failed: 0x%08X", dev.id, u32(hr))
+        log.errorf("GetDevice(%v) failed: 0x%08X", device_id, u32(hr))
         return false
     }
 
@@ -72,7 +72,7 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
         nil,
         (^rawptr)(&client),
     ); windows.FAILED(hr) {
-        log.errorf("Activate(IAudioClient) failed for %q: 0x%08X", dev.name, u32(hr))
+        log.errorf("Activate(IAudioClient) failed for %q: 0x%08X", device_id, u32(hr))
         device->Release()
         device = nil
         return false
@@ -80,7 +80,7 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
 
     wfx: ^wasapi.WAVEFORMATEX
     if hr := client->GetMixFormat(&wfx); windows.FAILED(hr) {
-        log.errorf("GetMixFormat failed for %q: 0x%08X", dev.name, u32(hr))
+        log.errorf("GetMixFormat failed for %q: 0x%08X", device_id, u32(hr))
         client->Release()
         client = nil
         device->Release()
@@ -89,19 +89,19 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
     }
     defer windows.CoTaskMemFree(wfx)
     flags := u32(wasapi.AUDCLNT_FLAG.STREAM_EVENTCALLBACK)
-    if dev.is_loopback do flags |= u32(wasapi.AUDCLNT_FLAG.STREAM_LOOPBACK)
+    if is_loopback do flags |= u32(wasapi.AUDCLNT_FLAG.STREAM_LOOPBACK)
     BUFFER_DURATION :: 100_000   // 10ms in 100ns units
 
     event := windows.CreateEventW(nil, false, false, nil)
     if event == nil {
-        log.errorf("CreateEventW failed for %q: %v", dev.name, windows.GetLastError())
+        log.errorf("CreateEventW failed for %q: %v", device_id, windows.GetLastError())
         client->Release()
         device->Release()
         return false
     }
 
     if hr := client->Initialize(.SHARED, flags, BUFFER_DURATION, 0, wfx, nil); windows.FAILED(hr) {
-        log.errorf("Initialize failed for %q: 0x%08X", dev.name, u32(hr))
+        log.errorf("Initialize failed for %q: 0x%08X", device_id, u32(hr))
         client->Release()
         device->Release()
         windows.CloseHandle(event)
@@ -109,7 +109,7 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
     }
 
     if hr := client->SetEventHandle(event); windows.FAILED(hr) {
-        log.errorf("SetEventHandle failed for %q: 0x%08X", dev.name, u32(hr))
+        log.errorf("SetEventHandle failed for %q: 0x%08X", device_id, u32(hr))
         windows.CloseHandle(event)
         client->Release()
         device->Release()
@@ -118,7 +118,7 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
 
     capture: ^IAudioCaptureClient
     if hr := client->GetService(IID_IAudioCaptureClient, (^rawptr)(&capture)); windows.FAILED(hr) {
-        log.errorf("GetService(IAudioCaptureClient) failed for %q: 0x%08X", dev.name, u32(hr))
+        log.errorf("GetService(IAudioCaptureClient) failed for %q: 0x%08X", device_id, u32(hr))
         client->Release()
         device->Release()
         windows.CloseHandle(event)
@@ -126,7 +126,7 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
     }
 
     if hr := client->Start(); windows.FAILED(hr) {
-        log.errorf("Start failed for %q: 0x%08X", dev.name, u32(hr))
+        log.errorf("Start failed for %q: 0x%08X", device_id, u32(hr))
         capture->Release()
         client->Release()
         device->Release()
@@ -135,7 +135,7 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
     }
 
     log.infof("stream open: %q %v Hz %v ch loopback=%v",
-        dev.name, wfx.nSamplesPerSec, wfx.nChannels, dev.is_loopback)
+        device_id, wfx.nSamplesPerSec, wfx.nChannels, is_loopback)
 
     s.device = device
     s.client = client
@@ -143,7 +143,7 @@ open_stream  :: proc(s: ^Stream, dev: Device_Info) -> bool {
     s.event = event
     s.sample_rate = wfx.nSamplesPerSec
     s.channels = wfx.nChannels
-    s.is_loopback = dev.is_loopback
+    s.is_loopback = is_loopback
     ring_init(&s.ring, 65536)
 
     intrinsics.atomic_store_explicit(&s.running, true, .Release)

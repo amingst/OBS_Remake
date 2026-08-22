@@ -12,10 +12,15 @@ Source_DTO :: struct {
     x, y:    f32,
     w, h:    f32,
     color:   [4]f32,
-    kind:    string, // "color" | "display"
+    kind:    string, // "color" | "display" | "audio"
 
     adapter_index: i32,
     output_index:  i32,
+
+    device_id: string,
+    is_loopback: bool,
+    volume: f32,
+    muted: bool
 }
 
 Scene_DTO :: struct {
@@ -97,12 +102,18 @@ to_dto :: proc(c: ^Collection) -> Collection_DTO {
                 color   = src.color,
             }
             switch d in src.data {
-            case Color_Data:
-                dto.kind = "color"
-            case Display_Data:
-                dto.kind          = "display"
-                dto.adapter_index = d.adapter_index
-                dto.output_index  = d.output_index
+                case Color_Data:
+                    dto.kind = "color"
+                case Display_Data:
+                    dto.kind          = "display"
+                    dto.adapter_index = d.adapter_index
+                    dto.output_index  = d.output_index
+                case Audio_Data:
+                    dto.kind = "audio"
+                    dto.device_id = d.device_id
+                    dto.volume = d.params.volume
+                    dto.muted = d.params.muted
+                    dto.is_loopback = d.is_loopback
             }
             sources[j] = dto
         }
@@ -149,6 +160,15 @@ from_dto :: proc(dto: ^Collection_DTO, c: ^Collection) {
                 data = Display_Data{
                     adapter_index = src_dto.adapter_index,
                     output_index  = src_dto.output_index,
+                }
+            case "audio":
+                data = Audio_Data{
+                    device_id = strings.clone(src_dto.device_id),
+                    is_loopback = src_dto.is_loopback,
+                    params = Audio_Params{
+                        volume = src_dto.volume,
+                        muted = src_dto.muted
+                    }
                 }
             case:
                 // One bad source must not sink the whole collection.

@@ -35,6 +35,16 @@ shutdown :: proc() {
         g_enumerator = nil
         log.debug("audio enumerator released")
     }
+    if len(g_streams) > 0 {
+        log.warnf("audio shutdown with %v stream(s) still referenced", len(g_streams))
+    }
+
+    for id, entry in g_streams {
+        log.debug("Releasing device with id %v", id)
+        close_stream(entry.stream)
+        free(entry.stream)
+    }
+    delete(g_streams)
 }
 
 @(private="file") RPC_E_CHANGED_MODE  :: windows.HRESULT(-2147417850) // 0x80010106
