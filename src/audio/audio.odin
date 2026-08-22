@@ -43,6 +43,7 @@ shutdown :: proc() {
         log.debug("Releasing device with id %v", id)
         close_stream(entry.stream)
         free(entry.stream)
+        delete(entry.key)
     }
     delete(g_streams)
 }

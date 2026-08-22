@@ -529,7 +529,7 @@ main :: proc() {
 			last_peak_log = time.now()
 		}
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
-
+		audio.update_levels()
 		// Start the Dear ImGui frame
 		imdx11.NewFrame()
 		imwin32.NewFrame()

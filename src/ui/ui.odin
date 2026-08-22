@@ -40,7 +40,7 @@ draw :: proc(
     draw_preview(&state.preview, &state.sources, &state.scenes, doc, preview_tex, canvas_w, canvas_h)
     draw_scenes(&state.scenes, doc)
     draw_sources(&state.sources, &state.scenes, doc, outputs, canvas_w, canvas_h, audio_devices)
-    draw_mixer(&state.mixer)
+    draw_mixer(&state.mixer, &state.scenes, doc)
     draw_controls(&state.controls)
 }
 
