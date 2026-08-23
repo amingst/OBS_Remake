@@ -7,6 +7,7 @@ Target :: struct {
     texture: ^d3d11.ITexture2D,
     rtv:     ^d3d11.IRenderTargetView,
     srv:     ^d3d11.IShaderResourceView,
+    staging: ^d3d11.ITexture2D,
     width, height: u32,
 }
 
@@ -22,16 +23,36 @@ create_target :: proc(device: ^d3d11.IDevice, w, h: u32) -> (Target, bool) {
         Height     = h,
         MipLevels  = 1,
         ArraySize  = 1,
-        Format     = .R8G8B8A8_UNORM,
+        Format     = .B8G8R8A8_UNORM,
         SampleDesc = {Count = 1},
         Usage      = .DEFAULT,
         BindFlags  = {.RENDER_TARGET, .SHADER_RESOURCE},
     }
 
+    // Separate CPU-readable copy for encoder readback: a DEFAULT-usage render
+    // target can't be Mapped, so frames go CopyResource -> staging -> Map.
+    staging_desc := d3d11.TEXTURE2D_DESC{
+        Width      = w,
+        Height     = h,
+        MipLevels  = 1,
+        ArraySize  = 1,
+        Format     = .B8G8R8A8_UNORM,
+        SampleDesc = {Count = 1},
+        Usage      = .STAGING,
+        // Staging resources can't be bound to the pipeline, so no BindFlags.
+        CPUAccessFlags = {.READ},
+    }
+
     target := Target{width = w, height = h}
 
     if hr := device->CreateTexture2D(&desc, nil, &target.texture); hr != 0 {
-        log.errorf("CreateTexture2D(%vx%v, R8G8B8A8_UNORM, RENDER_TARGET|SHADER_RESOURCE) failed: HRESULT 0x%08X", w, h, u32(hr))
+        log.errorf("CreateTexture2D(%vx%v) failed: 0x%08X", w, h, u32(hr))
+        destroy_target(&target)
+        return {}, false
+    }
+
+    if hr := device->CreateTexture2D(&staging_desc, nil, &target.staging); hr != 0 {
+        log.errorf("staging CreateTexture2D(%vx%v) failed: 0x%08X", w, h, u32(hr))
         destroy_target(&target)
         return {}, false
     }
@@ -48,13 +69,19 @@ create_target :: proc(device: ^d3d11.IDevice, w, h: u32) -> (Target, bool) {
         return {}, false
     }
 
-    log.infof("render target created: %vx%v R8G8B8A8_UNORM", w, h)
+    log.infof("render target created: %vx%v .B8G8R8A8_UNORM", w, h)
     return target, true
 }
 
 destroy_target :: proc(target: ^Target) {
     if target == nil { return }
     log.debugf("releasing render target (%vx%v)", target.width, target.height)
+    
+    if target.staging != nil {
+        target.staging->Release()
+        target.staging = nil
+    }
+    
     if target.srv != nil {
         target.srv->Release()
         target.srv = nil
@@ -128,4 +155,51 @@ draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, pipeline: ^Pipel
         ctx->PSSetShaderResources(0, 1, &srv)
         ctx->Draw(4, 0)
     }
+}
+
+read_target :: proc(
+    ctx: ^d3d11.IDeviceContext,
+    target: ^Target,
+    dst: []u8,
+    flip_vertical := false,
+) -> bool {
+    if target.staging == nil do return false
+
+    row_bytes := int(target.width) * 4
+    if len(dst) < row_bytes * int(target.height) {
+        log.errorf("read_target: dst too small (%v bytes, need %v)",
+            len(dst), row_bytes * int(target.height))
+        return false
+    }
+
+    ctx->CopyResource(
+        (^d3d11.IResource)(target.staging),
+        (^d3d11.IResource)(target.texture)
+    )
+    mapped: d3d11.MAPPED_SUBRESOURCE
+    if hr := ctx->Map(
+        (^d3d11.IResource)(target.staging),
+        0,
+        .READ,
+        {},
+        &mapped
+    ); hr < 0 {
+        log.errorf("Map(staging) failed: 0x%08X", u32(hr))
+        return false
+    }
+    defer ctx->Unmap((^d3d11.IResource)(target.staging), 0)
+
+    // RowPitch is not necessarily width*4 -- D3D pads rows for alignment, so
+    // copying the whole thing in one memcpy would shear the image. Flipping
+    // costs nothing extra here since the loop already goes row by row --
+    // just write row y to height-1-y instead of y.
+    src := ([^]u8)(mapped.pData)
+    for y in 0..<int(target.height) {
+        src_off := y * int(mapped.RowPitch)
+        dst_row := flip_vertical ? int(target.height) - 1 - y : y
+        dst_off := dst_row * row_bytes
+        copy(dst[dst_off:dst_off+row_bytes], src[src_off:src_off+row_bytes])
+    }
+
+    return true
 }

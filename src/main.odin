@@ -13,6 +13,7 @@ import imdx11  "libs:odin-imgui/backends/dx11"
 import time "core:time"
 import "core:os"
 import "core:strings"
+import "core:path/filepath"
 
 // Import from platform module
 import "config"
@@ -23,6 +24,7 @@ import "scene"
 import "ui"
 import "capture"
 import "audio"
+import "encode"
 
 main :: proc() {
 	// Wrap the heap allocator so we get a leak/bad-free report at exit.
@@ -370,6 +372,7 @@ main :: proc() {
     done := false
 	was_occluded := false
 	last_peak_log := time.now()
+	recording := false
 	// Main loop
 	for !done {
 		// Poll and handle messages (inputs, window resize, etc.)
@@ -405,11 +408,21 @@ main :: proc() {
 			platform.create_render_target(&win)
 		}
 
+		frame_bytes := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
+		defer delete(frame_bytes)
+
 		// Bring the live objects in line with what the settings modal published.
 		// Ordering constraints and the reasoning live in reconcile.odin; the
 		// only thing that matters here is that this runs well before
 		// im.NewFrame().
-		reconcile(&applied, &cfg, win.device, &preview_target)
+		reconcile(&applied, &cfg, win.device, &preview_target, recording)
+
+		// Check each frame for resize after each reconcile call	
+		needed := int(preview_target.width) * int(preview_target.height) * 4
+		if len(frame_bytes) != needed {
+			delete(frame_bytes)
+			frame_bytes = make([]u8, needed)
+		}
 
 		// Service a pending save. Deliberately placed *after* the reconciliation
 		// above rather than next to the ui.draw call that raises the request: the
@@ -450,6 +463,14 @@ main :: proc() {
 		if req := ui_state.collections.request; req != .None {
 			handle_collection_request(req, &ui_state.collections, &ui_state.scenes, &ui_state.sources,
 				&doc, &app_cfg, &paths, &collection_infos)
+		}
+
+		// Service a pending recording request. Deliberately after reconcile,
+		// same as the requests above: a canvas resize landing between
+		// encode.start and the first pushed frame would hand the encoder a
+		// resolution that doesn't match what it was configured with.
+		if req := ui_state.controls.request; req != .None {
+			handle_controls_request(req, &ui_state.controls, &recording, &paths, &preview_target, cfg.video.fps)
 		}
 
 		// Neutral fallback for "no scene selected" -- selected_id 0, or the
@@ -530,6 +551,28 @@ main :: proc() {
 		}
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 		audio.update_levels()
+
+		if recording {
+			// flip_vertical: MFVideoFormat_RGB32 is bottom-up by convention and
+			// MF ignores the MF_MT_DEFAULT_STRIDE hint that's supposed to
+			// override that (see the comment in mf.odin's begin_recording), so
+			// the rows are flipped here instead. This is a workaround for that
+			// one encoder, not the default -- every other read_target caller
+			// wants top-down rows.
+			if render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true) {
+				encode.push_video(frame_bytes)
+			}
+		}
+		@static dumped := false
+		if !dumped {
+			buf := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
+			defer delete(buf)
+			if render.read_target(win.device_context, &preview_target, buf) {
+				log.infof("readback: first pixel BGRA = %v %v %v %v", buf[0], buf[1], buf[2], buf[3])
+			}
+			dumped = true
+		}
+
 		// Start the Dear ImGui frame
 		imdx11.NewFrame()
 		imwin32.NewFrame()
@@ -541,6 +584,13 @@ main :: proc() {
         // is an already-uploaded backend texture, use _TexID directly".
         // Rebuilt each frame so it stays correct if the target is recreated.
         preview_tex := im.TextureRef{_TexID = im.TextureID(uintptr(preview_target.srv))}
+
+        // ui can't query the encoder directly -- its state is a private
+        // package singleton, and a UI panel reaching into a subsystem would
+        // be backwards -- so main writes down its own recording state here,
+        // every frame, for the Controls panel to read.
+        ui_state.controls.recording = recording
+
         ui.draw(&ui_state, &cfg, &doc, &clear_color, preview_tex, outputs, profile_infos, collection_infos,
             f32(preview_target.width), f32(preview_target.height), audio_devices)
 
@@ -674,6 +724,60 @@ handle_profile_request :: proc(
 
 	case .Delete:
 		delete_active_profile(cfg, app_cfg, paths, infos, state)
+	}
+}
+
+// Dispatches a Controls panel request raised by ui. Same one-shot contract as
+// handle_profile_request: the request is always cleared, whether or not the
+// action actually went through. Starting while already recording, or
+// stopping while not, is a no-op rather than a double call into encode.
+@(private = "file")
+handle_controls_request :: proc(
+	req:       ui.Controls_Request,
+	state:     ^ui.Controls_State,
+	recording: ^bool,
+	paths:     ^config.Paths,
+	target:    ^render.Target,
+	fps:       i32,
+) {
+	state.request = .None
+
+	#partial switch req {
+	case .Start_Recording:
+		if recording^ do return
+		if paths.videos == "" {
+			log.warn("recording requested, but no videos directory is available")
+			return
+		}
+
+		year, month, day := time.date(time.now())
+		hour, min, sec := time.clock(time.now())
+		filename := fmt.aprintf("recording_%4d-%02d-%02d_%02d-%02d-%02d.mp4",
+			year, int(month), day, hour, min, sec)
+		defer delete(filename)
+
+		out_path, jerr := filepath.join({paths.videos, filename})
+		if jerr != nil {
+			log.warnf("could not build recording output path: %v", jerr)
+			return
+		}
+		// encode.start (via mf.begin_recording) converts this to a wide
+		// string synchronously and doesn't retain the Odin string, so it's
+		// safe to free right after the call returns.
+		defer delete(out_path)
+
+		if encode.start(out_path, target.width, target.height, u32(fps)) {
+			recording^ = true
+			log.infof("recording started -> %v", out_path)
+		} else {
+			log.warn("failed to start recording (cause logged above)")
+		}
+
+	case .Stop_Recording:
+		if !recording^ do return
+		encode.stop()
+		recording^ = false
+		log.info("recording stopped")
 	}
 }
 

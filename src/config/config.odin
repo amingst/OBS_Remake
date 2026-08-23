@@ -3,6 +3,7 @@ package config
 import "core:log"
 import "core:os"
 import "core:path/filepath"
+import "core:strings"
 import win32 "core:sys/windows"
 
 @(private)
@@ -21,6 +22,7 @@ Paths :: struct {
 	settings:    string,   // root/settings.json  (migration-only: read by the one-shot legacy migration in main, nothing else should touch it)
 	profiles:    string,   // root/profiles/
 	collections: string,   // root/collections/
+	videos:      string,   // recording output directory, e.g. %USERPROFILE%\Videos
 }
 
 destroy_paths :: proc(p: ^Paths) {
@@ -30,6 +32,7 @@ destroy_paths :: proc(p: ^Paths) {
 	if p.settings    != "" do delete(p.settings)
 	if p.profiles    != "" do delete(p.profiles)
 	if p.collections != "" do delete(p.collections)
+	if p.videos      != "" do delete(p.videos)
 	p^ = {}
 }
 
@@ -72,8 +75,52 @@ resolve_paths :: proc() -> (paths: Paths, ok: bool) {
 	if !join_into(&paths.collections, paths.root, "collections") do return
 	if !make_dir(paths.collections)                              do return
 
+	// Recording output. Unlike the rest of Paths this isn't nested under
+	// paths.root -- it's the user's actual Videos folder, not app config --
+	// and its own resolution failure is non-fatal to the rest of Paths: a
+	// blank paths.videos just means recording can't start, logged where it's
+	// attempted, same "no persistence" contract as a blank paths.profiles.
+	resolve_videos(&paths)
+
 	ok = true
 	return
+}
+
+@(private = "file")
+resolve_videos :: proc(paths: ^Paths) {
+	videos: string
+	folder_id := win32.FOLDERID_Videos // needs an addressable copy
+	wpath: win32.LPWSTR
+	if hr := win32.SHGetKnownFolderPath(&folder_id, 0, nil, &wpath); hr >= 0 && wpath != nil {
+		defer win32.CoTaskMemFree(wpath)
+		if s, err := win32.wstring_to_utf8(win32.wstring(wpath), -1, context.temp_allocator);
+		   err == nil && s != "" {
+			videos = s
+			log.debugf("videos directory from SHGetKnownFolderPath: %v", videos)
+		}
+	} else {
+		log.warnf("SHGetKnownFolderPath(FOLDERID_Videos) failed: HRESULT 0x%08X", u32(hr))
+	}
+
+	if videos == "" {
+		profile, found := os.lookup_env("USERPROFILE", context.temp_allocator)
+		if !found || profile == "" {
+			log.warn("no Videos directory available (known folder and USERPROFILE both failed); recording will not be available")
+			return
+		}
+		joined, jerr := filepath.join({profile, "Videos"}, context.temp_allocator)
+		if jerr != nil {
+			log.warnf("could not build videos path from USERPROFILE: %v; recording will not be available", jerr)
+			return
+		}
+		videos = joined
+		log.debugf("videos directory from USERPROFILE: %v", videos)
+	}
+
+	if !make_dir(videos) {
+		return
+	}
+	paths.videos = strings.clone(videos)
 }
 
 @(private="file")
