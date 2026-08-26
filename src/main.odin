@@ -284,15 +284,12 @@ main :: proc() {
 		audio.log_device_format(dev)
 	}
 	
-	// TODO: Remove after testing
-	audio_stream: audio.Stream
-	defer audio.close_stream(&audio_stream)
-	// for dev in audio_devices {
-	// 	if dev.is_loopback {
-	// 		audio.open_stream(&audio_stream, dev.id, dev.is_default)
-	// 		break
-	// 	}
-	// }
+	// Mixer state — allocated once, freed at exit.
+	CHANNELS :: 2
+	mix_buf := make([]f32, audio.BLOCK_SAMPLES * CHANNELS)
+	defer delete(mix_buf)
+	blocks_emitted: u64
+	mixer_started := false
 
 	// The active scene collection. Same load-active/pick-first/create-Default
 	// shape as the profile selection above; unlike profiles there's no
@@ -371,16 +368,16 @@ main :: proc() {
 
     done := false
 	was_occluded := false
-	last_peak_log := time.now()
 	recording := false
+	video_frame_count: u64
+	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
+	has_audio_sources := false // set each frame, used by the recording-start handler next frame
 	// Main loop
 	for !done {
 		// Poll and handle messages (inputs, window resize, etc.)
         if platform.pump_messages(&win) {
             break
         }
-
-		audio.poll_stream(&audio_stream)
 
 		// Handle window being minimized or screen locked
 		if win.swap_chain_occluded && win.swap_chain->Present(0, {.TEST}) == dxgi.STATUS_OCCLUDED {
@@ -470,7 +467,14 @@ main :: proc() {
 		// encode.start and the first pushed frame would hand the encoder a
 		// resolution that doesn't match what it was configured with.
 		if req := ui_state.controls.request; req != .None {
-			handle_controls_request(req, &ui_state.controls, &recording, &paths, &preview_target, cfg.video.fps)
+			was_recording := recording
+			handle_controls_request(req, &ui_state.controls, &recording, &paths, &preview_target, cfg.video.fps, has_audio_sources)
+			if recording && !was_recording {
+				// Reset clocks so the first sample/frame is PTS 0.
+				blocks_emitted = 0
+				video_frame_count = 0
+				using_audio_clock = false
+			}
 		}
 
 		// Neutral fallback for "no scene selected" -- selected_id 0, or the
@@ -489,6 +493,7 @@ main :: proc() {
 		// first means our binding here is harmlessly replaced rather than
 		// clobbering ImGui's.quads := make([dynamic]render.Quad, context.temp_allocator)
 		quads := make([dynamic]render.Quad, context.temp_allocator)
+		inputs := make([dynamic]audio.Mix_Input, context.temp_allocator)
 		if sel := scene.find(&doc, ui_state.scenes.selected_id); sel != nil {
 			for &src in sel.sources {
 				if !src.visible do continue
@@ -497,9 +502,19 @@ main :: proc() {
 						if d.stream == nil && d.device_id != "" && time.now()._nsec >= d.next_retry._nsec {
 							if s := audio.acquire_stream(d.device_id, d.is_loopback); s != nil {
 								d.stream = s
+								if s.sample_rate != 48000 {
+									log.warnf("audio stream %v reports %v Hz, expected 48000 — recording may be pitch-shifted", d.device_id, s.sample_rate)
+								}
 							} else {
 								d.next_retry = time.time_add(time.now(),2 * time.Second)
 							}
+						}
+						if d.stream != nil {
+							append(&inputs, audio.Mix_Input{
+								stream = d.stream,
+								volume = d.volume,
+								muted  = d.muted,
+							})
 						}
 					case scene.Color_Data:
 						append(&quads, render.Quad{
@@ -526,7 +541,7 @@ main :: proc() {
 							}
 						}
 						if d.dupl != nil && d.texture != nil {
-							ok, lost := capture.acquire_frame(win.device_context, d.dupl, d.texture)
+							ok, lost, got_frame := capture.acquire_frame(win.device_context, d.dupl, d.texture)
 							if lost {
 								log.warn("duplication access lost, will restart")
 								capture.stop_duplication(d.dupl)
@@ -534,6 +549,30 @@ main :: proc() {
 								d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
 							}
 							_ = ok
+
+							// Stall tracking: detect when the desktop stops
+							// producing new frames (e.g. display sleep) and log
+							// the transition. A static desktop is normal — the
+							// app correctly re-encodes the last frame — but the
+							// log should say so, since a frozen recording is
+							// otherwise indistinguishable from a bug.
+							STALL_THRESHOLD :: 5 * time.Second
+							now := time.now()
+							if got_frame {
+								if d.stalled {
+									elapsed := time.diff(d.last_frame_time, now)
+									log.infof("display capture resumed after %v with no new desktop frames (adapter %v output %v)",
+										elapsed, d.adapter_index, d.output_index)
+								}
+								d.last_frame_time = now
+								d.stalled = false
+							} else if d.last_frame_time._nsec != 0 && !d.stalled {
+								if time.diff(d.last_frame_time, now) > STALL_THRESHOLD {
+									log.infof("display capture: no new desktop frames for >5s — desktop is likely static or display is asleep (adapter %v output %v); encoding last frame",
+										d.adapter_index, d.output_index)
+									d.stalled = true
+								}
+							}
 						}
 
 						append(&quads, render.Quad{
@@ -544,14 +583,33 @@ main :: proc() {
 				}
 			}
 		}
-		if time.diff(last_peak_log, time.now()) > time.Second {
-			log.debugf("audio peak: %.4f", audio_stream.peak)
-			audio_stream.peak = 0
-			last_peak_log = time.now()
-		}
+		has_audio_sources = len(inputs) > 0
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
-		audio.update_levels()
 
+		// -- Audio mixer --------------------------------------------------
+		// Reset the startup gate when all audio sources disappear so that a
+		// newly added source after a gap starts buffered.
+		if len(inputs) == 0 {
+			mixer_started = false
+		}
+
+		if !mixer_started && audio.mixer_ready(inputs[:], CHANNELS) {
+			mixer_started = true
+		}
+
+		if mixer_started {
+			for audio.mix_block(inputs[:], mix_buf, CHANNELS) {
+				if recording {
+					pts_100ns := i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
+					duration_100ns := i64(audio.BLOCK_SAMPLES) * 10_000_000 / 48000
+					pcm_buf := f32_to_pcm16(mix_buf)
+					encode.push_audio(pcm_buf, pts_100ns, duration_100ns)
+				}
+				blocks_emitted += 1
+			}
+		}
+
+		// -- Video push ---------------------------------------------------
 		if recording {
 			// flip_vertical: MFVideoFormat_RGB32 is bottom-up by convention and
 			// MF ignores the MF_MT_DEFAULT_STRIDE hint that's supposed to
@@ -559,8 +617,24 @@ main :: proc() {
 			// the rows are flipped here instead. This is a workaround for that
 			// one encoder, not the default -- every other read_target caller
 			// wants top-down rows.
+			video_pts: i64
+			want_audio_clock := len(inputs) > 0
+			if want_audio_clock {
+				video_pts = i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
+			} else {
+				video_pts = i64(video_frame_count) * (i64(10_000_000) / i64(cfg.video.fps))
+			}
+			if want_audio_clock != using_audio_clock {
+				if want_audio_clock {
+					log.info("video PTS: switching to audio-master clock")
+				} else {
+					log.info("video PTS: switching to frame-counter fallback (no audio sources)")
+				}
+				using_audio_clock = want_audio_clock
+			}
 			if render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true) {
-				encode.push_video(frame_bytes)
+				encode.push_video(frame_bytes, video_pts)
+				video_frame_count += 1
 			}
 		}
 		@static dumped := false
@@ -739,6 +813,7 @@ handle_controls_request :: proc(
 	paths:     ^config.Paths,
 	target:    ^render.Target,
 	fps:       i32,
+	has_audio: bool,
 ) {
 	state.request = .None
 
@@ -766,9 +841,16 @@ handle_controls_request :: proc(
 		// safe to free right after the call returns.
 		defer delete(out_path)
 
-		if encode.start(out_path, target.width, target.height, u32(fps)) {
+		audio_rate: u32 = has_audio ? 48000 : 0
+		audio_ch:   u32 = has_audio ? 2 : 0
+		if encode.start(out_path, target.width, target.height, u32(fps),
+			audio_sample_rate = audio_rate, audio_channels = audio_ch) {
 			recording^ = true
-			log.infof("recording started -> %v", out_path)
+			if has_audio {
+				log.infof("recording started (video+audio) -> %v", out_path)
+			} else {
+				log.infof("recording started (video only) -> %v", out_path)
+			}
 		} else {
 			log.warn("failed to start recording (cause logged above)")
 		}
@@ -1075,5 +1157,19 @@ reset_collection_selection :: proc(scenes: ^ui.Scenes_State, sources: ^ui.Source
 	if len(doc.scenes) > 0 {
 		scenes.selected_id = doc.scenes[0].id
 	}
+}
+
+// Convert interleaved f32 samples (range [-1,1]) to interleaved 16-bit PCM
+// packed as a byte slice. Uses the temp allocator — freed at end of frame.
+@(private = "file")
+f32_to_pcm16 :: proc(src: []f32) -> []u8 {
+	out := make([]u8, len(src) * 2, context.temp_allocator)
+	for s, i in src {
+		clamped := clamp(s, -1, 1)
+		sample := i16(clamped * 32767)
+		out[i * 2 + 0] = u8(sample & 0xFF)
+		out[i * 2 + 1] = u8((sample >> 8) & 0xFF)
+	}
+	return out
 }
 

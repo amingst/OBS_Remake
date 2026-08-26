@@ -48,20 +48,3 @@ release_stream :: proc(device_id: string) {
     delete_key(&g_streams, device_id)
     delete(key)
 }
-
-update_levels :: proc() {
-    scratch: [4096]f32
-    for _, entry in g_streams {
-        s := entry.stream
-        frame_peak: f32
-        for {
-            n := ring_read(&s.ring, scratch[:])
-            if n == 0 do break
-            for v in scratch[:n] {
-                a := abs(v)
-                if a > frame_peak do frame_peak = a
-            }
-        }
-        s.peak = max(frame_peak, s.peak * 0.92)
-    }
-}

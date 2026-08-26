@@ -208,16 +208,16 @@ create_capture_texture :: proc(device: ^d3d11.IDevice, w, h: u32) -> (^d3d11.ITe
     return texture, srv, true
 }
 
-acquire_frame :: proc(ctx: ^d3d11.IDeviceContext, dupl: ^dxgi.IOutputDuplication, dest: ^d3d11.ITexture2D) -> (ok: bool, lost: bool) {
+acquire_frame :: proc(ctx: ^d3d11.IDeviceContext, dupl: ^dxgi.IOutputDuplication, dest: ^d3d11.ITexture2D) -> (ok: bool, lost: bool, got_frame: bool) {
     info: dxgi.OUTDUPL_FRAME_INFO
     resource: ^dxgi.IResource
 
     hr := dupl->AcquireNextFrame(0, &info, &resource)
-    if hr == dxgi.ERROR_WAIT_TIMEOUT do return true, false
-    if hr == dxgi.ERROR_ACCESS_LOST  do return false, true
+    if hr == dxgi.ERROR_WAIT_TIMEOUT do return true, false, false
+    if hr == dxgi.ERROR_ACCESS_LOST  do return false, true, false
     if hr < 0 {
         log.errorf("AcquireNextFrame failed: 0x%08X", u32(hr))
-        return false, false
+        return false, false, false
     }
     src_tex: ^d3d11.ITexture2D
     qhr := resource->QueryInterface(d3d11.ITexture2D_UUID, (^rawptr)(&src_tex))
@@ -226,13 +226,13 @@ acquire_frame :: proc(ctx: ^d3d11.IDeviceContext, dupl: ^dxgi.IOutputDuplication
     if qhr < 0 {
         log.errorf("frame QueryInterface(ITexture2D) failed: 0x%08X", u32(qhr))
         dupl->ReleaseFrame()
-        return false, false
+        return false, false, false
     }
 
     ctx->CopyResource((^d3d11.IResource)(dest), (^d3d11.IResource)(src_tex))
     src_tex->Release()
     dupl->ReleaseFrame()
-    return true, false
+    return true, false, true
 }
 
 @(private)

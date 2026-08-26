@@ -25,13 +25,15 @@ Color_Data :: struct {
 }
 
 Display_Data :: struct {
-    output_index:  i32,
-    adapter_index: i32,
-    dupl:          ^dxgi.IOutputDuplication,
-    texture:       ^d3d11.ITexture2D,
-    srv:           ^d3d11.IShaderResourceView,
-    lost:          bool,
-    next_retry:    time.Time,
+    output_index:    i32,
+    adapter_index:   i32,
+    dupl:            ^dxgi.IOutputDuplication,
+    texture:         ^d3d11.ITexture2D,
+    srv:             ^d3d11.IShaderResourceView,
+    lost:            bool,
+    next_retry:      time.Time,
+    last_frame_time: time.Time, // wall-clock time of last new desktop frame
+    stalled:         bool,      // true once we've logged a stall (>5s with no new frame)
 }
 
 Source_Data :: union {
@@ -101,6 +103,8 @@ reset_display_capture :: proc(d: ^Display_Data) {
 
     d.lost = false
     d.next_retry = {}
+    d.last_frame_time = {}
+    d.stalled = false
 }
 
 destroy_source :: proc(src: ^Source) {

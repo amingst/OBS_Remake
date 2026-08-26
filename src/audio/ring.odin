@@ -65,3 +65,8 @@ ring_read :: proc(r: ^Ring, dst: []f32) -> (read: int) {
 
     return int(n)
 }
+
+ring_available :: proc(r: ^Ring) -> int {
+    wr := intrinsics.atomic_load_explicit(&r.write, .Acquire)
+    return int(wr - r.read)
+}

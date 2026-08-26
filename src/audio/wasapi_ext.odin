@@ -178,19 +178,6 @@ close_stream :: proc(s: ^Stream) {
     log.debug("audio stream closed")
 }
 
-poll_stream  :: proc(s: ^Stream) {
-    if s.capture == nil do return
-    scratch: [4096]f32
-    for {
-        n := ring_read(&s.ring, scratch[:])
-        if n == 0 do break
-        for v in scratch[:n] {
-            a := abs(v)
-            if a > s.peak do s.peak = a
-        }
-    }
-}
-
 @(private="file")
 drain_packets :: proc(s: ^Stream) {
     if s.capture == nil do return

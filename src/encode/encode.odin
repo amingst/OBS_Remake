@@ -11,7 +11,6 @@ State :: struct {
     has_audio:          bool,
     width, height:      u32,
     frame_duration:     i64,
-    frame_index:        u32,
     recording:          bool,
 }
 
@@ -43,13 +42,12 @@ start :: proc(
     g_state.width = width
     g_state.height = height
     g_state.frame_duration = i64(10_000_000) / i64(fps)
-    g_state.frame_index = 0
     g_state.has_audio = audio_channels > 0
     g_state.recording = true
     return true
 }
 
-push_video :: proc(pixels: []u8) -> bool {
+push_video :: proc(pixels: []u8, pts_100ns: i64) -> bool {
     if !g_state.recording {
         log.errorf("encode.push_video called with no active recording")
         return false
@@ -61,12 +59,7 @@ push_video :: proc(pixels: []u8) -> bool {
         return false
     }
 
-    sample_time := i64(g_state.frame_index) * g_state.frame_duration
-    ok := mf.write_video_frame(g_state.sink_writer, g_state.video_stream_index, pixels, sample_time, g_state.frame_duration)
-    if !ok do return false
-
-    g_state.frame_index += 1
-    return true
+    return mf.write_video_frame(g_state.sink_writer, g_state.video_stream_index, pixels, pts_100ns, g_state.frame_duration)
 }
 
 // Caller supplies the timestamp explicitly, in 100ns units - the video/audio
