@@ -13,6 +13,10 @@ echo === audio ===
 odin test src/audio %FLAGS%
 if errorlevel 1 set FAILED=1
 
+echo === rtmp ===
+odin test src/rtmp %FLAGS%
+if errorlevel 1 set FAILED=1
+
 if %FAILED%==1 (
     echo.
     echo === TESTS FAILED ===
