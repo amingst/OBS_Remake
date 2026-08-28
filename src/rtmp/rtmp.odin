@@ -7,17 +7,30 @@ import "core:encoding/endian"
 import "core:time"
 
 Connection :: struct {
-	socket: net.TCP_Socket
+	socket: net.TCP_Socket,
+	chunk_states: map[u32]Chunk_State,
+	chunk_size: u32,
+	incoming: map[u32]Incoming_Chunk_State,
+	peer_chunk_size: u32
 }
 
+// TODO: Rename to dial
 connect :: proc(host: string, port: int) -> (Connection, bool) {
 	sock, err := net.dial_tcp(host, port)
 	if err != nil {
 		log.warnf("Failed to establish RTMP Connection to host %v, error: %v", host, err)
 		return {}, false
 	}
+	state := make(map[u32]Chunk_State, context.temp_allocator)
+	incoming_chunks := make(map[u32]Incoming_Chunk_State, context.temp_allocator)
 
-	return {sock}, true
+	return {
+		socket = sock,
+		chunk_size = 128,
+		chunk_states = state,
+		incoming = incoming_chunks,
+		peer_chunk_size = 128
+	}, true
 }
 
 handshake :: proc(c: ^Connection) -> bool {
@@ -68,11 +81,16 @@ handshake :: proc(c: ^Connection) -> bool {
 
 close :: proc(c: ^Connection) {
 	if &c.socket != nil {
+		for _, state in c.incoming {
+			delete(state.buffer)
+		}
+		delete(c.chunk_states)
+		delete(c.incoming)
 		net.close(c.socket)
 	}
 }
 
-@(private="file")
+@(private)
 read_exact :: proc(s: net.TCP_Socket, buf: []u8) -> bool {
 	total := 0
 	for total < len(buf) {
@@ -84,7 +102,7 @@ read_exact :: proc(s: net.TCP_Socket, buf: []u8) -> bool {
 	return true
 }
 
-@(private="file")
+@(private)
 send_all :: proc(s: net.TCP_Socket, buf: []u8) -> bool {
     total := 0
     for total < len(buf) {

@@ -21,6 +21,16 @@ Chunk_State :: struct {
 	stream_id:       u32,
 }
 
+Incoming_Chunk_State :: struct {
+	timestamp:       u32,
+	timestamp_delta: u32,
+	length:          u32,
+	type_id:         u8,
+	stream_id:       u32,
+	buffer: 		 [dynamic]u8,
+	extended: 		 bool
+}
+
 // Writes msg into dst as one or more chunks. Returns bytes written, or -1 if
 // dst is too small -- in which case dst and states are left untouched, so a
 // short buffer can't desync the chunk state.
