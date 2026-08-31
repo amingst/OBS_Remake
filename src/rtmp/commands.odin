@@ -56,6 +56,45 @@ send_connect :: proc(
 	return true
 }
 
+send_set_chunk_size :: proc(c: ^Connection, size: u32) -> bool {
+	if size == 0 || size & 0x8000_0000 != 0 {
+		log.warnf("setChunkSize: invalid size %v (must be 1..0x7FFFFFFF)", size)
+		return false
+	}
+
+	payload := make([]u8, 4, context.temp_allocator)
+	payload[0] = u8(size >> 24)
+	payload[1] = u8(size >> 16)
+	payload[2] = u8(size >> 8)
+	payload[3] = u8(size)
+
+	msg := Message{
+		csid = 2,
+		type_id = 1,
+		stream_id = 0,
+		timestamp = 0,
+		payload = payload,
+	}
+
+	buf := make([]u8, len(payload) + 256, context.temp_allocator)
+	// Encode at the current chunk size -- the server doesn't know about the
+	// new size until this message arrives, so it must go out at the old one.
+	n := encode_message(buf, msg, c.chunk_size, &c.chunk_states)
+	if n < 0 {
+		log.warn("setChunkSize: message did not fit in encode buffer")
+		return false
+	}
+
+	if !send_all(c.socket, buf[:n]) {
+		log.warn("setChunkSize: send failed")
+		return false
+	}
+
+	c.chunk_size = size
+	log.infof("RTMP set chunk size sent (size=%v)", size)
+	return true
+}
+
 read_message :: proc(c: ^Connection) -> (Message, bool) {
 	for {
 		// Read 1 byte basic header
@@ -158,7 +197,8 @@ read_message :: proc(c: ^Connection) -> (Message, bool) {
 			if len(state.buffer) >= 4 {
 				c.peer_chunk_size = u32(state.buffer[0])<<24 | u32(state.buffer[1])<<16 |
 					u32(state.buffer[2])<<8 | u32(state.buffer[3])
-				log.infof("rtmp: peer chunk size now %v", c.peer_chunk_size)
+				log.infof("rtmp: peer chunk size now %v (raw bytes %v)",
+					c.peer_chunk_size, state.buffer[0:4])
 			}
 			clear(&state.buffer)
 			continue
@@ -177,13 +217,92 @@ read_message :: proc(c: ^Connection) -> (Message, bool) {
 	}
 }
 
-send_create_stream :: proc(c: ^Connection) -> bool
+send_create_stream :: proc(c: ^Connection) -> bool {
+	payload := make([dynamic]u8, context.temp_allocator)
 
-read_create_stream_result :: proc(c: ^Connection) -> (u32, bool)
+	amf_write_string(&payload, "createStream")
+	amf_write_number(&payload, 2)
+	amf_write_null(&payload)
 
-send_publish :: proc(c: ^Connection, stream_key: string, stream_id: u32) -> bool
+	if !send_command(c, payload[:], 3, 0) {
+		log.warn("createStream: send failed")
+		return false
+	}
+
+	log.info("RTMP createStream sent")
+	return true
+}
+
+read_create_stream_result :: proc(c: ^Connection) -> (u32, bool) {
+	for {
+		msg, ok := read_message(c)
+		if !ok do return 0, false
+
+		if msg.type_id != 20 do continue
+
+		offset := 0
+		name, name_ok := amf_read_string(msg.payload, &offset)
+		if !name_ok do return 0, false
+
+		if name != "_result" {
+			// Servers interleave other commands -- ffmpeg sends onBWDone after
+			// the connect result. Only _error is worth failing on.
+			if name == "_error" {
+				log.warn("createStream: server returned _error")
+				return 0, false
+			}
+			log.debugf("createStream: skipping %q while waiting for _result", name)
+			continue
+		}
+
+		if !amf_skip_value(msg.payload, &offset) do return 0, false  // transaction id
+		if !amf_skip_value(msg.payload, &offset) do return 0, false  // command object
+
+		id, id_ok := amf_read_number(msg.payload, &offset)
+		if !id_ok do return 0, false
+
+		return u32(id), true
+	}
+}
+
+send_publish :: proc(c: ^Connection, stream_key: string, stream_id: u32) -> bool {
+	payload := make([dynamic]u8, context.temp_allocator)
+	amf_write_string(&payload, "publish")
+	amf_write_number(&payload, 3)
+	amf_write_null(&payload)
+	amf_write_string(&payload, stream_key)
+	amf_write_string(&payload, "live")
+
+	if !send_command(c, payload[:], 4, stream_id) {
+		log.warn("publish: send failed")
+		return false
+	}
+
+	log.info("RTMP publish sent")
+	return true
+}
 
 @(private)
 read_u24 :: proc(b: []u8) -> u32 {
 	return u32(b[0])<<16 | u32(b[1])<<8 | u32(b[2])
+}
+
+@(private="file")
+send_command :: proc(c: ^Connection, payload: []u8, csid: u32, stream_id: u32) -> bool {
+	msg := Message{
+		csid = csid,
+		type_id = 20,
+		stream_id = stream_id,
+		timestamp = 0,
+		payload = payload
+	}
+
+	buf := make([]u8, len(payload) + 256, context.temp_allocator)
+	n := encode_message(buf, msg, c.chunk_size, &c.chunk_states)
+	if n < 0 {
+		log.warn("rtmp: command did not fit in encode buffer")
+		return false
+	}
+
+	return send_all(c.socket, buf[:n])
 }

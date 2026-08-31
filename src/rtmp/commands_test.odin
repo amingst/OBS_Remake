@@ -13,37 +13,44 @@ import "core:testing"
 // Run with -define:ODIN_TEST_THREADS=1, or run them individually.
 
 @(test)
-connect_command_accepted :: proc(t: ^testing.T) {
+publish_sequence :: proc(t: ^testing.T) {
     c, ok := connect("127.0.0.1", 1935)
     if !ok {
-        log.info("no RTMP server on 127.0.0.1:1935 -- skipping (see commands_test.odin header)")
+        log.info("no RTMP server on 127.0.0.1:1935 -- skipping")
         return
     }
     defer close(&c)
 
-    if !handshake(&c) {
-        testing.fail_now(t, "handshake failed before connect could be tested")
+    if !handshake(&c) do testing.fail_now(t, "handshake failed")
+    if !send_connect(&c, "live", "rtmp://127.0.0.1:1935/live") {
+        testing.fail_now(t, "send_connect failed")
     }
 
-    testing.expect(t, send_connect(&c, "live", "rtmp://127.0.0.1:1935/live"),
-        "send_connect failed")
+    if !send_set_chunk_size(&c, 4096) {
+        testing.fail_now(t, "send_set_chunk_size failed")
+    }
 
-
-
-    // Window Ack Size (5), Set Peer Bandwidth (6), Set Chunk Size (1), then
-    // the AMF0 _result (20). Set Chunk Size is consumed inside read_message,
-    // so it won't appear here -- watch the log for it instead.
-    msgs := 0
-    for i in 0..<4 {
+    // Drain the connect response -- window ack, peer bandwidth, stream begin,
+    // and the _result. createStream's reply can't be read until these are off
+    // the wire.
+    for _ in 0..<4 {
         msg, msg_ok := read_message(&c)
-        if !msg_ok {
-            log.infof("read_message returned false after %v messages", i)
-            break
-        }
-        msgs += 1
-        log.infof("msg type=%v csid=%v len=%v stream=%v",
-            msg.type_id, msg.csid, len(msg.payload), msg.stream_id)
+        if !msg_ok do break
+        log.infof("connect reply: type=%v len=%v", msg.type_id, len(msg.payload))
     }
 
-    testing.expect(t, msgs > 0, "server sent nothing -- connect was likely rejected")
+    if !send_create_stream(&c) do testing.fail_now(t, "send_create_stream failed")
+
+    stream_id, id_ok := read_create_stream_result(&c)
+    testing.expect(t, id_ok, "createStream did not return a stream id")
+    log.infof("stream id: %v", stream_id)
+
+    testing.expect(t, send_publish(&c, "test", stream_id), "send_publish failed")
+
+    // onStatus with NetStream.Publish.Start if it worked.
+    msg, msg_ok := read_message(&c)
+    testing.expect(t, msg_ok, "no reply to publish")
+    if msg_ok {
+        log.infof("publish reply: type=%v len=%v", msg.type_id, len(msg.payload))
+    }
 }
