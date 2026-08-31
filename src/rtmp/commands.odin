@@ -265,7 +265,7 @@ read_create_stream_result :: proc(c: ^Connection) -> (u32, bool) {
 	}
 }
 
-send_publish :: proc(c: ^Connection, stream_key: string, stream_id: u32) -> bool {
+send_publish :: proc(c: ^Connection, stream_key: string) -> bool {
 	payload := make([dynamic]u8, context.temp_allocator)
 	amf_write_string(&payload, "publish")
 	amf_write_number(&payload, 3)
@@ -273,13 +273,65 @@ send_publish :: proc(c: ^Connection, stream_key: string, stream_id: u32) -> bool
 	amf_write_string(&payload, stream_key)
 	amf_write_string(&payload, "live")
 
-	if !send_command(c, payload[:], 4, stream_id) {
+	if !send_command(c, payload[:], 4, c.stream_id) {
 		log.warn("publish: send failed")
 		return false
 	}
 
 	log.info("RTMP publish sent")
 	return true
+}
+
+CSID_VIDEO :: 6 // distinct from command csids (3, 4); fixed for the life of the connection
+
+send_media :: proc(c: ^Connection, type_id: u8, payload: []u8, timestamp_100ns: i64, csid: u32) -> bool {
+	if c.stream_id == 0 {
+		log.warn("send_media: stream_id not set -- call after createStream result")
+		return false
+	}
+
+	msg := Message{
+		csid = csid,
+		type_id = type_id,
+		stream_id = c.stream_id,
+		timestamp = u32(timestamp_100ns / 10_000),
+		payload = payload,
+	}
+
+	buf := make([]u8, media_buffer_size(len(payload), csid, c.chunk_size), context.temp_allocator)
+	n := encode_message(buf, msg, c.chunk_size, &c.chunk_states)
+	if n < 0 {
+		log.errorf("send_media: message did not fit (type_id=%v payload=%v)", type_id, len(payload))
+		return false
+	}
+
+	if !send_all(c.socket, buf[:n]) {
+		log.warn("send_media: send failed")
+		return false
+	}
+
+	return true
+}
+
+@(private="file")
+media_buffer_size :: proc(payload_len: int, csid: u32, chunk_size: u32) -> int {
+	basic := 1
+	if csid > 319 {
+		basic = 3
+	} else if csid > 63 {
+		basic = 2
+	}
+
+	chunks := max(1, (payload_len + int(chunk_size) - 1) / int(chunk_size))
+
+	// Worst case: fmt 0 header (11 bytes) plus extended timestamp on every
+	// chunk. Mirrors encode_message's internal encoded_size, just without
+	// needing to know in advance which fmt_type it will actually pick --
+	// that decision stays inside encode_message, not duplicated here.
+	total := basic + 11 + 4 + min(payload_len, int(chunk_size))
+	total += (chunks - 1) * (basic + 4)
+	total += payload_len - min(payload_len, int(chunk_size))
+	return total
 }
 
 @(private)

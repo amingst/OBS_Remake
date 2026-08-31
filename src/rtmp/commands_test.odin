@@ -45,7 +45,9 @@ publish_sequence :: proc(t: ^testing.T) {
     testing.expect(t, id_ok, "createStream did not return a stream id")
     log.infof("stream id: %v", stream_id)
 
-    testing.expect(t, send_publish(&c, "test", stream_id), "send_publish failed")
+    c.stream_id = stream_id
+
+    testing.expect(t, send_publish(&c, "test"), "send_publish failed")
 
     // onStatus with NetStream.Publish.Start if it worked.
     msg, msg_ok := read_message(&c)

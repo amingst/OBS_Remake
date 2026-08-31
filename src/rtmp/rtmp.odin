@@ -11,7 +11,8 @@ Connection :: struct {
 	chunk_states: map[u32]Chunk_State,
 	chunk_size: u32,
 	incoming: map[u32]Incoming_Chunk_State,
-	peer_chunk_size: u32
+	peer_chunk_size: u32,
+	stream_id: u32
 }
 
 // TODO: Rename to dial
