@@ -283,7 +283,7 @@ main :: proc() {
 	for dev in audio_devices {
 		audio.log_device_format(dev)
 	}
-	
+
 	// Mixer state — allocated once, freed at exit.
 	CHANNELS :: 2
 	mix_buf := make([]f32, audio.BLOCK_SAMPLES * CHANNELS)
@@ -414,7 +414,7 @@ main :: proc() {
 		// im.NewFrame().
 		reconcile(&applied, &cfg, win.device, &preview_target, recording)
 
-		// Check each frame for resize after each reconcile call	
+		// Check each frame for resize after each reconcile call
 		needed := int(preview_target.width) * int(preview_target.height) * 4
 		if len(frame_bytes) != needed {
 			delete(frame_bytes)
@@ -1172,4 +1172,3 @@ f32_to_pcm16 :: proc(src: []f32) -> []u8 {
 	}
 	return out
 }
-

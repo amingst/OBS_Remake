@@ -9,7 +9,8 @@
 		{ "name": "config", "path": "src/config" },
 		{ "name": "audio", "path": "src/audio" },
 		{ "name": "mf", "path": "libs/mf" },
-		{ "name": "rtmp", "path": "src/rtmp"}
+		{ "name": "rtmp", "path": "src/rtmp"},
+		{ "name": "h264", "path": "libs/h264"}
 	],
 	"enable_semantic_tokens": true,
 	"enable_document_symbols": true,

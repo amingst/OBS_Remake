@@ -13,6 +13,14 @@ echo === audio ===
 odin test src/audio %FLAGS%
 if errorlevel 1 set FAILED=1
 
+echo === h264 ===
+odin test libs/h264 %FLAGS%
+if errorlevel 1 set FAILED=1
+
+echo === mf ===
+odin test libs/mf %FLAGS%
+if errorlevel 1 set FAILED=1
+
 echo === rtmp ===
 odin test src/rtmp %FLAGS% -define:ODIN_TEST_THREADS=1
 if errorlevel 1 set FAILED=1
