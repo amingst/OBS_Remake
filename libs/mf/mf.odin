@@ -414,77 +414,13 @@ begin_h264_encoder :: proc(width, height, fps, bitrate: u32) -> (encoder: ^IMFTr
 
 @(private)
 drain_encoder_output :: proc(encoder: ^IMFTransform, allocator := context.allocator) -> (nalus: [][]u8, ok: bool) {
+    raw_samples, drain_ok := drain_transform_samples(encoder, 0, context.temp_allocator)
+    if !drain_ok do return nil, false
+
     collected: [dynamic][]u8
     defer delete(collected)
-
-    for {
-        stream_info: MFT_OUTPUT_STREAM_INFO
-        hr := encoder.GetOutputStreamInfo(encoder, 0, &stream_info)
-        if hr < 0 {
-            log.errorf("GetOutputStreamInfo failed: 0x%08X", u32(hr))
-            return nil, false
-        }
-
-        sample: ^IMFSample
-        provides_own := stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES != 0
-        if !provides_own {
-            hr = MFCreateSample(&sample)
-            if hr < 0 {
-                log.errorf("MFCreateSample (output) failed: 0x%08X", u32(hr))
-                return nil, false
-            }
-            out_buffer: ^IMFMediaBuffer
-            hr = MFCreateMemoryBuffer(stream_info.cbSize, &out_buffer)
-            if hr < 0 {
-                log.errorf("MFCreateMemoryBuffer (output) failed: 0x%08X", u32(hr))
-                sample.Release(sample)
-                return nil, false
-            }
-            sample.AddBuffer(sample, out_buffer)
-            out_buffer.Release(out_buffer) // sample holds its own ref via AddBuffer
-        }
-
-        output_buf := MFT_OUTPUT_DATA_BUFFER{dwStreamID = 0, pSample = sample}
-        status: u32
-        hr = encoder.ProcessOutput(encoder, 0, 1, &output_buf, &status)
-
-        if u32(hr) == MF_E_TRANSFORM_NEED_MORE_INPUT {
-            if sample != nil do sample.Release(sample)
-            break
-        }
-        if hr < 0 {
-            log.errorf("ProcessOutput failed: 0x%08X", u32(hr))
-            if sample != nil do sample.Release(sample)
-            return nil, false
-        }
-
-        result := output_buf.pSample
-        contiguous: ^IMFMediaBuffer
-        hr = result.ConvertToContiguousBuffer(result, &contiguous)
-        if hr < 0 {
-            log.errorf("ConvertToContiguousBuffer failed: 0x%08X", u32(hr))
-            result.Release(result)
-            return nil, false
-        }
-
-        data: [^]u8
-        hr = contiguous.Lock(contiguous, &data, nil, nil)
-        if hr < 0 {
-            log.errorf("Buffer Lock (output) failed: 0x%08X", u32(hr))
-            contiguous.Release(contiguous)
-            result.Release(result)
-            return nil, false
-        }
-
-        length: u32
-        contiguous.GetCurrentLength(contiguous, &length)
-        raw_bytes := make([]u8, length, context.temp_allocator)
-        mem.copy(raw_data(raw_bytes), data, int(length))
-        contiguous.Unlock(contiguous)
-        contiguous.Release(contiguous)
-        result.Release(result)
-
-        for nalu in h264.split_annexb(raw_bytes, context.temp_allocator) {
+    for sample_bytes in raw_samples {
+        for nalu in h264.split_annexb(sample_bytes, context.temp_allocator) {
             append(&collected, slice.clone(nalu, allocator))
         }
     }
@@ -542,4 +478,237 @@ end_h264_encoder :: proc(encoder: ^IMFTransform) -> (tail_nalus: [][]u8) {
     tail_nalus, _ = drain_encoder_output(encoder)
     encoder.Release(encoder)
     return tail_nalus
+}
+
+begin_video_processor :: proc(width, height: u32) -> (processor: ^IMFTransform, ok: bool) {
+	input_filter := MFT_REGISTER_TYPE_INFO{MFMediaType_Video, MFVideoFormat_RGB32}
+	output_filter := MFT_REGISTER_TYPE_INFO{MFMediaType_Video, MFVideoFormat_NV12}
+
+	activates: [^]^IMFActivate
+	count: u32
+	hr := MFTEnumEx(MFT_CATEGORY_VIDEO_PROCESSOR, MFT_ENUM_FLAG_SYNCMFT, &input_filter, &output_filter, &activates, &count)
+	if hr < 0 {
+		log.errorf("MFTEnumEx (video processor) failed: 0x%08X", u32(hr))
+	}
+
+	if count == 0 {
+		log.errorf("MFTEnumEx found no synchronous Video Processor MFT for RGB32->NV12")
+        windows.CoTaskMemFree(activates)
+        return nil, false
+	}
+
+	activate := activates[0]
+	for i: u32 = 1; i < count; i += 1 {
+		activates[i].Release(activates[i])
+	}
+	windows.CoTaskMemFree(activates)
+	defer activate.Release(activate)
+
+	hr = activate.ActivateObject(activate, &IID_IMFTransform, cast(^rawptr)&processor)
+ 	if hr < 0 {
+        log.errorf("ActivateObject (video processor) failed: 0x%08X", u32(hr))
+        return nil, false
+    }
+
+    // set input type first
+    // TODO: Refactor
+    input_type: ^IMFMediaType
+    hr = MFCreateMediaType(&input_type)
+    if hr < 0 {
+        log.errorf("MFCreateMediaType (processor input) failed: 0x%08X", u32(hr))
+        processor.Release(processor)
+        return nil, false
+    }
+    defer input_type.Release(input_type)
+
+    input_type.SetGUID(input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+    input_type.SetGUID(input_type, &MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
+    input_type.SetUINT32(input_type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)
+    mf_set_size(input_type, &MF_MT_FRAME_SIZE, width, height)
+
+    hr = processor.SetInputType(processor, 0, input_type, 0)
+    if hr < 0 {
+        log.errorf("SetInputType (processor) failed: 0x%08X", u32(hr))
+        processor.Release(processor)
+        return nil, false
+    }
+
+    // set output type second
+    // TODO: Refactor
+    output_type: ^IMFMediaType
+    hr = MFCreateMediaType(&output_type)
+    if hr < 0 {
+        log.errorf("MFCreateMediaType (processor output) failed: 0x%08X", u32(hr))
+        processor.Release(processor)
+        return nil, false
+    }
+    defer output_type.Release(output_type)
+
+    output_type.SetGUID(output_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+    output_type.SetGUID(output_type, &MF_MT_SUBTYPE, &MFVideoFormat_NV12)
+    output_type.SetUINT32(output_type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)
+    mf_set_size(output_type, &MF_MT_FRAME_SIZE, width, height)
+
+    hr = processor.SetOutputType(processor, 0, output_type, 0)
+    if hr < 0 {
+        log.errorf("SetOutputType (processor) failed: 0x%08X", u32(hr))
+        processor.Release(processor)
+        return nil, false
+    }
+
+    hr = processor.ProcessMessage(processor, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+    if hr < 0 {
+        log.errorf("ProcessMessage(BEGIN_STREAMING) on processor failed: 0x%08X", u32(hr))
+        processor.Release(processor)
+        return nil, false
+    }
+
+    return processor, true
+}
+
+@(private)
+drain_transform_samples :: proc(transform: ^IMFTransform, stream_id: u32, allocator := context.allocator) -> (frames: [][]u8, ok: bool) {
+	collected: [dynamic][]u8
+	defer delete(collected)
+
+	for {
+		stream_info: MFT_OUTPUT_STREAM_INFO
+		hr := transform.GetOutputStreamInfo(transform, stream_id, &stream_info)
+  		if hr < 0 {
+            log.errorf("GetOutputStreamInfo failed: 0x%08X", u32(hr))
+            return nil, false
+        }
+
+		sample: ^IMFSample
+		provides_own := stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES != 0
+		if !provides_own {
+			hr = MFCreateSample(&sample)
+			if hr < 0 {
+				log.errorf("MFCreateSample (output) failed: 0x%08X", u32(hr))
+                return nil, false
+			}
+
+			out_buffer: ^IMFMediaBuffer
+			hr = MFCreateMemoryBuffer(stream_info.cbSize, &out_buffer)
+			if hr < 0 {
+				log.errorf("MFCreateMemoryBuffer (output) failed: 0x%08X", u32(hr))
+                sample.Release(sample)
+                return nil, false
+			}
+
+			sample.AddBuffer(sample, out_buffer)
+			out_buffer.Release(out_buffer)
+		}
+
+		output_buf := MFT_OUTPUT_DATA_BUFFER{dwStreamID = stream_id, pSample = sample}
+		status: u32
+		hr = transform.ProcessOutput(transform, 0, 1, &output_buf, &status)
+
+		if u32(hr) == MF_E_TRANSFORM_NEED_MORE_INPUT {
+			if sample != nil do sample.Release(sample)
+			break
+		}
+		if hr < 0 {
+			log.errorf("ProcessOutput failed: 0x%08X", u32(hr))
+            if sample != nil do sample.Release(sample)
+            return nil, false
+		}
+
+		result := output_buf.pSample
+		contiguous: ^IMFMediaBuffer
+		hr = result.ConvertToContiguousBuffer(result, &contiguous)
+  		if hr < 0 {
+            log.errorf("ConvertToContiguousBuffer failed: 0x%08X", u32(hr))
+            result.Release(result)
+            return nil, false
+        }
+
+        data: [^]u8
+        hr = contiguous.Lock(contiguous, &data, nil, nil)
+        if hr < 0 {
+            log.errorf("Buffer Lock (output) failed: 0x%08X", u32(hr))
+            contiguous.Release(contiguous)
+            result.Release(result)
+            return nil, false
+        }
+
+        length: u32
+        contiguous.GetCurrentLength(contiguous, &length)
+        raw_bytes := make([]u8, length, allocator)
+        mem.copy(raw_data(raw_bytes), data, int(length))
+        contiguous.Unlock(contiguous)
+        contiguous.Release(contiguous)
+        result.Release(result)
+
+        append(&collected, raw_bytes)
+	}
+
+ 	out := make([][]u8, len(collected), allocator)
+    copy(out, collected[:])
+    return out, true
+}
+
+
+
+// bgra must be width*height*4 bytes (B8G8R8A8_UNORM, matching your render target).
+encode_bgra_frame :: proc(processor: ^IMFTransform, encoder: ^IMFTransform, bgra: []u8, sample_time, sample_duration: i64) -> (nalus: [][]u8, ok: bool) {
+    buffer: ^IMFMediaBuffer
+    hr := MFCreateMemoryBuffer(u32(len(bgra)), &buffer)
+    if hr < 0 {
+        log.errorf("MFCreateMemoryBuffer (processor input) failed: 0x%08X", u32(hr))
+        return nil, false
+    }
+
+    data: [^]u8
+    hr = buffer.Lock(buffer, &data, nil, nil)
+    if hr < 0 {
+        log.errorf("Buffer Lock (processor input) failed: 0x%08X", u32(hr))
+        buffer.Release(buffer)
+        return nil, false
+    }
+    mem.copy(data, raw_data(bgra), len(bgra))
+    buffer.Unlock(buffer)
+    buffer.SetCurrentLength(buffer, u32(len(bgra)))
+
+    sample: ^IMFSample
+    hr = MFCreateSample(&sample)
+    if hr < 0 {
+        log.errorf("MFCreateSample (processor input) failed: 0x%08X", u32(hr))
+        buffer.Release(buffer)
+        return nil, false
+    }
+    sample.AddBuffer(sample, buffer)
+    sample.SetSampleTime(sample, sample_time)
+    sample.SetSampleDuration(sample, sample_duration)
+
+    hr = processor.ProcessInput(processor, 0, sample, 0)
+    sample.Release(sample)
+    buffer.Release(buffer)
+    if hr < 0 {
+        log.errorf("ProcessInput (processor) failed: 0x%08X", u32(hr))
+        return nil, false
+    }
+
+    nv12_samples, drain_ok := drain_transform_samples(processor, 0, context.temp_allocator)
+    if !drain_ok do return nil, false
+
+    all_nalus: [dynamic][]u8
+    for nv12 in nv12_samples {
+        frame_nalus, enc_ok := encode_h264_frame(encoder, nv12, sample_time, sample_duration)
+        if !enc_ok do return nil, false
+        for n in frame_nalus do append(&all_nalus, n)
+    }
+
+    out := make([][]u8, len(all_nalus))
+    copy(out, all_nalus[:])
+    return out, true
+}
+
+end_video_processor :: proc(processor: ^IMFTransform) {
+    processor.ProcessMessage(processor, MFT_MESSAGE_COMMAND_DRAIN, 0)
+    leftover, _ := drain_transform_samples(processor, 0, context.temp_allocator)
+    if len(leftover) > 0 {
+        log.warnf("video processor drain produced %d unexpected frame(s) - it may not be a pure 1:1 converter", len(leftover))
+    }
+    processor.Release(processor)
 }
