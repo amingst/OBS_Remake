@@ -17,6 +17,10 @@ echo === h264 ===
 odin test libs/h264 %FLAGS%
 if errorlevel 1 set FAILED=1
 
+echo === flv ===
+odin test libs/flv %FLAGS%
+if errorlevel 1 set FAILED=1
+
 echo === mf ===
 odin test libs/mf %FLAGS%
 if errorlevel 1 set FAILED=1
