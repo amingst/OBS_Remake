@@ -212,3 +212,30 @@ IMFTransform_VTable :: struct {
 }
 
 IMFTransform :: struct { using vtbl: ^IMFTransform_VTable }
+
+// ---------------------------------------------------------------------
+// ICodecAPI : IUnknown  (3 + 15 = 18 slots)
+// Only SetValue is typed — the rest are placeholders.
+// ---------------------------------------------------------------------
+
+VARIANT :: struct {
+    vt:        u16,
+    _reserved: [3]u16,
+    val:       u64, // overlaid union; we only ever store a u32 (VT_UI4)
+}
+
+ICodecAPI_VTable :: struct {
+    QueryInterface: proc "stdcall" (this: ^ICodecAPI, riid: ^windows.GUID, ppv: ^rawptr) -> windows.HRESULT,
+    AddRef:         proc "stdcall" (this: ^ICodecAPI) -> u32,
+    Release:        proc "stdcall" (this: ^ICodecAPI) -> u32,
+
+    IsSupported:       rawptr,
+    IsModifiable:      rawptr,
+    GetParameterRange: rawptr,
+    GetParameterValues: rawptr,
+    GetDefaultValue:   rawptr,
+    GetValue:          rawptr,
+    SetValue: proc "stdcall" (this: ^ICodecAPI, api: ^windows.GUID, value: ^VARIANT) -> windows.HRESULT,
+}
+
+ICodecAPI :: struct { using vtbl: ^ICodecAPI_VTable }

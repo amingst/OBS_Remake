@@ -473,6 +473,27 @@ encode_h264_frame :: proc(encoder: ^IMFTransform, nv12: []u8, sample_time, sampl
     return drain_encoder_output(encoder)
 }
 
+// Sets the GOP size (keyframe interval in frames) on a live encoder via
+// ICodecAPI. Call after begin_h264_encoder; the MS software H.264 MFT
+// accepts this property after type negotiation.
+set_encoder_gop_size :: proc(encoder: ^IMFTransform, gop_size: u32) -> bool {
+    codec_api: ^ICodecAPI
+    hr := encoder.QueryInterface(encoder, &IID_ICodecAPI, cast(^rawptr)&codec_api)
+    if hr < 0 {
+        log.errorf("QueryInterface(ICodecAPI) failed: 0x%08X", u32(hr))
+        return false
+    }
+    defer codec_api.Release(codec_api)
+
+    v := VARIANT{vt = VT_UI4, val = u64(gop_size)}
+    hr = codec_api.SetValue(codec_api, &CODECAPI_AVEncMPVGOPSize, &v)
+    if hr < 0 {
+        log.errorf("ICodecAPI::SetValue(AVEncMPVGOPSize=%v) failed: 0x%08X", gop_size, u32(hr))
+        return false
+    }
+    return true
+}
+
 end_h264_encoder :: proc(encoder: ^IMFTransform) -> (tail_nalus: [][]u8) {
     encoder.ProcessMessage(encoder, MFT_MESSAGE_COMMAND_DRAIN, 0)
     tail_nalus, _ = drain_encoder_output(encoder)
