@@ -313,6 +313,24 @@ send_media :: proc(c: ^Connection, type_id: u8, payload: []u8, timestamp_100ns: 
 	return true
 }
 
+send_fc_unpublish :: proc(s: ^Rtmp_Stream) -> bool {
+	payload := make([dynamic]u8, context.temp_allocator)
+	amf_write_string(&payload, "FCUnpublish")
+	amf_write_number(&payload, 4)
+	amf_write_null(&payload)
+	amf_write_string(&payload, s.stream_key)
+	return send_command(&s.conn, payload[:], 4, s.conn.stream_id)
+}
+
+send_delete_stream :: proc(s: ^Rtmp_Stream) -> bool {
+	payload := make([dynamic]u8, context.temp_allocator)
+	amf_write_string(&payload, "deleteStream")
+	amf_write_number(&payload, 5)
+	amf_write_null(&payload)
+	amf_write_number(&payload, f64(s.conn.stream_id))
+	return send_command(&s.conn, payload[:], 4, s.conn.stream_id)
+}
+
 @(private="file")
 media_buffer_size :: proc(payload_len: int, csid: u32, chunk_size: u32) -> int {
 	basic := 1

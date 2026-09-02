@@ -1,6 +1,7 @@
 package ui
 
 import "core:fmt"
+import "core:strings"
 import im "libs:odin-imgui"
 import "../capture"
 import "../scene"
@@ -18,6 +19,19 @@ Settings_State :: struct {
     preset_idx:   int,          // index into the preset list; == len(presets) means Custom
     was_open:     bool,         // last frame's show_settings, so we can seed on the opening edge
     save_request: Save_Trigger, // raised here, consumed and cleared by main
+
+    // Stream (Output tab) fields. Stream_Settings holds owned strings, so
+    // unlike `pending` above these aren't edited as a struct copy -- ImGui
+    // text inputs need a fixed-size byte buffer (same InputText-into-buffer
+    // shape as profiles.odin's name_buf), seeded/read via seed_name_buf and
+    // read_stream_field below, and only turned back into owned strings on
+    // Apply/OK.
+    stream_host_buf:  [128]u8,
+    stream_app_buf:   [128]u8,
+    stream_tcurl_buf: [256]u8,
+    stream_key_buf:   [128]u8,
+    stream_port:      i32,
+    stream_bitrate:   i32,
 }
 
 init_settings_state :: proc() -> Settings_State {
@@ -67,6 +81,7 @@ draw_menubar :: proc(
     outputs: []capture.Output_Info,
     profiles: []settings.Profile_Info,
     collections: []scene.Collection_Info,
+    streaming: bool,
 ) {
     if im.BeginMainMenuBar() {
         draw_file_menu(state, cfg, doc, profiles, collections)
@@ -77,7 +92,7 @@ draw_menubar :: proc(
     if state.show_settings && !im.IsPopupOpen("Settings") {
         im.OpenPopup("Settings")
     }
-    draw_settings(state, cfg, outputs)
+    draw_settings(state, cfg, outputs, streaming)
 
     draw_profile_popups(&state.profiles, cfg.name)
     draw_collection_popups(&state.collections, doc.name)
@@ -113,13 +128,20 @@ draw_file_menu :: proc(
 }
 
 @(private="file")
-draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.Output_Info) {
+draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.Output_Info, streaming: bool) {
     s := &state.settings
     presets := build_presets(outputs)
 
     if state.show_settings && !s.was_open {
         s.pending = cfg.video
         s.preset_idx = match_preset(presets, s.pending.canvas_width, s.pending.canvas_height)
+
+        seed_name_buf(s.stream_host_buf[:], cfg.stream.host)
+        seed_name_buf(s.stream_app_buf[:], cfg.stream.app)
+        seed_name_buf(s.stream_tcurl_buf[:], cfg.stream.tc_url)
+        seed_name_buf(s.stream_key_buf[:], cfg.stream.stream_key)
+        s.stream_port = cfg.stream.port
+        s.stream_bitrate = cfg.stream.bitrate
     }
     s.was_open = state.show_settings
 
@@ -159,6 +181,34 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.
                 im.EndTabItem()
             }
             if im.BeginTabItem("Output") {
+                // Streaming reads Profile.stream (host/app/tc_url/stream_key)
+                // once, at Start_Streaming, into a fixed-size rtmp connection --
+                // there's no live-reconcile path for it the way canvas
+                // resolution has (reconcile.odin), so editing mid-stream would
+                // silently do nothing until the next stream restart. Same
+                // reasoning as guarding a second recording start; no existing
+                // "disable while busy" precedent elsewhere in the UI, so this
+                // uses ImGui's own BeginDisabled/EndDisabled rather than
+                // inventing a new one.
+                if streaming {
+                    im.TextColored({1, 0.7, 0, 1}, "Stop the stream to edit these settings.")
+                }
+                im.BeginDisabled(streaming)
+
+                im.InputText("Host", cstring(&s.stream_host_buf[0]), len(s.stream_host_buf))
+                port := s.stream_port
+                if im.InputInt("Port", &port) {
+                    s.stream_port = port
+                }
+                im.InputText("App", cstring(&s.stream_app_buf[0]), len(s.stream_app_buf))
+                im.InputText("TC URL", cstring(&s.stream_tcurl_buf[0]), len(s.stream_tcurl_buf))
+                im.InputText("Stream Key", cstring(&s.stream_key_buf[0]), len(s.stream_key_buf), {.Password})
+                bitrate := s.stream_bitrate
+                if im.InputInt("Bitrate (bps)", &bitrate) {
+                    s.stream_bitrate = bitrate
+                }
+
+                im.EndDisabled()
                 im.EndTabItem()
             }
             im.EndTabBar()
@@ -168,6 +218,7 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.
 
         if im.Button("OK") {
             cfg.video = s.pending
+            apply_stream_settings(s, cfg)
             s.save_request = .Settings_OK
             state.show_settings = false
             im.CloseCurrentPopup()
@@ -180,11 +231,44 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.
         im.SameLine()
         if im.Button("Apply") {
             cfg.video = s.pending
+            apply_stream_settings(s, cfg)
             s.save_request = .Settings_Apply
         }
 
         im.EndPopup()
     }
+}
+
+// Mirrors from_dto's owned-string replacement in settings/persist.odin:
+// delete the profile's current stream strings before cloning the edited
+// buffer contents over them, so applying settings repeatedly doesn't leak.
+@(private="file")
+apply_stream_settings :: proc(s: ^Settings_State, cfg: ^settings.Profile) {
+    delete(cfg.stream.host)
+    delete(cfg.stream.app)
+    delete(cfg.stream.tc_url)
+    delete(cfg.stream.stream_key)
+
+    cfg.stream = {
+        host       = read_stream_field(s.stream_host_buf[:]),
+        port       = s.stream_port,
+        app        = read_stream_field(s.stream_app_buf[:]),
+        tc_url     = read_stream_field(s.stream_tcurl_buf[:]),
+        stream_key = read_stream_field(s.stream_key_buf[:]),
+        bitrate    = s.stream_bitrate,
+    }
+}
+
+// Unlike read_name_buf (profiles.odin), an empty stream field is valid --
+// dto_is_valid (settings/persist.odin) treats a blank stream config as
+// "not set up yet" rather than rejecting it, so this doesn't reject empty.
+@(private="file")
+read_stream_field :: proc(buf: []u8) -> string {
+    n := strings.index_byte(string(buf), 0)
+    if n < 0 {
+        n = len(buf)
+    }
+    return strings.clone(string(buf[:n]))
 }
 
 @(private="file")

@@ -81,14 +81,28 @@ handshake :: proc(c: ^Connection) -> bool {
 }
 
 close :: proc(c: ^Connection) {
-	if &c.socket != nil {
-		for _, state in c.incoming {
-			delete(state.buffer)
-		}
-		delete(c.chunk_states)
-		delete(c.incoming)
-		net.close(c.socket)
+	net.set_option(c.socket, .Receive_Timeout, time.Second * 2)
+
+	// Graceful half-close: tell the peer we're done sending, then drain
+	// whatever it sends back (or its own FIN) before tearing down. Without
+	// this, closesocket() on Windows sends RST instead of FIN whenever
+	// unread bytes are still sitting in the receive buffer -- which is what
+	// was showing up as ffmpeg's "Error during demuxing: I/O error" even
+	// after FCUnpublish/deleteStream were added upstream of this point.
+	net.shutdown(c.socket, .Send)
+
+	drain: [256]u8
+	for {
+		n, err := net.recv_tcp(c.socket, drain[:])
+		if err != nil || n == 0 do break
 	}
+
+	for _, state in c.incoming {
+		delete(state.buffer)
+	}
+	delete(c.chunk_states)
+	delete(c.incoming)
+	net.close(c.socket)
 }
 
 @(private)

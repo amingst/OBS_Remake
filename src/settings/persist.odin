@@ -11,11 +11,21 @@ Video_Settings_DTO :: struct {
     fps: i32,
 }
 
+Stream_Settings_DTO :: struct {
+    host: string,
+    port: i32,
+    app: string,
+    tc_url: string,
+    stream_key: string,
+    bitrate: i32,
+}
+
 Settings_DTO :: struct {
     version: int,
     id:      string,
     name:    string,
     video:   Video_Settings_DTO,
+    stream:  Stream_Settings_DTO,
 }
 
 // Version of the settings file, root/settings.json (Settings_DTO above).
@@ -110,6 +120,11 @@ dto_is_valid :: proc(dto: ^Settings_DTO, path: string) -> bool {
             v.canvas_width, v.canvas_height, v.output_width, v.output_height, v.fps, path)
         return false
     }
+
+    // Unlike video, an empty/zero stream config is a legitimate "streaming
+    // not set up yet" state -- Start_Streaming is what rejects a blank host
+    // or stream_key, the same way paths.videos == "" is checked at
+    // recording-start rather than at settings-load. Nothing here to reject.
     return true
 }
 
@@ -127,6 +142,14 @@ to_dto :: proc(cfg: ^Profile) -> Settings_DTO {
             output_width = cfg.video.output_width,
             output_height = cfg.video.output_height,
             fps = cfg.video.fps
+        },
+        stream = {
+            host = cfg.stream.host,
+            port = cfg.stream.port,
+            app = cfg.stream.app,
+            tc_url = cfg.stream.tc_url,
+            stream_key = cfg.stream.stream_key,
+            bitrate = cfg.stream.bitrate,
         }
     }
 }
@@ -140,6 +163,10 @@ to_dto :: proc(cfg: ^Profile) -> Settings_DTO {
 from_dto :: proc(dto: ^Settings_DTO, cfg: ^Profile) {
     delete(cfg.id)
     delete(cfg.name)
+    delete(cfg.stream.host)
+    delete(cfg.stream.app)
+    delete(cfg.stream.tc_url)
+    delete(cfg.stream.stream_key)
     cfg.id = strings.clone(dto.id)
     cfg.name = strings.clone(dto.name)
 
@@ -149,5 +176,14 @@ from_dto :: proc(dto: ^Settings_DTO, cfg: ^Profile) {
         output_width  = dto.video.output_width,
         output_height = dto.video.output_height,
         fps           = dto.video.fps,
+    }
+
+    cfg.stream = {
+        host       = strings.clone(dto.stream.host),
+        port       = dto.stream.port,
+        app        = strings.clone(dto.stream.app),
+        tc_url     = strings.clone(dto.stream.tc_url),
+        stream_key = strings.clone(dto.stream.stream_key),
+        bitrate    = dto.stream.bitrate,
     }
 }

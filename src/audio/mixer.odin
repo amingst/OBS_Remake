@@ -45,7 +45,7 @@ mix_block :: proc(inputs: []Mix_Input, dst: []f32, channels: int) -> bool {
         inp.stream.peak = max(frame_peak, inp.stream.peak * 0.92)
 
         if inp.muted do continue
-        
+
         for i in 0..<block_len {
             dst[i] += scratch[i] *  inp.volume
         }
@@ -70,8 +70,15 @@ mixer_ready :: proc(inputs: []Mix_Input, channels: int) -> bool {
 
     threshold := BLOCK_SAMPLES * channels * BLOCK_LATENCY
     for inp in inputs {
+	    // Loopback (render-endpoint) sources deliver zero packets when
+	    // nothing is playing on the device -- that's not "slow to buffer,"
+	    // it's silence by design, and may never cross the threshold. Only
+	    // non-loopback inputs (mic capture) are required to buffer before
+	    // mixing starts; a silent loopback is handled by mix_block's
+	    // per-input skip once mixing is running.
+		if inp.stream.is_loopback do continue
         if ring_available(&inp.stream.ring) < threshold do return false
     }
-    
+
     return true
 }

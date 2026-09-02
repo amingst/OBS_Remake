@@ -25,6 +25,7 @@ import "ui"
 import "capture"
 import "audio"
 import "encode"
+import "rtmp"
 
 main :: proc() {
 	// Wrap the heap allocator so we get a leak/bad-free report at exit.
@@ -369,7 +370,12 @@ main :: proc() {
     done := false
 	was_occluded := false
 	recording := false
+	streaming := false
+	rtmp_stream: ^rtmp.Rtmp_Stream
+	mailbox: ^rtmp.Frame_Mailbox
 	video_frame_count: u64
+	read_target_count: u64 // diagnostic-only: counts successful read_target calls in the recording||streaming block
+	mixer_ready_log_count: u64 // diagnostic-only: caps the mixer-readiness dump to the first 5 checks this session
 	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
 	has_audio_sources := false // set each frame, used by the recording-start handler next frame
 	// Main loop
@@ -468,7 +474,8 @@ main :: proc() {
 		// resolution that doesn't match what it was configured with.
 		if req := ui_state.controls.request; req != .None {
 			was_recording := recording
-			handle_controls_request(req, &ui_state.controls, &recording, &paths, &preview_target, cfg.video.fps, has_audio_sources)
+			handle_controls_request(req, &ui_state.controls, &recording, &streaming, &rtmp_stream, &mailbox,
+				&paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources)
 			if recording && !was_recording {
 				// Reset clocks so the first sample/frame is PTS 0.
 				blocks_emitted = 0
@@ -593,6 +600,25 @@ main :: proc() {
 			mixer_started = false
 		}
 
+		// Diagnostic: dumps exactly what mixer_ready inspects (per-input ring
+		// buffer fill vs. the readiness threshold) so a stuck-at-not-ready
+		// mixer is debuggable without flooding the log at frame rate -- capped
+		// to the first 5 checks this session, not per-frame.
+		if mixer_ready_log_count < 5 {
+			mixer_ready_log_count += 1
+			threshold := audio.BLOCK_SAMPLES * CHANNELS * audio.BLOCK_LATENCY
+			if len(inputs) == 0 {
+				log.infof("mixer_ready check #%v: len(inputs)=0, threshold=%v samples -- no audio sources wired into `inputs` this frame",
+					mixer_ready_log_count, threshold)
+			} else {
+				for inp, i in inputs {
+					available := audio.ring_available(&inp.stream.ring)
+					log.infof("mixer_ready check #%v: input[%v] ring_available=%v / threshold=%v samples (ready=%v)",
+						mixer_ready_log_count, i, available, threshold, available >= threshold)
+				}
+			}
+		}
+
 		if !mixer_started && audio.mixer_ready(inputs[:], CHANNELS) {
 			mixer_started = true
 		}
@@ -610,15 +636,32 @@ main :: proc() {
 		}
 
 		// -- Video push ---------------------------------------------------
-		if recording {
+		// Shared on recording || streaming: both consumers need the same GPU
+		// readback and PTS clock. push_video and mailbox_put/SetEvent are then
+		// independent conditionals below, not nested in each other, so either
+		// consumer can run alone.
+		if recording || streaming {
 			// flip_vertical: MFVideoFormat_RGB32 is bottom-up by convention and
 			// MF ignores the MF_MT_DEFAULT_STRIDE hint that's supposed to
 			// override that (see the comment in mf.odin's begin_recording), so
 			// the rows are flipped here instead. This is a workaround for that
 			// one encoder, not the default -- every other read_target caller
-			// wants top-down rows.
+			// wants top-down rows. The RTMP path was already fed these flipped
+			// rows whenever recording+streaming were both active, so extending
+			// this block to run for streaming-only doesn't change that.
 			video_pts: i64
-			want_audio_clock := len(inputs) > 0
+			// mixer_started gates this, not just len(inputs) > 0: audio sources
+			// can exist but still be warming up (ring buffers below
+			// audio.mixer_ready's threshold), during which blocks_emitted never
+			// advances. Previously that warm-up window fell into the "audio
+			// clock" branch anyway and produced video_pts == 0 for every frame
+			// until mixer_started flipped true -- FLV/RTMP require strictly
+			// increasing timestamps per stream, so ffmpeg silently dropped
+			// every repeated pts=0 frame, producing no output for the whole
+			// warm-up window (up to ~53s observed, bounded by the slowest
+			// input's ring fill time). Falling back to the frame counter during
+			// warm-up keeps video_pts valid and monotonic from frame one.
+			want_audio_clock := len(inputs) > 0 && mixer_started
 			if want_audio_clock {
 				video_pts = i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
 			} else {
@@ -628,12 +671,34 @@ main :: proc() {
 				if want_audio_clock {
 					log.info("video PTS: switching to audio-master clock")
 				} else {
-					log.info("video PTS: switching to frame-counter fallback (no audio sources)")
+					log.info("video PTS: switching to frame-counter fallback (no audio sources, or audio sources still warming up)")
 				}
 				using_audio_clock = want_audio_clock
 			}
-			if render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true) {
-				encode.push_video(frame_bytes, video_pts)
+			read_ok := render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true)
+
+			// Diagnostic: fires every 60th successful read regardless of which
+			// of recording/streaming is active below, so it can't be masked by
+			// either being off -- same every-60th-sample style as the RTMP
+			// thread's mailbox_take log.
+			if read_ok {
+				read_target_count += 1
+				if read_target_count % 60 == 0 {
+					log.infof("read_target #%v: ok=%v, video_pts=%v, first pixel BGRA = %v %v %v %v",
+						read_target_count, read_ok, video_pts, frame_bytes[0], frame_bytes[1], frame_bytes[2], frame_bytes[3])
+				}
+			} else {
+				log.warnf("read_target failed (recording=%v streaming=%v); frame_bytes left stale from the last successful read", recording, streaming)
+			}
+
+			if read_ok {
+				if recording {
+					encode.push_video(frame_bytes, video_pts)
+				}
+				if streaming {
+					rtmp.mailbox_put(mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
+					win32.SetEvent(rtmp_stream.event)
+				}
 				video_frame_count += 1
 			}
 		}
@@ -664,6 +729,7 @@ main :: proc() {
         // be backwards -- so main writes down its own recording state here,
         // every frame, for the Controls panel to read.
         ui_state.controls.recording = recording
+        ui_state.controls.streaming = streaming
 
         ui.draw(&ui_state, &cfg, &doc, &clear_color, preview_tex, outputs, profile_infos, collection_infos,
             f32(preview_target.width), f32(preview_target.height), audio_devices)
@@ -694,6 +760,19 @@ main :: proc() {
 			log.errorf("Present failed: HRESULT 0x%08X", u32(hr))
 		}
 		win.swap_chain_occluded = (hr == dxgi.STATUS_OCCLUDED)
+	}
+
+	// Finalize any still-active recording/stream before persisting. Previously
+	// there was no such call here, so closing the window mid-recording left
+	// the MP4's sink writer never finalized -- this closes that gap.
+	if recording {
+		log.info("finalizing recording on exit")
+		encode.stop()
+	}
+	if streaming {
+		log.info("closing stream on exit")
+		rtmp.rtmp_stream_close(rtmp_stream)
+		rtmp.mailbox_destroy(mailbox)
 	}
 
 	// Persist on a clean shutdown. Everything that reaches here left the loop
@@ -807,13 +886,17 @@ handle_profile_request :: proc(
 // stopping while not, is a no-op rather than a double call into encode.
 @(private = "file")
 handle_controls_request :: proc(
-	req:       ui.Controls_Request,
-	state:     ^ui.Controls_State,
-	recording: ^bool,
-	paths:     ^config.Paths,
-	target:    ^render.Target,
-	fps:       i32,
-	has_audio: bool,
+	req:         ui.Controls_Request,
+	state:       ^ui.Controls_State,
+	recording:   ^bool,
+	streaming:   ^bool,
+	rtmp_stream: ^^rtmp.Rtmp_Stream,
+	mailbox:     ^^rtmp.Frame_Mailbox,
+	paths:       ^config.Paths,
+	target:      ^render.Target,
+	fps:         i32,
+	stream_cfg:  settings.Stream_Settings,
+	has_audio:   bool,
 ) {
 	state.request = .None
 
@@ -860,6 +943,41 @@ handle_controls_request :: proc(
 		encode.stop()
 		recording^ = false
 		log.info("recording stopped")
+
+	case .Start_Streaming:
+		if streaming^ do return
+		if stream_cfg.host == "" || stream_cfg.stream_key == "" {
+			log.warn("streaming requested, but no stream destination is configured")
+			return
+		}
+
+		// Fixed at the max canvas size rather than target's current dimensions:
+		// the canvas can be resized while streaming (reconcile.odin's
+		// recording-guard doesn't cover streaming), and mailbox_put's copy()
+		// would silently truncate a frame into an undersized buffer instead of
+		// erroring. See conversation notes for the investigation.
+		mbox := rtmp.mailbox_init(settings.MAX_CANVAS_WIDTH, settings.MAX_CANVAS_HEIGHT)
+		stream, ok := rtmp.rtmp_stream_start(
+			mbox, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
+			stream_cfg.stream_key, u32(fps), target.width, target.height, u32(stream_cfg.bitrate))
+		if ok {
+			mailbox^ = mbox
+			rtmp_stream^ = stream
+			streaming^ = true
+			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
+		} else {
+			rtmp.mailbox_destroy(mbox)
+			log.warn("failed to start streaming (cause logged above)")
+		}
+
+	case .Stop_Streaming:
+		if !streaming^ do return
+		rtmp.rtmp_stream_close(rtmp_stream^)
+		rtmp.mailbox_destroy(mailbox^)
+		rtmp_stream^ = nil
+		mailbox^ = nil
+		streaming^ = false
+		log.info("streaming stopped")
 	}
 }
 

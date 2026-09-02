@@ -35,7 +35,7 @@ draw :: proc(
 ) {
     im.DockSpaceOverViewport(0, im.GetMainViewport(), {.PassthruCentralNode}, nil)
 
-    draw_menubar(state, cfg, doc, outputs, profiles, collections);
+    draw_menubar(state, cfg, doc, outputs, profiles, collections, state.controls.streaming);
 
     draw_preview(&state.preview, &state.sources, &state.scenes, doc, preview_tex, canvas_w, canvas_h)
     draw_scenes(&state.scenes, doc)

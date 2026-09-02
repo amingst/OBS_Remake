@@ -6,6 +6,8 @@ Controls_Request :: enum {
     None,
     Start_Recording,
     Stop_Recording,
+    Start_Streaming,
+    Stop_Streaming,
 }
 
 // Requests are raised here and consumed/cleared by main -- same pattern as
@@ -20,6 +22,9 @@ Controls_State :: struct {
     // are supposed to flow -- so main writes this down each frame before
     // ui.draw, and draw_controls only ever reads it back.
     recording: bool,
+
+    // Mirrors main's rtmp streaming state, same reasoning as recording above.
+    streaming: bool,
 }
 
 init_controls_state :: proc() -> Controls_State {
@@ -37,6 +42,18 @@ draw_controls :: proc(state: ^Controls_State) {
         } else {
             if im.Button("Start") {
                 state.request = .Start_Recording
+            }
+        }
+
+        if state.streaming {
+            if im.Button("Stop Stream") {
+                state.request = .Stop_Streaming
+            }
+            im.SameLine()
+            im.TextColored({1, 0, 0, 1}, "● LIVE")
+        } else {
+            if im.Button("Start Stream") {
+                state.request = .Start_Streaming
             }
         }
     }
