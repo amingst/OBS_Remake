@@ -218,10 +218,10 @@ with_com :: proc() -> (uninit: bool) {
 // Output lands in build/test-output/ and is intentionally left on disk
 // (both on success and failure) so the encoded clip can be opened in
 // VLC/ffplay to confirm it's actually decodable, not just API-successful.
-@(private="file")
+@(private)
 test_output_dir :: "build/test-output"
 
-@(private="file")
+@(private)
 ensure_test_output_dir :: proc() -> bool {
     // Same "already-there is the steady state" pattern as config.odin's make_dir.
     if err := os.make_directory("build"); err != nil && err != os.General_Error.Exist {
@@ -235,7 +235,7 @@ ensure_test_output_dir :: proc() -> bool {
     return true
 }
 
-@(private="file")
+@(private)
 log_test_output_path :: proc(path: string) {
     abs_path, aerr := filepath.abs(path)
     if aerr != nil {

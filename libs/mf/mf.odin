@@ -734,4 +734,179 @@ end_video_processor :: proc(processor: ^IMFTransform) {
     processor.Release(processor)
 }
 
-begin_aac_encoder :: proc() -> (encoder: ^IMFTransform, ok: bool)
+begin_aac_encoder :: proc(audio_sample_rate, audio_channels, audio_bitrate: u32) -> (encoder: ^IMFTransform, aac_config: []u8, ok: bool) {
+    output_filter := MFT_REGISTER_TYPE_INFO{MFMediaType_Audio, MFAudioFormat_AAC}
+    activates: [^]^IMFActivate
+    count: u32
+
+    hr := MFTEnumEx(MFT_CATEGORY_AUDIO_ENCODER, MFT_ENUM_FLAG_SYNCMFT, nil, &output_filter, &activates, &count)
+    if hr < 0 {
+        log.errorf("MFTEnumEx failed: 0x%08X", u32(hr))
+        return nil, nil, false
+    }
+    if count == 0 {
+        log.errorf("MFTEnumEx found no synchronous AAC encoder")
+        windows.CoTaskMemFree(activates)
+        return nil, nil, false
+    }
+
+    activate := activates[0]
+    for i: u32 = 1; i < count; i += 1 {
+        activates[i].Release(activates[i])
+    }
+    windows.CoTaskMemFree(activates)
+    defer activate.Release(activate)
+
+    hr = activate.ActivateObject(activate, &IID_IMFTransform, cast(^rawptr)&encoder)
+    if hr < 0 {
+        log.errorf("ActivateObject failed: 0x%08X", u32(hr))
+        return nil, nil, false
+    }
+
+    if !valid_aac_bitrate(audio_channels, audio_bitrate) {
+        log.errorf("Invalid AAC bitrate for %d channels: %d", audio_channels, audio_bitrate)
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+
+    // ---- output type: AAC ----
+    output_type: ^IMFMediaType
+    hr = MFCreateMediaType(&output_type)
+    if hr < 0 {
+        log.errorf("MFCreateMediaType (encoder output) failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+
+    defer output_type.Release(output_type)
+    output_type.SetGUID(output_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+    output_type.SetGUID(output_type, &MF_MT_SUBTYPE, &MFAudioFormat_AAC)
+    output_type.SetUINT32(output_type, &MF_MT_AAC_PAYLOAD_TYPE, 0)
+    output_type.SetUINT32(output_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels)
+    output_type.SetUINT32(output_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate)
+    output_type.SetUINT32(output_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+    output_type.SetUINT32(output_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_bitrate)
+    hr = encoder.SetOutputType(encoder, 0, output_type, 0)
+    if hr < 0 {
+        log.errorf("SetOutputType failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+
+    // ---- input type: PCM ----
+    input_type: ^IMFMediaType
+    hr = MFCreateMediaType(&input_type)
+    if hr < 0 {
+        log.errorf("MFCreateMediaType (encoder input) failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+
+    block_align := audio_channels * 2
+
+    defer input_type.Release(input_type)
+    input_type.SetGUID(input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
+    input_type.SetGUID(input_type, &MF_MT_SUBTYPE, &MFAudioFormat_PCM)
+    input_type.SetUINT32(input_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels)
+    input_type.SetUINT32(input_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate)
+    input_type.SetUINT32(input_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
+    input_type.SetUINT32(input_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_sample_rate * block_align)
+    input_type.SetUINT32(input_type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align)
+    hr = encoder.SetInputType(encoder, 0, input_type, 0)
+    if hr < 0 {
+        log.errorf("SetInputType failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+
+    // TODO: extract aac_config via MF_MT_USER_DATA
+    current_output: ^IMFMediaType
+    hr = encoder.GetOutputCurrentType(encoder, 0, &current_output)
+    if hr < 0 {
+        log.errorf("GetOutputCurrentType failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+    defer current_output.Release(current_output)
+
+    aac_size: u32
+    hr = current_output.GetBlobSize(current_output, &MF_MT_USER_DATA, &aac_size)
+    if hr < 0 {
+        log.errorf("GetBlobSize(AAC) failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+    asc_blob := make([]u8, aac_size, context.temp_allocator)
+    hr = current_output.GetBlob(current_output, &MF_MT_USER_DATA, raw_data(asc_blob), aac_size, nil)
+    if hr < 0 {
+        log.errorf("GetBlob(AAC) failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+    aac_config = slice.clone(asc_blob[12:])
+
+    hr = encoder.ProcessMessage(encoder, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
+    if hr < 0 {
+        log.errorf("ProcessMessage(BEGIN_STREAMING) failed: 0x%08X", u32(hr))
+        delete(aac_config)
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+
+    return encoder, aac_config, true
+}
+
+encode_aac_frame :: proc(encoder: ^IMFTransform, raw_pcm_samples: []u8, pcm_sample_time, pcm_sample_duration: i64) -> (aac_data: [][]u8, ok: bool) {
+	buffer: ^IMFMediaBuffer
+	hr := MFCreateMemoryBuffer(u32(len(raw_pcm_samples)), &buffer)
+	if hr < 0 {
+		log.errorf("MFCreateMemoryBuffer failed: 0x%08X", u32(hr))
+		return nil, false
+	}
+
+	data: [^]u8
+	hr = buffer.Lock(buffer, &data, nil, nil)
+	if hr < 0 {
+		log.errorf("Lock failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return nil, false
+	}
+	mem.copy(data, raw_data(raw_pcm_samples), len(raw_pcm_samples))
+	hr = buffer.Unlock(buffer)
+	if hr < 0 {
+		log.errorf("Unlock failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return nil, false
+	}
+	buffer.SetCurrentLength(buffer, u32(len(raw_pcm_samples)))
+
+	sample: ^IMFSample
+	hr = MFCreateSample(&sample)
+	if hr < 0 {
+		log.errorf("MFCreateSample failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return nil, false
+	}
+
+	sample.AddBuffer(sample, buffer)
+
+	sample.SetSampleTime(sample, pcm_sample_time)
+	sample.SetSampleDuration(sample, pcm_sample_duration)
+
+	hr = encoder.ProcessInput(encoder, 0, sample, 0)
+	sample.Release(sample)
+    buffer.Release(buffer)
+	if hr < 0 {
+		log.errorf("ProcessInput failed: 0x%08X", u32(hr))
+		return nil, false
+	}
+
+	return drain_transform_samples(encoder, 0)
+}
+
+end_aac_encoder :: proc(encoder: ^IMFTransform) -> [][]u8 {
+	encoder.ProcessMessage(encoder, MFT_MESSAGE_COMMAND_DRAIN, 0)
+	tail_frames, _ := drain_transform_samples(encoder, 0)
+	encoder.Release(encoder)
+	return tail_frames
+}
