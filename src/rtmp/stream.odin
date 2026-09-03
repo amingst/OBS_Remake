@@ -24,7 +24,14 @@ Rtmp_Stream :: struct {
     sps, pps:       []u8,
     width, height:  u32,
     fps:            u32,
-    stream_key: 	string,
+    stream_key:     string,
+    aac_config:         []u8,
+    audio_encoder:      ^mf.IMFTransform,
+    audio_queue:        ^Audio_Queue,
+    audio_sample_rate:  u32,
+    audio_scratch:      []u8,
+    dropped_audio_blocks: u32,
+    audio_channels:     u32,
 }
 
 rtmp_stream_start :: proc(
@@ -36,6 +43,8 @@ rtmp_stream_start :: proc(
 	stream_key: string,
 	fps: u32,
 	width, height, bitrate: u32,
+	audio_channels, audio_bitrate, audio_sample_rate: u32,
+	audio_queue: ^Audio_Queue,
 ) -> (^Rtmp_Stream, bool) {
 	// ---- Connect to the RTMP Server ----
 	conn, ok := connect(host, port)
@@ -119,6 +128,17 @@ rtmp_stream_start :: proc(
     	log.warnf("set_encoder_gop_size failed -- encoder will use its default keyframe interval")
     }
 
+    // ---- Init Audio Encoder ----
+    audio_encoder, aac_config, audio_ok := mf.begin_aac_encoder(audio_sample_rate, audio_channels, audio_bitrate)
+    if !audio_ok {
+     	mf.end_video_processor(processor)
+     	encoder.Release(encoder)
+     	delete(sps)
+     	delete(pps)
+    	log.error("begin_aac_encoder failed")
+    	return {}, false
+    }
+
     // ---- send AVC sequence header (once, at timestamp 0) ----
     // Mirrors commands_test.odin's publish_sequence test -- this send was
     // missing here entirely, which is the likely cause of ffmpeg failing to
@@ -147,7 +167,27 @@ rtmp_stream_start :: proc(
     	encoder.Release(encoder)
     	delete(sps)
     	delete(pps)
+    	audio_encoder.Release(audio_encoder)
+     	delete(aac_config)
     	log.error("send_media (sequence header) failed")
+    	return {}, false
+    }
+
+
+    // ---- send AAC sequence header (once, at timestamp 0) ----
+    is_stereo := audio_channels == 2
+    aac_seq_header := flv.build_aac_sequence_header(aac_config, true, is_stereo)
+    defer delete(aac_seq_header)
+    audio_seq_ok := send_media(&conn, 8, aac_seq_header, 0, CSID_AUDIO)
+    log.infof("send_media (AAC sequence header) returned %v", audio_seq_ok)
+    if !audio_seq_ok {
+    	mf.end_video_processor(processor)
+    	encoder.Release(encoder)
+    	delete(sps)
+    	delete(pps)
+    	audio_encoder.Release(audio_encoder)
+    	delete(aac_config)
+    	log.error("send_media (AAC sequence header) failed")
     	return {}, false
     }
 
@@ -163,6 +203,12 @@ rtmp_stream_start :: proc(
     stream.fps = fps
     stream.mailbox = mbox
     stream.stream_key = stream_key
+    stream.aac_config = aac_config
+    stream.audio_encoder = audio_encoder
+    stream.audio_queue = audio_queue
+    stream.audio_sample_rate = audio_sample_rate
+    stream.audio_scratch = make([]u8, int(audio_queue.stride))
+    stream.audio_channels = audio_channels
 
     event_handle := windows.CreateEventW(
     	lpEventAttributes = nil,
@@ -192,6 +238,9 @@ rtmp_stream_start :: proc(
     	delete(pps)
     	windows.CloseHandle(stream.event)
     	delete(stream.scratch)
+     	audio_encoder.Release(audio_encoder)
+      	delete(stream.audio_scratch)
+        delete(aac_config)
     	free(stream)
     	return {}, false
     }
@@ -213,6 +262,7 @@ rtmp_stream_close :: proc(s: ^Rtmp_Stream) {
 
 	if s.scratch != nil { delete(s.scratch) }
 	if s.event != nil { windows.CloseHandle(s.event); s.event = nil}
+	if s.audio_scratch != nil { delete(s.audio_scratch) }
 	log.debug("rtmp stream closed")
 	free(s)
 }
@@ -238,12 +288,48 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 	windows.CoInitializeEx(nil, .MULTITHREADED)
 	defer windows.CoUninitialize()
 
+	samples_per_block := stream.audio_queue.stride / (stream.audio_channels * 2)
+	is_stereo := stream.audio_channels == 2
+	audio_block_duration := i64(samples_per_block) * 10_000_000 / i64(stream.audio_sample_rate)
 	frame_duration := i64(10_000_000) / i64(stream.fps)
 	last_pts: i64 = 0
 	take_count: u64 = 0
+	last_audio_pts: i64 = 0
+	audio_take_count: u64 = 0
 
 	for intrinsics.atomic_load_explicit(&stream.running, .Acquire) {
  		if windows.WaitForSingleObject(stream.event, 200) != windows.WAIT_OBJECT_0 do continue
+	   for {
+		       audio_pts, take_ok := audio_queue_take(stream.audio_queue, stream.audio_scratch)
+		       if !take_ok do break
+		      	audio_take_count += 1
+		       	if audio_take_count % 60 == 0 {
+		        	log.infof("audio_queue_take #%v: pts=%v",
+		         	audio_take_count, audio_pts)
+		        }
+			   aac_data, encode_aac_ok := mf.encode_aac_frame(stream.audio_encoder, stream.audio_scratch, audio_pts, audio_block_duration)
+			   if !encode_aac_ok {
+					intrinsics.atomic_add(&stream.dropped_audio_blocks, 1)
+					log.infof("encode_aac_frame failed, dropped block")
+					continue
+				}
+
+				if len(aac_data) > 0 {
+					for data in aac_data {
+						aac_frame := flv.build_aac_frame(data, true, is_stereo)
+						if !send_media(&stream.conn, 8, aac_frame, i64(audio_pts), CSID_AUDIO) {
+							intrinsics.atomic_add(&stream.dropped_audio_blocks, 1)
+							log.infof("send_media failed, dropped block")
+						}
+						delete(aac_frame)
+					}
+				}
+
+				last_audio_pts = i64(audio_pts)
+				for data in aac_data do delete(data)
+				delete(aac_data)
+				free_all(context.temp_allocator)
+	   }
    		_, _, pts, mbox_take_ok := mailbox_take(stream.mailbox, stream.scratch)
       	if !mbox_take_ok do continue
 
@@ -293,9 +379,24 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 	for n in tail do delete(n)
 	delete(tail)
 
+	audio_tail := mf.end_aac_encoder(stream.audio_encoder)
+	if len(audio_tail) > 0 {
+		for data in audio_tail {
+			aac_frame := flv.build_aac_frame(data, true, is_stereo)
+			if !send_media(&stream.conn, 8, aac_frame, i64(last_audio_pts), CSID_AUDIO) {
+				intrinsics.atomic_add(&stream.dropped_audio_blocks, 1)
+				log.infof("send_media failed, dropped block")
+			}
+			delete(aac_frame)
+		}
+	}
+	for data in audio_tail do delete(data)
+	delete(audio_tail)
+
 	mf.end_video_processor(stream.processor)
 	delete(stream.sps)
 	delete(stream.pps)
+	delete(stream.aac_config)
 	mf.MFShutdown()
 
 	if !send_fc_unpublish(stream) {
@@ -310,5 +411,7 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 
 	intrinsics.atomic_store_explicit(&stream.alive, false, .Release)
 	intrinsics.atomic_store_explicit(&stream.running, false, .Release)
-	log.infof("rtmp stream stopped: dropped %v frames", intrinsics.atomic_load_explicit(&stream.dropped_frames, .Acquire))
+	log.infof("rtmp stream stopped: dropped %v video frame(s), %v audio block(s)",
+	    intrinsics.atomic_load_explicit(&stream.dropped_frames, .Acquire),
+	    intrinsics.atomic_load_explicit(&stream.dropped_audio_blocks, .Acquire))
 }

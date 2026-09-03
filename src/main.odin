@@ -373,6 +373,7 @@ main :: proc() {
 	streaming := false
 	rtmp_stream: ^rtmp.Rtmp_Stream
 	mailbox: ^rtmp.Frame_Mailbox
+	audio_queue: ^rtmp.Audio_Queue
 	video_frame_count: u64
 	read_target_count: u64 // diagnostic-only: counts successful read_target calls in the recording||streaming block
 	mixer_ready_log_count: u64 // diagnostic-only: caps the mixer-readiness dump to the first 5 checks this session
@@ -475,7 +476,7 @@ main :: proc() {
 		if req := ui_state.controls.request; req != .None {
 			was_recording := recording
 			handle_controls_request(req, &ui_state.controls, &recording, &streaming, &rtmp_stream, &mailbox,
-				&paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources)
+				&audio_queue, &paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources)
 			if recording && !was_recording {
 				// Reset clocks so the first sample/frame is PTS 0.
 				blocks_emitted = 0
@@ -625,12 +626,19 @@ main :: proc() {
 
 		if mixer_started {
 			for audio.mix_block(inputs[:], mix_buf, CHANNELS) {
+				pts_100ns := i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
+				duration_100ns := i64(audio.BLOCK_SAMPLES) * 10_000_000 / 48000
+				pcm_buf := f32_to_pcm16(mix_buf)
+
 				if recording {
-					pts_100ns := i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
-					duration_100ns := i64(audio.BLOCK_SAMPLES) * 10_000_000 / 48000
-					pcm_buf := f32_to_pcm16(mix_buf)
 					encode.push_audio(pcm_buf, pts_100ns, duration_100ns)
 				}
+				if streaming {
+					if !rtmp.audio_queue_put(audio_queue, pcm_buf, pts_100ns) {
+						log.warnf("audio_queue_put failed (queue full), dropped block")
+					}
+				}
+
 				blocks_emitted += 1
 			}
 		}
@@ -773,6 +781,7 @@ main :: proc() {
 		log.info("closing stream on exit")
 		rtmp.rtmp_stream_close(rtmp_stream)
 		rtmp.mailbox_destroy(mailbox)
+		rtmp.audio_queue_destroy(audio_queue)
 	}
 
 	// Persist on a clean shutdown. Everything that reaches here left the loop
@@ -892,6 +901,7 @@ handle_controls_request :: proc(
 	streaming:   ^bool,
 	rtmp_stream: ^^rtmp.Rtmp_Stream,
 	mailbox:     ^^rtmp.Frame_Mailbox,
+	audio_queue: ^^rtmp.Audio_Queue,
 	paths:       ^config.Paths,
 	target:      ^render.Target,
 	fps:         i32,
@@ -951,22 +961,40 @@ handle_controls_request :: proc(
 			return
 		}
 
-		// Fixed at the max canvas size rather than target's current dimensions:
-		// the canvas can be resized while streaming (reconcile.odin's
-		// recording-guard doesn't cover streaming), and mailbox_put's copy()
-		// would silently truncate a frame into an undersized buffer instead of
-		// erroring. See conversation notes for the investigation.
 		mbox := rtmp.mailbox_init(settings.MAX_CANVAS_WIDTH, settings.MAX_CANVAS_HEIGHT)
+
+		// Fixed at 48kHz/stereo/16000 bytes-per-sec -- matches the mixer's
+		// hardcoded format elsewhere in main.odin (CHANNELS, the 48000 literal
+		// in the pts_100ns calc below) and is one of valid_aac_bitrate's fixed
+		// accepted values for non-5.1 channel counts. Streaming currently
+		// always sets up the AAC encoder regardless of has_audio, unlike
+		// recording's 0-means-no-audio branch -- rtmp_stream_start has no
+		// no-audio path yet, so a stream started with no audio sources present
+		// just sends an AAC sequence header and no further audio frames, rather
+		// than skipping audio setup entirely. Worth revisiting if that turns
+		// out to matter in practice.
+		STREAM_AUDIO_SAMPLE_RATE :: 48000
+		STREAM_AUDIO_CHANNELS    :: 2
+		STREAM_AUDIO_BITRATE     :: 16000
+
+		aq := rtmp.audio_queue_init(
+			audio.BLOCK_LATENCY,
+			u32(audio.BLOCK_SAMPLES) * STREAM_AUDIO_CHANNELS * 2,
+		)
+
 		stream, ok := rtmp.rtmp_stream_start(
 			mbox, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
-			stream_cfg.stream_key, u32(fps), target.width, target.height, u32(stream_cfg.bitrate))
+			stream_cfg.stream_key, u32(fps), target.width, target.height, u32(stream_cfg.bitrate),
+			STREAM_AUDIO_CHANNELS, STREAM_AUDIO_BITRATE, STREAM_AUDIO_SAMPLE_RATE, aq)
 		if ok {
 			mailbox^ = mbox
+			audio_queue^ = aq
 			rtmp_stream^ = stream
 			streaming^ = true
 			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
 		} else {
 			rtmp.mailbox_destroy(mbox)
+			rtmp.audio_queue_destroy(aq)
 			log.warn("failed to start streaming (cause logged above)")
 		}
 
@@ -974,8 +1002,10 @@ handle_controls_request :: proc(
 		if !streaming^ do return
 		rtmp.rtmp_stream_close(rtmp_stream^)
 		rtmp.mailbox_destroy(mailbox^)
+		rtmp.audio_queue_destroy(audio_queue^)
 		rtmp_stream^ = nil
 		mailbox^ = nil
+		audio_queue^ = nil
 		streaming^ = false
 		log.info("streaming stopped")
 	}

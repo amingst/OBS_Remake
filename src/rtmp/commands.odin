@@ -284,6 +284,7 @@ send_publish :: proc(c: ^Connection, stream_key: string) -> bool {
 
 CSID_VIDEO :: 6 // distinct from command csids (3, 4); fixed for the life of the connection
 
+CSID_AUDIO :: 8
 send_media :: proc(c: ^Connection, type_id: u8, payload: []u8, timestamp_100ns: i64, csid: u32) -> bool {
 	if c.stream_id == 0 {
 		log.warn("send_media: stream_id not set -- call after createStream result")
