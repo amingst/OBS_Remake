@@ -11,6 +11,11 @@ AVC_PACKET_TYPE_SEQUENCE_HEADER :: 0
 AVC_PACKET_TYPE_NALU            :: 1
 AVC_PACKET_TYPE_END_OF_SEQUENCE :: 2
 
+AAC_SOUND_FORMAT :: 10
+AAC_SOUND_RATE :: 3
+AAC_PACKET_TYPE_SEQUENCE_HEADER :: 0
+AAC_PACKET_TYPE_RAW :: 1
+
 // The one-time AVC sequence header message, built from
 // h264.build_avc_decoder_config's output. Send this exactly once, before
 // any frame data, immediately after the publish sequence completes.
@@ -51,4 +56,26 @@ build_avc_frame :: proc(nalus: [][]u8, composition_time: i32 = 0, allocator := c
     for b in avcc do append(&out, b)
 
     return out[:], is_keyframe
+}
+
+build_aac_sequence_header :: proc(aac_config: []u8, is_16_bit: bool, is_stereo: bool, allocator := context.allocator) -> []u8 {
+	out := make([dynamic]u8, allocator)
+	size_bits := is_16_bit ? u8(1) : u8(0)
+	stereo_bits := is_stereo ? u8(1) : u8(0)
+	append(&out, u8(AAC_SOUND_FORMAT << 4 | AAC_SOUND_RATE << 2 | size_bits << 1 | stereo_bits))
+	append(&out, u8(AAC_PACKET_TYPE_SEQUENCE_HEADER))
+	for b in aac_config do append(&out, b)
+
+	return out[:]
+}
+
+build_aac_frame :: proc(encoded: []u8, is_16_bit: bool, is_stereo: bool, allocator := context.allocator) -> []u8 {
+	out := make([dynamic]u8, allocator)
+	size_bits := is_16_bit ? u8(1) : u8(0)
+	stereo_bits := is_stereo ? u8(1) : u8(0)
+	append(&out, u8(AAC_SOUND_FORMAT << 4 | AAC_SOUND_RATE << 2 | size_bits << 1 | stereo_bits))
+	append(&out, u8(AAC_PACKET_TYPE_RAW))
+	for b in encoded do append(&out, b)
+
+	return out[:]
 }

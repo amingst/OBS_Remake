@@ -733,3 +733,5 @@ end_video_processor :: proc(processor: ^IMFTransform) {
     }
     processor.Release(processor)
 }
+
+begin_aac_encoder :: proc() -> (encoder: ^IMFTransform, ok: bool)
