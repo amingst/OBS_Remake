@@ -9,6 +9,7 @@ import "core:log"
 import "core:fmt"
 import "core:strings"
 import "base:intrinsics"
+import "../applog"
 
 Rtmp_Stream :: struct {
     running:        bool,
@@ -32,6 +33,8 @@ Rtmp_Stream :: struct {
     audio_scratch:      []u8,
     dropped_audio_blocks: u32,
     audio_channels:     u32,
+    log_sink:       ^applog.Sink,
+    stream_index:   u8,
 }
 
 rtmp_stream_start :: proc(
@@ -45,6 +48,8 @@ rtmp_stream_start :: proc(
 	width, height, bitrate: u32,
 	audio_channels, audio_bitrate, audio_sample_rate: u32,
 	audio_queue: ^Audio_Queue,
+	log_sink: ^applog.Sink,
+	stream_index: u8,
 ) -> (^Rtmp_Stream, bool) {
 	// ---- Connect to the RTMP Server ----
 	conn, ok := connect(host, port)
@@ -209,6 +214,8 @@ rtmp_stream_start :: proc(
     stream.audio_sample_rate = audio_sample_rate
     stream.audio_scratch = make([]u8, int(audio_queue.stride))
     stream.audio_channels = audio_channels
+    stream.log_sink = log_sink
+    stream.stream_index = stream_index
 
     event_handle := windows.CreateEventW(
     	lpEventAttributes = nil,
@@ -269,21 +276,15 @@ rtmp_stream_close :: proc(s: ^Rtmp_Stream) {
 
 @(private="file")
 rtmp_stream_thread :: proc(t: ^thread.Thread) {
+	stream := (^Rtmp_Stream)(t.data)
+
 	// thread.create starts with a fresh default context -- context.logger is
 	// NOT inherited from the spawning thread, so every log call in this proc
-	// was silently discarded until this was added. Own instance rather than
-	// sharing main's: console_logger_proc's fmt.fprintf to os.stdout/stderr
-	// is documented not-yet-thread-safe regardless of whether the Logger
-	// instance is shared, so a separate instance costs nothing extra and
-	// avoids any cross-thread lifetime/destroy-ordering question.
-	when ODIN_DEBUG {
-		context.logger = log.create_console_logger(.Debug)
-	} else {
-		context.logger = log.create_console_logger(.Info)
-	}
-	defer log.destroy_console_logger(context.logger)
-
-	stream := (^Rtmp_Stream)(t.data)
+	// was silently discarded until this was added. rtmp_log_ctx is a local of
+	// this proc (not the spawning proc) so the pointer make_logger stashes in
+	// the Logger stays valid for the thread's whole lifetime.
+	rtmp_log_ctx := applog.Log_Context{sink = stream.log_sink, tag = {.Rtmp, stream.stream_index}}
+	context.logger = applog.make_logger(&rtmp_log_ctx)
 
 	windows.CoInitializeEx(nil, .MULTITHREADED)
 	defer windows.CoUninitialize()

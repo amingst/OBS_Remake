@@ -60,6 +60,11 @@ main :: proc() {
 	main_log_ctx := applog.Log_Context{sink = log_sink, tag = {.Main, 0}}
 	context.logger = applog.make_logger(&main_log_ctx)
 
+	// The audio capture thread logs through this same sink -- set once here,
+	// before any stream is opened (streams are only acquired later, from the
+	// scene-source handling in the main loop below).
+	audio.set_log_sink(log_sink)
+
 	// Config locations and persisted state. Done up here, before any device
 	// objects exist, because the loaded canvas resolution decides how big the
 	// preview target is created below -- see the create_target call.
@@ -476,7 +481,7 @@ main :: proc() {
 		if req := ui_state.controls.request; req != .None {
 			was_recording := recording
 			handle_controls_request(req, &ui_state.controls, &recording, &streaming, &rtmp_stream, &mailbox,
-				&audio_queue, &paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources)
+				&audio_queue, &paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources, log_sink)
 			if recording && !was_recording {
 				// Reset clocks so the first sample/frame is PTS 0.
 				blocks_emitted = 0
@@ -907,6 +912,7 @@ handle_controls_request :: proc(
 	fps:         i32,
 	stream_cfg:  settings.Stream_Settings,
 	has_audio:   bool,
+	log_sink:    ^applog.Sink,
 ) {
 	state.request = .None
 
@@ -982,10 +988,13 @@ handle_controls_request :: proc(
 			u32(audio.BLOCK_SAMPLES) * STREAM_AUDIO_CHANNELS * 2,
 		)
 
+		// stream_index 0: a single stream is all this build supports today.
+		// A real id generator/registry belongs with fan-out, not here.
 		stream, ok := rtmp.rtmp_stream_start(
 			mbox, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
 			stream_cfg.stream_key, u32(fps), target.width, target.height, u32(stream_cfg.bitrate),
-			STREAM_AUDIO_CHANNELS, STREAM_AUDIO_BITRATE, STREAM_AUDIO_SAMPLE_RATE, aq)
+			STREAM_AUDIO_CHANNELS, STREAM_AUDIO_BITRATE, STREAM_AUDIO_SAMPLE_RATE, aq,
+			log_sink, 0)
 		if ok {
 			mailbox^ = mbox
 			audio_queue^ = aq

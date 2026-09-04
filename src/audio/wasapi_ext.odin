@@ -5,6 +5,7 @@ import "vendor:windows/wasapi"
 import "core:log"
 import "core:thread"
 import "base:intrinsics"
+import "../applog"
 
 
 IID_IAudioCaptureClient := &windows.IID{
@@ -206,12 +207,26 @@ drain_packets :: proc(s: ^Stream) {
 stream_thread :: proc(t: ^thread.Thread) {
     s := (^Stream)(t.data)
 
+    // thread.create starts with a fresh default context -- context.logger is
+    // NOT inherited from the spawning thread, so every log call in this proc
+    // was silently discarded before this was added. audio_log_ctx is a local
+    // of this proc (not the spawning proc) so the pointer make_logger stashes
+    // in the Logger stays valid for the thread's whole lifetime.
+    audio_log_ctx := applog.Log_Context{sink = g_log_sink, tag = {.Audio, 0}}
+    context.logger = applog.make_logger(&audio_log_ctx)
+
     windows.CoInitializeEx(nil, .MULTITHREADED)
     defer windows.CoUninitialize()
 
     for intrinsics.atomic_load_explicit(&s.running, .Acquire) {
         if windows.WaitForSingleObject(s.event, 200) != windows.WAIT_OBJECT_0 do continue
         drain_packets(s)
+        // core:log's frontend formats via tprintf, allocating from the
+        // per-thread temp arena. drain_packets can log (ring-overflow
+        // warning) every iteration of this long-lived loop, so it must be
+        // cleared here or it grows without bound -- invisible to the
+        // tracking allocator since core:context.temp_allocator isn't it.
+        free_all(context.temp_allocator)
     }
 
     log.debug("audio thread exiting")

@@ -4,9 +4,19 @@ import "vendor:windows/wasapi"
 import "core:log"
 import "core:sys/windows"
 import "core:strings"
+import "../applog"
 
 // Singleton Instance of audio device enumerator
 @(private) g_enumerator: ^wasapi.IMMDeviceEnumerator
+
+// Sink the capture thread logs into. Set once at startup via set_log_sink,
+// before any stream is opened -- open_stream is only ever called later, from
+// the main loop's per-frame source handling.
+@(private) g_log_sink: ^applog.Sink
+
+set_log_sink :: proc(sink: ^applog.Sink) {
+    g_log_sink = sink
+}
 @(private)
 get_enumerator :: proc() -> ^wasapi.IMMDeviceEnumerator {
     if g_enumerator != nil do return g_enumerator
