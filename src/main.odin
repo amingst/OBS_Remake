@@ -76,6 +76,22 @@ main :: proc() {
 	paths, _ := config.resolve_paths()
 	defer config.destroy_paths(&paths)
 
+	// One log file per run, named with the start timestamp, under the same
+	// config root as everything else in Paths. Not fatal if it can't be
+	// opened (no root, or the open itself fails) -- the app already has the
+	// ring buffer and console, so it just says so once and moves on.
+	if paths.root != "" {
+		year, month, day := time.date(time.now())
+		hour, min, sec := time.clock(time.now())
+		log_file_name := fmt.tprintf("log-%4d-%02d-%02d_%02d-%02d-%02d.txt",
+			year, int(month), day, hour, min, sec)
+		if log_path, jerr := filepath.join({paths.root, log_file_name}, context.temp_allocator); jerr == nil {
+			if !applog.sink_open_file(log_sink, log_path) {
+				fmt.eprintfln("applog: could not open log file %v -- continuing with ring buffer and console only", log_path)
+			}
+		}
+	}
+
 	// app.json: which profile is active. Loaded before any profile is, since
 	// deciding which profile to load depends on it. A missing or unreadable
 	// file just means a zero-valued config -- non-fatal, same contract as
@@ -380,7 +396,7 @@ main :: proc() {
 	mailbox: ^rtmp.Frame_Mailbox
 	audio_queue: ^rtmp.Audio_Queue
 	video_frame_count: u64
-	read_target_count: u64 // diagnostic-only: counts successful read_target calls in the recording||streaming block
+	audio_queue_full_count: u64 // throttles the "queue full" warning below, which can otherwise fire many times per second
 	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
 	has_audio_sources := false // set each frame, used by the recording-start handler next frame
 	// Main loop
@@ -607,7 +623,7 @@ main :: proc() {
 
 		if !mixer_started && audio.mixer_ready(inputs[:], CHANNELS) {
 			mixer_started = true
-			log.info("mixer_started -> true")
+			log.debug("mixer_started -> true")
 		}
 
 		if mixer_started {
@@ -621,7 +637,10 @@ main :: proc() {
 				}
 				if streaming {
 					if !rtmp.audio_queue_put(audio_queue, pcm_buf, pts_100ns) {
-						log.warnf("audio_queue_put failed (queue full), dropped block")
+						audio_queue_full_count += 1
+						if audio_queue_full_count % 60 == 0 {
+							log.warnf("audio_queue_put failed (queue full), dropped %v block(s) so far", audio_queue_full_count)
+						}
 					}
 				}
 
@@ -671,17 +690,7 @@ main :: proc() {
 			}
 			read_ok := render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true)
 
-			// Diagnostic: fires every 60th successful read regardless of which
-			// of recording/streaming is active below, so it can't be masked by
-			// either being off -- same every-60th-sample style as the RTMP
-			// thread's mailbox_take log.
-			if read_ok {
-				read_target_count += 1
-				if read_target_count % 60 == 0 {
-					log.infof("read_target #%v: ok=%v, video_pts=%v, first pixel BGRA = %v %v %v %v",
-						read_target_count, read_ok, video_pts, frame_bytes[0], frame_bytes[1], frame_bytes[2], frame_bytes[3])
-				}
-			} else {
+			if !read_ok {
 				log.warnf("read_target failed (recording=%v streaming=%v); frame_bytes left stale from the last successful read", recording, streaming)
 			}
 

@@ -195,7 +195,7 @@ drain_packets :: proc(s: ^Stream) {
         if flags & 0x2 == 0 && data != nil {
             samples := (cast([^]f32)data)[:frames * u32(s.channels)]
             if n := ring_write(&s.ring, samples); n < len(samples) {
-                log.warnf("audio ring overflow: dropped %v samples", len(samples) - n)
+                //log.debugf("audio ring overflow: dropped %v samples", len(samples) - n)
             }
         }
 

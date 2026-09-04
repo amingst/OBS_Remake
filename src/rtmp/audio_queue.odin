@@ -45,8 +45,10 @@ audio_queue_put :: proc(audio_queue: ^Audio_Queue, samples: []u8, pts: i64) -> b
 	defer sync.unlock(&audio_queue.mutex)
 
 	// Return when the count = capacity i.e. No room left
+	// Caller (main.odin's audio_queue_put failed (queue full)) reports this
+	// condition -- logging it here too was a redundant duplicate of the same
+	// event.
 	if audio_queue.count == audio_queue.capacity {
-		log.warn("Audio queue full")
 		return false
 	}
 
@@ -72,7 +74,7 @@ audio_queue_take :: proc(audio_queue: ^Audio_Queue, dst: []u8) -> (pts: i64, ok:
 	defer sync.unlock(&audio_queue.mutex)
 
 	if audio_queue.count == 0 {
-		log.warn("No audio bytes to send to stream")
+		log.debug("No audio bytes to send to stream")
 		return {}, false
 	}
 

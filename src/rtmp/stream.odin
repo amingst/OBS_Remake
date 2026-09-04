@@ -6,8 +6,6 @@ import "libs:h264"
 import "core:thread"
 import "core:sys/windows"
 import "core:log"
-import "core:fmt"
-import "core:strings"
 import "base:intrinsics"
 import "../applog"
 
@@ -35,6 +33,7 @@ Rtmp_Stream :: struct {
     audio_channels:     u32,
     log_sink:       ^applog.Sink,
     stream_index:   u8,
+    log_level: log.Level
 }
 
 rtmp_stream_start :: proc(
@@ -153,20 +152,7 @@ rtmp_stream_start :: proc(
     seq_header := flv.build_avc_sequence_header(avc_config)
     defer delete(seq_header)
 
-    log.infof("seq header: sps=%v bytes, pps=%v bytes, avc_config=%v bytes, seq_header=%v bytes",
-    	len(sps), len(pps), len(avc_config), len(seq_header))
-    {
-    	dump_n := min(len(seq_header), 32)
-    	sb: strings.Builder
-    	strings.builder_init(&sb, context.temp_allocator)
-    	for b in seq_header[:dump_n] {
-    		fmt.sbprintf(&sb, "%02X ", b)
-    	}
-    	log.infof("seq header first %v bytes: %v", dump_n, strings.to_string(sb))
-    }
-
     seq_ok := send_media(&conn, 9, seq_header, 0, CSID_VIDEO)
-    log.infof("send_media (sequence header) returned %v", seq_ok)
     if !seq_ok {
     	mf.end_video_processor(processor)
     	encoder.Release(encoder)
@@ -184,7 +170,6 @@ rtmp_stream_start :: proc(
     aac_seq_header := flv.build_aac_sequence_header(aac_config, true, is_stereo)
     defer delete(aac_seq_header)
     audio_seq_ok := send_media(&conn, 8, aac_seq_header, 0, CSID_AUDIO)
-    log.infof("send_media (AAC sequence header) returned %v", audio_seq_ok)
     if !audio_seq_ok {
     	mf.end_video_processor(processor)
     	encoder.Release(encoder)
@@ -216,6 +201,7 @@ rtmp_stream_start :: proc(
     stream.audio_channels = audio_channels
     stream.log_sink = log_sink
     stream.stream_index = stream_index
+    intrinsics.atomic_store(&stream.log_level, ODIN_DEBUG ? log.Level.Debug : log.Level.Info)
 
     event_handle := windows.CreateEventW(
     	lpEventAttributes = nil,
@@ -294,18 +280,23 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 	audio_block_duration := i64(samples_per_block) * 10_000_000 / i64(stream.audio_sample_rate)
 	frame_duration := i64(10_000_000) / i64(stream.fps)
 	last_pts: i64 = 0
-	take_count: u64 = 0
 	last_audio_pts: i64 = 0
 	audio_take_count: u64 = 0
 
 	for intrinsics.atomic_load_explicit(&stream.running, .Acquire) {
+		// Loaded every iteration (not just once at thread start) so a runtime
+		// change to stream.log_level takes effect without restarting the
+		// stream. core:log's logf checks this before formatting/allocating,
+		// so this is the only place the per-packet noise below is actually
+		// gated -- a check inside the backend would still pay the cost.
+		context.logger.lowest_level = intrinsics.atomic_load(&stream.log_level)
  		if windows.WaitForSingleObject(stream.event, 200) != windows.WAIT_OBJECT_0 do continue
 	   for {
 		       audio_pts, take_ok := audio_queue_take(stream.audio_queue, stream.audio_scratch)
 		       if !take_ok do break
 		      	audio_take_count += 1
 		       	if audio_take_count % 60 == 0 {
-		        	log.infof("audio_queue_take #%v: pts=%v",
+		        	log.debugf("audio_queue_take #%v: pts=%v",
 		         	audio_take_count, audio_pts)
 		        }
 			   aac_data, encode_aac_ok := mf.encode_aac_frame(stream.audio_encoder, stream.audio_scratch, audio_pts, audio_block_duration)
@@ -333,12 +324,6 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 	   }
    		_, _, pts, mbox_take_ok := mailbox_take(stream.mailbox, stream.scratch)
       	if !mbox_take_ok do continue
-
-      	take_count += 1
-       	if take_count % 60 == 0 {
-        	log.infof("mailbox_take #%v: pts=%v, first pixel BGRA = %v %v %v %v",
-         	take_count, pts, stream.scratch[0], stream.scratch[1], stream.scratch[2], stream.scratch[3])
-        }
 
        	nalus, encode_bgra_ok := mf.encode_bgra_frame(
         	stream.processor,
