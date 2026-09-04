@@ -9,6 +9,10 @@ setlocal
 set FLAGS=-collection:libs=libs -vet -vet-shadowing -debug
 set FAILED=0
 
+echo === applog ===
+odin test src/applog %FLAGS%
+if errorlevel 1 set FAILED=1
+
 echo === audio ===
 odin test src/audio %FLAGS%
 if errorlevel 1 set FAILED=1

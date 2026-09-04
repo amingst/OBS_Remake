@@ -26,6 +26,7 @@ import "capture"
 import "audio"
 import "encode"
 import "rtmp"
+import "applog"
 
 main :: proc() {
 	// Wrap the heap allocator so we get a leak/bad-free report at exit.
@@ -53,12 +54,11 @@ main :: proc() {
 	}
 
 	// Set up logging -- console logger to stderr, debug level in debug builds.
-	when ODIN_DEBUG {
-		context.logger = log.create_console_logger(.Debug)
-	} else {
-		context.logger = log.create_console_logger(.Info)
-	}
-	defer log.destroy_console_logger(context.logger)
+	log_sink := applog.sink_init(8192)
+	defer applog.sink_destroy(log_sink)
+
+	main_log_ctx := applog.Log_Context{sink = log_sink, tag = {.Main, 0}}
+	context.logger = applog.make_logger(&main_log_ctx)
 
 	// Config locations and persisted state. Done up here, before any device
 	// objects exist, because the loaded canvas resolution decides how big the
