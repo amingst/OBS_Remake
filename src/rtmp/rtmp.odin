@@ -22,8 +22,14 @@ connect :: proc(host: string, port: int) -> (Connection, bool) {
 		log.warnf("Failed to establish RTMP Connection to host %v, error: %v", host, err)
 		return {}, false
 	}
-	state := make(map[u32]Chunk_State, context.temp_allocator)
-	incoming_chunks := make(map[u32]Incoming_Chunk_State, context.temp_allocator)
+	// Heap-allocated (context.allocator), not context.temp_allocator: these
+	// maps live for the whole streaming session and are written to from the
+	// RTMP worker thread on every frame, long past the main thread's
+	// per-frame free_all(context.temp_allocator) -- a temp-allocator map here
+	// was silently corrupt across that lifetime/thread mismatch. delete(...)
+	// in close() matches this allocator.
+	state := make(map[u32]Chunk_State)
+	incoming_chunks := make(map[u32]Incoming_Chunk_State)
 
 	return {
 		socket = sock,

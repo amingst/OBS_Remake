@@ -70,6 +70,7 @@ mixer_ready :: proc(inputs: []Mix_Input, channels: int) -> bool {
 
     threshold := BLOCK_SAMPLES * channels * BLOCK_LATENCY
     for inp in inputs {
+        log.infof("mixer_ready: input is_loopback=%v ring_available=%v/%v", inp.stream.is_loopback, ring_available(&inp.stream.ring), threshold)
 	    // Loopback (render-endpoint) sources deliver zero packets when
 	    // nothing is playing on the device -- that's not "slow to buffer,"
 	    // it's silence by design, and may never cross the threshold. Only

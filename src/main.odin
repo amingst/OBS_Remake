@@ -381,7 +381,6 @@ main :: proc() {
 	audio_queue: ^rtmp.Audio_Queue
 	video_frame_count: u64
 	read_target_count: u64 // diagnostic-only: counts successful read_target calls in the recording||streaming block
-	mixer_ready_log_count: u64 // diagnostic-only: caps the mixer-readiness dump to the first 5 checks this session
 	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
 	has_audio_sources := false // set each frame, used by the recording-start handler next frame
 	// Main loop
@@ -606,27 +605,9 @@ main :: proc() {
 			mixer_started = false
 		}
 
-		// Diagnostic: dumps exactly what mixer_ready inspects (per-input ring
-		// buffer fill vs. the readiness threshold) so a stuck-at-not-ready
-		// mixer is debuggable without flooding the log at frame rate -- capped
-		// to the first 5 checks this session, not per-frame.
-		if mixer_ready_log_count < 5 {
-			mixer_ready_log_count += 1
-			threshold := audio.BLOCK_SAMPLES * CHANNELS * audio.BLOCK_LATENCY
-			if len(inputs) == 0 {
-				log.infof("mixer_ready check #%v: len(inputs)=0, threshold=%v samples -- no audio sources wired into `inputs` this frame",
-					mixer_ready_log_count, threshold)
-			} else {
-				for inp, i in inputs {
-					available := audio.ring_available(&inp.stream.ring)
-					log.infof("mixer_ready check #%v: input[%v] ring_available=%v / threshold=%v samples (ready=%v)",
-						mixer_ready_log_count, i, available, threshold, available >= threshold)
-				}
-			}
-		}
-
 		if !mixer_started && audio.mixer_ready(inputs[:], CHANNELS) {
 			mixer_started = true
+			log.info("mixer_started -> true")
 		}
 
 		if mixer_started {
