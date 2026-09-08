@@ -28,6 +28,14 @@ import "encode"
 import "rtmp"
 import "applog"
 
+Output_State :: struct {
+	recording:		bool,
+	streaming:		bool,
+	rtmp_stream:	^rtmp.Rtmp_Stream,
+	mailbox:		^rtmp.Frame_Mailbox,
+	audio_queue:	^rtmp.Audio_Queue,
+}
+
 main :: proc() {
 	// Wrap the heap allocator so we get a leak/bad-free report at exit.
 	// Registered first, so its `defer` runs last -- after every other `defer`
@@ -390,11 +398,9 @@ main :: proc() {
 
     done := false
 	was_occluded := false
-	recording := false
-	streaming := false
-	rtmp_stream: ^rtmp.Rtmp_Stream
-	mailbox: ^rtmp.Frame_Mailbox
-	audio_queue: ^rtmp.Audio_Queue
+
+	output: Output_State
+
 	video_frame_count: u64
 	audio_queue_full_count: u64 // throttles the "queue full" warning below, which can otherwise fire many times per second
 	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
@@ -439,7 +445,7 @@ main :: proc() {
 		// Ordering constraints and the reasoning live in reconcile.odin; the
 		// only thing that matters here is that this runs well before
 		// im.NewFrame().
-		reconcile(&applied, &cfg, win.device, &preview_target, recording)
+		reconcile(&applied, &cfg, win.device, &preview_target, output.recording)
 
 		// Check each frame for resize after each reconcile call
 		needed := int(preview_target.width) * int(preview_target.height) * 4
@@ -494,10 +500,10 @@ main :: proc() {
 		// encode.start and the first pushed frame would hand the encoder a
 		// resolution that doesn't match what it was configured with.
 		if req := ui_state.controls.request; req != .None {
-			was_recording := recording
-			handle_controls_request(req, &ui_state.controls, &recording, &streaming, &rtmp_stream, &mailbox,
-				&audio_queue, &paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources, log_sink)
-			if recording && !was_recording {
+			was_recording := output.recording
+			handle_controls_request(req, &ui_state.controls, &output,
+				&paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources, log_sink)
+			if output.recording && !was_recording {
 				// Reset clocks so the first sample/frame is PTS 0.
 				blocks_emitted = 0
 				video_frame_count = 0
@@ -632,11 +638,11 @@ main :: proc() {
 				duration_100ns := i64(audio.BLOCK_SAMPLES) * 10_000_000 / 48000
 				pcm_buf := f32_to_pcm16(mix_buf)
 
-				if recording {
+				if output.recording {
 					encode.push_audio(pcm_buf, pts_100ns, duration_100ns)
 				}
-				if streaming {
-					if !rtmp.audio_queue_put(audio_queue, pcm_buf, pts_100ns) {
+				if output.streaming {
+					if !rtmp.audio_queue_put(output.audio_queue, pcm_buf, pts_100ns) {
 						audio_queue_full_count += 1
 						if audio_queue_full_count % 60 == 0 {
 							log.warnf("audio_queue_put failed (queue full), dropped %v block(s) so far", audio_queue_full_count)
@@ -653,7 +659,7 @@ main :: proc() {
 		// readback and PTS clock. push_video and mailbox_put/SetEvent are then
 		// independent conditionals below, not nested in each other, so either
 		// consumer can run alone.
-		if recording || streaming {
+		if output.recording || output.streaming {
 			// flip_vertical: MFVideoFormat_RGB32 is bottom-up by convention and
 			// MF ignores the MF_MT_DEFAULT_STRIDE hint that's supposed to
 			// override that (see the comment in mf.odin's begin_recording), so
@@ -691,16 +697,16 @@ main :: proc() {
 			read_ok := render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true)
 
 			if !read_ok {
-				log.warnf("read_target failed (recording=%v streaming=%v); frame_bytes left stale from the last successful read", recording, streaming)
+				log.warnf("read_target failed (recording=%v streaming=%v); frame_bytes left stale from the last successful read", output.recording, output.streaming)
 			}
 
 			if read_ok {
-				if recording {
+				if output.recording {
 					encode.push_video(frame_bytes, video_pts)
 				}
-				if streaming {
-					rtmp.mailbox_put(mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
-					win32.SetEvent(rtmp_stream.event)
+				if output.streaming {
+					rtmp.mailbox_put(output.mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
+					win32.SetEvent(output.rtmp_stream.event)
 				}
 				video_frame_count += 1
 			}
@@ -731,8 +737,8 @@ main :: proc() {
         // package singleton, and a UI panel reaching into a subsystem would
         // be backwards -- so main writes down its own recording state here,
         // every frame, for the Controls panel to read.
-        ui_state.controls.recording = recording
-        ui_state.controls.streaming = streaming
+        ui_state.controls.recording = output.recording
+        ui_state.controls.streaming = output.streaming
 
         ui.draw(&ui_state, &cfg, &doc, &clear_color, preview_tex, outputs, profile_infos, collection_infos,
             f32(preview_target.width), f32(preview_target.height), audio_devices)
@@ -768,15 +774,15 @@ main :: proc() {
 	// Finalize any still-active recording/stream before persisting. Previously
 	// there was no such call here, so closing the window mid-recording left
 	// the MP4's sink writer never finalized -- this closes that gap.
-	if recording {
+	if output.recording {
 		log.info("finalizing recording on exit")
 		encode.stop()
 	}
-	if streaming {
+	if output.streaming {
 		log.info("closing stream on exit")
-		rtmp.rtmp_stream_close(rtmp_stream)
-		rtmp.mailbox_destroy(mailbox)
-		rtmp.audio_queue_destroy(audio_queue)
+		rtmp.rtmp_stream_close(output.rtmp_stream)
+		rtmp.mailbox_destroy(output.mailbox)
+		rtmp.audio_queue_destroy(output.audio_queue)
 	}
 
 	// Persist on a clean shutdown. Everything that reaches here left the loop
@@ -892,11 +898,7 @@ handle_profile_request :: proc(
 handle_controls_request :: proc(
 	req:         ui.Controls_Request,
 	state:       ^ui.Controls_State,
-	recording:   ^bool,
-	streaming:   ^bool,
-	rtmp_stream: ^^rtmp.Rtmp_Stream,
-	mailbox:     ^^rtmp.Frame_Mailbox,
-	audio_queue: ^^rtmp.Audio_Queue,
+	output:		 ^Output_State,
 	paths:       ^config.Paths,
 	target:      ^render.Target,
 	fps:         i32,
@@ -908,7 +910,7 @@ handle_controls_request :: proc(
 
 	#partial switch req {
 	case .Start_Recording:
-		if recording^ do return
+		if output.recording do return
 		if paths.videos == "" {
 			log.warn("recording requested, but no videos directory is available")
 			return
@@ -934,7 +936,7 @@ handle_controls_request :: proc(
 		audio_ch:   u32 = has_audio ? 2 : 0
 		if encode.start(out_path, target.width, target.height, u32(fps),
 			audio_sample_rate = audio_rate, audio_channels = audio_ch) {
-			recording^ = true
+			output.recording = true
 			if has_audio {
 				log.infof("recording started (video+audio) -> %v", out_path)
 			} else {
@@ -945,13 +947,13 @@ handle_controls_request :: proc(
 		}
 
 	case .Stop_Recording:
-		if !recording^ do return
+		if !output.recording do return
 		encode.stop()
-		recording^ = false
+		output.recording = false
 		log.info("recording stopped")
 
 	case .Start_Streaming:
-		if streaming^ do return
+		if output.streaming do return
 		if stream_cfg.host == "" || stream_cfg.stream_key == "" {
 			log.warn("streaming requested, but no stream destination is configured")
 			return
@@ -986,10 +988,10 @@ handle_controls_request :: proc(
 			STREAM_AUDIO_CHANNELS, STREAM_AUDIO_BITRATE, STREAM_AUDIO_SAMPLE_RATE, aq,
 			log_sink, 0)
 		if ok {
-			mailbox^ = mbox
-			audio_queue^ = aq
-			rtmp_stream^ = stream
-			streaming^ = true
+			output.mailbox = mbox
+			output.audio_queue = aq
+			output.rtmp_stream = stream
+			output.streaming = true
 			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
 		} else {
 			rtmp.mailbox_destroy(mbox)
@@ -998,14 +1000,14 @@ handle_controls_request :: proc(
 		}
 
 	case .Stop_Streaming:
-		if !streaming^ do return
-		rtmp.rtmp_stream_close(rtmp_stream^)
-		rtmp.mailbox_destroy(mailbox^)
-		rtmp.audio_queue_destroy(audio_queue^)
-		rtmp_stream^ = nil
-		mailbox^ = nil
-		audio_queue^ = nil
-		streaming^ = false
+		if !output.streaming do return
+		rtmp.rtmp_stream_close(output.rtmp_stream)
+		rtmp.mailbox_destroy(output.mailbox)
+		rtmp.audio_queue_destroy(output.audio_queue)
+		output.rtmp_stream = nil
+		output.mailbox = nil
+		output.audio_queue = nil
+		output.streaming = false
 		log.info("streaming stopped")
 	}
 }
