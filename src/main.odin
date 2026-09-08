@@ -10,6 +10,7 @@ import "vendor:directx/dxgi"
 import im      "libs:odin-imgui"
 import imwin32 "libs:odin-imgui/backends/win32"
 import imdx11  "libs:odin-imgui/backends/dx11"
+import mf      "libs:mf"
 import time "core:time"
 import "core:os"
 import "core:strings"
@@ -314,6 +315,12 @@ main :: proc() {
 		audio.log_device_format(dev)
 	}
 
+	if hr := mf.MFStartup(mf.MF_VERSION, mf.MFSTARTUP_FULL); hr < 0 {
+		log.errorf("MFStartup failed: 0x%08X", u32(hr))
+		return
+	}
+	defer mf.MFShutdown()
+
 	// Mixer state — allocated once, freed at exit.
 	CHANNELS :: 2
 	mix_buf := make([]f32, audio.BLOCK_SAMPLES * CHANNELS)
@@ -405,6 +412,9 @@ main :: proc() {
 	audio_queue_full_count: u64 // throttles the "queue full" warning below, which can otherwise fire many times per second
 	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
 	has_audio_sources := false // set each frame, used by the recording-start handler next frame
+
+	frame_bytes := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
+
 	// Main loop
 	for !done {
 		// Poll and handle messages (inputs, window resize, etc.)
@@ -437,9 +447,6 @@ main :: proc() {
 			win.resize_width, win.resize_height = 0, 0
 			platform.create_render_target(&win)
 		}
-
-		frame_bytes := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
-		defer delete(frame_bytes)
 
 		// Bring the live objects in line with what the settings modal published.
 		// Ordering constraints and the reasoning live in reconcile.odin; the
@@ -770,6 +777,8 @@ main :: proc() {
 		}
 		win.swap_chain_occluded = (hr == dxgi.STATUS_OCCLUDED)
 	}
+
+	delete(frame_bytes)
 
 	// Finalize any still-active recording/stream before persisting. Previously
 	// there was no such call here, so closing the window mid-recording left

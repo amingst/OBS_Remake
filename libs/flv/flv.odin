@@ -34,7 +34,7 @@ build_avc_sequence_header :: proc(avc_config: []u8, allocator := context.allocat
 // belong in the sequence header, never in a per-frame payload - so callers
 // can pass the encoder's raw output directly without pre-filtering it
 // themselves.
-build_avc_frame :: proc(nalus: [][]u8, composition_time: i32 = 0, allocator := context.allocator) -> (payload: []u8, is_keyframe: bool) {
+build_avc_frame :: proc(nalus: [][]u8, is_keyframe: bool, composition_time: i32 = 0, allocator := context.allocator) -> []u8 {
     slice_nalus := make([dynamic][]u8, context.temp_allocator)
     for nalu in nalus {
         switch h264.nal_type(nalu) {
@@ -42,7 +42,6 @@ build_avc_frame :: proc(nalus: [][]u8, composition_time: i32 = 0, allocator := c
             append(&slice_nalus, nalu)
         case h264.NAL_TYPE_IDR:
             append(&slice_nalus, nalu)
-            is_keyframe = true
         }
     }
 
@@ -55,7 +54,7 @@ build_avc_frame :: proc(nalus: [][]u8, composition_time: i32 = 0, allocator := c
     append(&out, u8(composition_time >> 16), u8(composition_time >> 8), u8(composition_time)) // signed 24-bit, big-endian
     for b in avcc do append(&out, b)
 
-    return out[:], is_keyframe
+    return out[:]
 }
 
 build_aac_sequence_header :: proc(aac_config: []u8, is_16_bit: bool, is_stereo: bool, allocator := context.allocator) -> []u8 {

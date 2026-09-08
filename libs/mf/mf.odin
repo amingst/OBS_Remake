@@ -66,18 +66,11 @@ begin_recording :: proc(
     out_video_stream_index: ^u32,
     out_audio_stream_index: ^u32,
 ) -> bool {
-    hr := MFStartup(MF_VERSION, MFSTARTUP_FULL)
-    if !mf_succeeded(hr) {
-        log.errorf("MFStartup failed: 0x%08X", u32(hr))
-        return false
-    }
-
     path_w := windows.utf8_to_wstring(output_path)
     sink_writer: ^IMFSinkWriter
-    hr = MFCreateSinkWriterFromURL(path_w, nil, nil, &sink_writer)
+    hr := MFCreateSinkWriterFromURL(path_w, nil, nil, &sink_writer)
     if !mf_succeeded(hr) {
         log.errorf("MFCreateSinkWriterFromURL failed: 0x%08X", u32(hr))
-        MFShutdown()
         return false
     }
 
@@ -87,7 +80,6 @@ begin_recording :: proc(
     if !mf_succeeded(hr) {
         log.errorf("MFCreateMediaType (video output) failed: 0x%08X", u32(hr))
         sink_writer.Release(sink_writer)
-        MFShutdown()
         return false
     }
     defer video_output_type.Release(video_output_type)
@@ -105,7 +97,6 @@ begin_recording :: proc(
     if !mf_succeeded(hr) {
         log.errorf("AddStream (video) failed: 0x%08X", u32(hr))
         sink_writer.Release(sink_writer)
-        MFShutdown()
         return false
     }
 
@@ -115,7 +106,6 @@ begin_recording :: proc(
     if !mf_succeeded(hr) {
         log.errorf("MFCreateMediaType (video input) failed: 0x%08X", u32(hr))
         sink_writer.Release(sink_writer)
-        MFShutdown()
         return false
     }
     defer video_input_type.Release(video_input_type)
@@ -132,7 +122,6 @@ begin_recording :: proc(
     if !mf_succeeded(hr) {
         log.errorf("SetInputMediaType (video) failed: 0x%08X", u32(hr))
         sink_writer.Release(sink_writer)
-        MFShutdown()
         return false
     }
 
@@ -142,7 +131,6 @@ begin_recording :: proc(
         if !valid_aac_bitrate(audio_channels, audio_bitrate) {
             log.errorf("audio_bitrate %d bytes/sec is not a value the AAC encoder accepts for %d channel(s) (valid: 12000/16000/20000/24000, x6 for 5.1)", audio_bitrate, audio_channels)
             sink_writer.Release(sink_writer)
-            MFShutdown()
             return false
         }
 
@@ -152,7 +140,6 @@ begin_recording :: proc(
         if !mf_succeeded(hr) {
             log.errorf("MFCreateMediaType (audio output) failed: 0x%08X", u32(hr))
             sink_writer.Release(sink_writer)
-            MFShutdown()
             return false
         }
         defer audio_output_type.Release(audio_output_type)
@@ -168,7 +155,6 @@ begin_recording :: proc(
         if !mf_succeeded(hr) {
             log.errorf("AddStream (audio) failed: 0x%08X", u32(hr))
             sink_writer.Release(sink_writer)
-            MFShutdown()
             return false
         }
 
@@ -181,7 +167,6 @@ begin_recording :: proc(
         if !mf_succeeded(hr) {
             log.errorf("MFCreateMediaType (audio input) failed: 0x%08X", u32(hr))
             sink_writer.Release(sink_writer)
-            MFShutdown()
             return false
         }
         defer audio_input_type.Release(audio_input_type)
@@ -199,7 +184,6 @@ begin_recording :: proc(
         if !mf_succeeded(hr) {
             log.errorf("SetInputMediaType (audio) failed: 0x%08X", u32(hr))
             sink_writer.Release(sink_writer)
-            MFShutdown()
             return false
         }
     }
@@ -208,7 +192,6 @@ begin_recording :: proc(
     if !mf_succeeded(hr) {
         log.errorf("BeginWriting failed: 0x%08X", u32(hr))
         sink_writer.Release(sink_writer)
-        MFShutdown()
         return false
     }
 
@@ -281,7 +264,6 @@ write_audio_frame :: proc(sink_writer: ^IMFSinkWriter, stream_index: u32, sample
 end_recording :: proc(sink_writer: ^IMFSinkWriter) -> bool {
     hr := sink_writer.Finalize(sink_writer)
     sink_writer.Release(sink_writer)
-    MFShutdown()
 
     if !mf_succeeded(hr) {
         log.errorf("Finalize failed: 0x%08X", u32(hr))
@@ -714,10 +696,15 @@ encode_bgra_frame :: proc(processor: ^IMFTransform, encoder: ^IMFTransform, bgra
     if !drain_ok do return nil, false
 
     all_nalus: [dynamic][]u8
+    defer delete(all_nalus)
     for nv12 in nv12_samples {
         frame_nalus, enc_ok := encode_h264_frame(encoder, nv12, sample_time, sample_duration)
-        if !enc_ok do return nil, false
+        if !enc_ok {
+            for n in all_nalus do delete(n)
+            return nil, false
+        }
         for n in frame_nalus do append(&all_nalus, n)
+        delete(frame_nalus)
     }
 
     out := make([][]u8, len(all_nalus))

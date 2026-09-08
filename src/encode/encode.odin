@@ -1,5 +1,6 @@
 package encode
 
+import "base:intrinsics"
 import "base:runtime"
 import "core:sync"
 import mf "libs:mf"
@@ -16,6 +17,11 @@ State :: struct {
     recording:          bool,
 }
 
+Nalu_Span :: struct {
+	start:		int,
+	length:		int,
+}
+
 Frame_Group :: struct {
 	refcount:		u32,
 	pts:			i64,
@@ -24,7 +30,8 @@ Frame_Group :: struct {
 	buf:			[dynamic]u8,
 	nalus:			[dynamic][]u8,
 	pool:			^Frame_Pool,
-	index:			int
+	index:			int,
+	offsets:		[dynamic]Nalu_Span,
 }
 
 Frame_Pool :: struct {
@@ -136,7 +143,13 @@ pool_init    :: proc(pool: ^Frame_Pool, slot_count: int, initial_buf_cap: int) -
 	    }
 	    slot.nalus, err = make([dynamic][]u8, 0, 16)
 	    if err != nil {
-			log.errorf("pool_init: slot %d buffer (%d bytes) failed", i, initial_buf_cap)
+			log.errorf("pool_init: nalus %d buffer (%d bytes) failed", i, initial_buf_cap)
+	        pool_destroy(pool)
+	        return false
+	    }
+	    slot.offsets, err = make([dynamic]Nalu_Span, 0, 16)
+	    if err != nil {
+			log.errorf("pool_init: offsets %d buffer (%d bytes) failed", i, initial_buf_cap)
 	        pool_destroy(pool)
 	        return false
 	    }
@@ -148,6 +161,7 @@ pool_init    :: proc(pool: ^Frame_Pool, slot_count: int, initial_buf_cap: int) -
 	pool.free, err = make([dynamic]int, 0, slot_count)
 	if err != nil {
 		log.error("Error allocating free slots on pool")
+		pool_destroy(pool)
 		return false
 	}
 
@@ -162,6 +176,7 @@ pool_destroy :: proc(pool: ^Frame_Pool) {
 	for &slot in pool.slots {
 		delete(slot.buf)
 		delete(slot.nalus)
+		delete(slot.offsets)
 	}
 	delete(pool.free)
 	delete(pool.slots)
@@ -169,7 +184,17 @@ pool_destroy :: proc(pool: ^Frame_Pool) {
 }
 
 @(private)
-pool_acquire :: proc(pool: ^Frame_Pool) -> (^Frame_Group, bool)  // encoder thread only
+pool_acquire :: proc(pool: ^Frame_Pool) -> (^Frame_Group, bool){   // encoder thread only
+	sync.mutex_lock(&pool.mutex)
+	defer sync.mutex_unlock(&pool.mutex)
+	if len(pool.free) == 0 {
+		return nil, false
+	}
+	index := pop(&pool.free)
+	slot := &pool.slots[index]
+	assert(sync.atomic_load(&slot.refcount) == 0, "acquired a slot with a live refcount")
+	return slot, true
+}
 
 @(private)
 pool_recycle :: proc(g: ^Frame_Group) {
@@ -181,7 +206,43 @@ pool_recycle :: proc(g: ^Frame_Group) {
 	sync.mutex_unlock(&pool.mutex)
 }
 
-group_release :: proc(g: ^Frame_Group)        // any consumer thread
-group_reset       :: proc(g: ^Frame_Group)                  // clear(&g.buf); clear(&g.nalus)
-group_append_nalu :: proc(g: ^Frame_Group, nalu: []u8)      // append bytes, then push subslice
-group_finish :: proc(g: ^Frame_Group)  // build nalus[] from recorded offsets
+group_release :: proc(g: ^Frame_Group) {
+	// any consumer thread
+	prev := sync.atomic_sub_explicit(&g.refcount, 1, .Release)
+	assert(prev != 0, "double release of frame group")
+	if prev == 1 {
+		intrinsics.atomic_thread_fence(.Acquire)
+		pool_recycle(g)
+	}
+}
+
+group_reset       :: proc(g: ^Frame_Group) {
+	clear(&g.buf)
+	clear(&g.nalus)
+	clear(&g.offsets)
+}
+
+group_append_nalu :: proc(g: ^Frame_Group, nalu: []u8) {
+	// append bytes, then push subslice
+	append(&g.offsets, Nalu_Span{start = len(g.buf), length = len(nalu)})
+	append(&g.buf, ..nalu)
+}
+
+group_finish :: proc(g: ^Frame_Group) {
+	// build nalus[] from recorded offsets
+	clear(&g.nalus)
+	for span in g.offsets {
+		append(&g.nalus, g.buf[span.start:][:span.length])
+	}
+}
+
+@(private)
+group_publish :: proc(g: ^Frame_Group, consumer_count: int) -> bool {
+	if consumer_count <= 0 {
+		pool_recycle(g)
+		return false
+	}
+
+	sync.atomic_store_explicit(&g.refcount, u32(consumer_count), .Release)
+	return true
+}

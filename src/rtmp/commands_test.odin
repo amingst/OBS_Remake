@@ -200,7 +200,7 @@ stream_synthetic_video :: proc(t: ^testing.T) {
         }
 
         if len(nalus) > 0 {
-            payload, _ := flv.build_avc_frame(nalus)
+            payload := flv.build_avc_frame(nalus, h264.contains_idr(nalus))
             if !send_media(&c, 9, payload, sample_time, CSID_VIDEO) {
                 log.errorf("send_media failed on frame %v", i)
                 delete(payload)
@@ -222,7 +222,7 @@ stream_synthetic_video :: proc(t: ^testing.T) {
 
     tail := mf.end_h264_encoder(encoder)
     if len(tail) > 0 {
-        payload, _ := flv.build_avc_frame(tail)
+        payload := flv.build_avc_frame(tail, h264.contains_idr(tail))
         pts := i64(sent_frames) * frame_duration
         send_media(&c, 9, payload, pts, CSID_VIDEO)
         delete(payload)
@@ -462,7 +462,7 @@ stream_synthetic_audio_video :: proc(t: ^testing.T) {
         }
 
         if len(nalus) > 0 {
-            payload, _ := flv.build_avc_frame(nalus)
+            payload := flv.build_avc_frame(nalus, h264.contains_idr(nalus))
             if !send_media(&c, 9, payload, video_pts, CSID_VIDEO) {
                 log.errorf("send_media failed on frame %v", i)
                 delete(payload)
@@ -484,7 +484,7 @@ stream_synthetic_audio_video :: proc(t: ^testing.T) {
 
     tail := mf.end_h264_encoder(encoder)
     if len(tail) > 0 {
-        payload, _ := flv.build_avc_frame(tail)
+        payload := flv.build_avc_frame(tail, h264.contains_idr(tail))
         pts := i64(sent_frames) * frame_duration
         send_media(&c, 9, payload, pts, CSID_VIDEO)
         delete(payload)

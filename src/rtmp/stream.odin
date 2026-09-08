@@ -106,15 +106,6 @@ rtmp_stream_start :: proc(
     log.infof("publish reply: type=%v len=%v", msg.type_id, len(msg.payload))
 
     // ---- Init Encoder ----
-    hr := mf.MFStartup(mf.MF_VERSION, mf.MFSTARTUP_FULL)
-    if hr < 0 {
-    	log.errorf("MFStartup failed: 0x%08X", u32(hr))
-    	return {}, false
-    }
-    defer if !success {
-    	mf.MFShutdown()
-    }
-
     processor, proc_ok := mf.begin_video_processor(width, height)
     if !proc_ok {
     	log.error("begin_video_processor failed")
@@ -341,7 +332,9 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 		}
 
 		if len(nalus) > 0 {
-			payload, _ := flv.build_avc_frame(nalus)
+			// TEMPORARY: recomputed here. Once the shared encoder thread lands, the
+			// flag travels on the frame group and this becomes g.is_keyframe.
+			payload := flv.build_avc_frame(nalus, h264.contains_idr(nalus))
 			if !send_media(&stream.conn, 9, payload, i64(pts), CSID_VIDEO) {
 				intrinsics.atomic_add(&stream.dropped_frames, 1)
 				log.warnf("send_media failed, dropped frame")
@@ -358,7 +351,9 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 	// ---- drain tail frames from encoder ----
 	tail := mf.end_h264_encoder(stream.encoder)
 	if len(tail) > 0 {
-		payload, _ := flv.build_avc_frame(tail)
+		// TEMPORARY: recomputed here. Once the shared encoder thread lands, the
+		// flag travels on the frame group and this becomes g.is_keyframe.
+		payload := flv.build_avc_frame(tail, h264.contains_idr(tail))
 		send_media(&stream.conn, 9, payload, last_pts, CSID_VIDEO)
 		delete(payload)
 	}
@@ -383,7 +378,6 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 	delete(stream.sps)
 	delete(stream.pps)
 	delete(stream.aac_config)
-	mf.MFShutdown()
 
 	if !send_fc_unpublish(stream) {
 		log.errorf("Failed to unpublish stream")

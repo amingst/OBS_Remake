@@ -20,10 +20,9 @@ test_build_avc_frame_keyframe :: proc(t: ^testing.T) {
     aud := []u8{0x09, 0x10}
     idr := []u8{0x65, 0x88, 0x84, 0x00}
 
-    payload, is_key := build_avc_frame([][]u8{aud, idr})
+    payload := build_avc_frame([][]u8{aud, idr}, true)
     defer delete(payload)
 
-    testing.expect(t, is_key)
     testing.expect_value(t, payload[0], u8(0x17))
     testing.expect_value(t, payload[1], u8(1))
     testing.expect(t, slice.equal(payload[2:5], []u8{0, 0, 0}))
@@ -34,9 +33,8 @@ test_build_avc_frame_keyframe :: proc(t: ^testing.T) {
 @(test)
 test_build_avc_frame_interframe :: proc(t: ^testing.T) {
     p_slice := []u8{0x41, 0x9a, 0x02, 0x05}
-    payload, is_key := build_avc_frame([][]u8{p_slice})
+    payload := build_avc_frame([][]u8{p_slice}, false)
     defer delete(payload)
 
-    testing.expect(t, !is_key)
     testing.expect_value(t, payload[0], u8(0x27)) // inter(2)<<4 | AVC(7)
 }
