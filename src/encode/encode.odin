@@ -1,10 +1,22 @@
 package encode
 
 import "base:intrinsics"
-import "base:runtime"
-import "core:sync"
 import mf "libs:mf"
 import "core:log"
+import "core:sync"
+import "../rtmp"
+import "../applog"
+import win32 "core:sys/windows"
+import "core:thread"
+import "libs:h264"
+
+@(private) g_state: State
+@(private) g_encoder:      ^Encoder
+@(private) g_encoder_refs: int
+
+VIDEO_POOL_SLOTS :: 64
+AUDIO_POOL_SLOTS :: 64
+AUDIO_BUF_CAP :: 2048
 
 @(private)
 State :: struct {
@@ -17,31 +29,354 @@ State :: struct {
     recording:          bool,
 }
 
-Nalu_Span :: struct {
-	start:		int,
-	length:		int,
+Consumer :: struct {
+	// put takes ownership of exactly one reference
+	// regardless of whether the group is dropped
+	// or kept.
+	put: proc(ctx: rawptr, g: ^Frame_Group),
+	ctx: rawptr,
+	event: win32.HANDLE
 }
 
-Frame_Group :: struct {
-	refcount:		u32,
-	pts:			i64,
-	duration:		i64,
-	is_keyframe:	bool,
-	buf:			[dynamic]u8,
-	nalus:			[dynamic][]u8,
-	pool:			^Frame_Pool,
-	index:			int,
-	offsets:		[dynamic]Nalu_Span,
+Encoder :: struct {
+	// consumers - main thread writes
+	consumers: [8]Consumer,
+	consumer_count: int,
+	consumers_mutex: sync.Mutex,
+
+	// inbound from main thread
+	raw_mailbox: ^rtmp.Frame_Mailbox,
+	pcm_queue: ^rtmp.Audio_Queue,
+	video_event: win32.HANDLE,
+	audio_event: win32.HANDLE,
+
+	// MFT's created and owned
+	// by the encoder thread
+	processor: ^mf.IMFTransform,
+	encoder: ^mf.IMFTransform,
+	audio_encoder: ^mf.IMFTransform,
+
+	// blobs produced by mft's
+	sps, pps: []u8,
+	aac_config: []u8,
+
+	// pools
+	video_pool: Frame_Pool,
+	audio_pool: Frame_Pool,
+
+	// thread
+	thread: ^thread.Thread,
+	running: bool, // atomic
+	ready_event: win32.HANDLE,
+	init_ok: bool,
+
+	// config, frozen on first acquire
+	width, height, fps, bitrate: u32,
+	audio_sample_rate, audio_channels, audio_bitrate: u32,
+	frame_duration: i64,
+
+	// diagnostics, logged at release
+	wake_video, wake_audio, wake_timeout: u64,
+	pool_min_free: int,
+	dropped_frames: u32,
+	encoded_frames: u32,
+
+	log_sink: ^applog.Sink,
+	scratch: []u8,
 }
 
-Frame_Pool :: struct {
-	slots:		[]Frame_Group,
-	free:		[dynamic]int,
-	mutex:		sync.Mutex
+Encoder_Config :: struct {
+	width, height, fps, bitrate: u32,
+	audio_sample_rate, audio_channels, audio_bitrate: u32,
+	frame_duration: i64,
+	log_sink: ^applog.Sink
+}
+
+Nalu_Sink :: struct {
+	g:	^Frame_Group,
+	is_keyframe: bool,
+}
+
+nalu_callback :: proc(ctx: rawptr, nalu: []u8) {
+	s := (^Nalu_Sink)(ctx)
+	if h264.nal_type(nalu) == h264.NAL_TYPE_IDR do s.is_keyframe = true
+	group_append_nalu(s.g, nalu)
+}
+
+encoder_acquire :: proc(
+	cfg: Encoder_Config,
+) -> (^Encoder, bool) {
+	if g_encoder_refs > 0 {
+		g_encoder_refs += 1
+		return g_encoder, true
+	}
+
+	e := new(Encoder)
+	ok := false
+	defer if !ok {
+		if e.ready_event != nil do win32.CloseHandle(e.ready_event)
+		if e.video_event != nil do win32.CloseHandle(e.video_event)
+		if e.audio_event != nil do win32.CloseHandle(e.audio_event)
+		pool_destroy(&e.video_pool)
+		pool_destroy(&e.audio_pool)
+		delete(e.scratch)
+		rtmp.mailbox_destroy(e.raw_mailbox)
+		free(e)
+	}
+
+	e.width = cfg.width
+	e.height = cfg.height
+	e.fps = cfg.fps
+	e.bitrate = cfg.bitrate
+	e.audio_sample_rate = cfg.audio_sample_rate
+	e.audio_channels = cfg.audio_channels
+	e.audio_bitrate = cfg.audio_bitrate
+	e.frame_duration = cfg.frame_duration
+	e.log_sink = cfg.log_sink
+
+	e.video_event = win32.CreateEventW(nil, false, false, nil)
+	if e.video_event == nil {
+		log.errorf("encoder_acquire: %v", win32.GetLastError())
+		return nil, false
+	}
+
+	e.audio_event = win32.CreateEventW(nil, false, false, nil)
+	if e.audio_event == nil {
+		log.errorf("encoder_acquire: %v", win32.GetLastError())
+		return nil, false
+	}
+
+	e.ready_event = win32.CreateEventW(nil, false, false, nil)
+	if e.ready_event == nil {
+		log.errorf("encoder_acquire: %v", win32.GetLastError())
+		return nil, false
+	}
+
+	video_buf_cap := int(cfg.bitrate / 8 / max(cfg.fps, 1)) * 4
+
+	video_pool_ok := pool_init(&e.video_pool, VIDEO_POOL_SLOTS, video_buf_cap)
+	if !video_pool_ok {
+		return nil, false
+	}
+
+	audio_pool_ok := pool_init(&e.audio_pool, AUDIO_POOL_SLOTS, AUDIO_BUF_CAP)
+	if !audio_pool_ok {
+		return nil, false
+	}
+
+	e.pool_min_free = VIDEO_POOL_SLOTS
+
+	e.scratch = make([]u8, int(e.width) * int(e.height) * 4)
+	e.raw_mailbox = rtmp.mailbox_init(e.width, e.height)
+
+	intrinsics.atomic_store(&e.running, true)
+	e.thread = thread.create(encoder_thread)
+	if e.thread == nil {
+		log.errorf("encoder_acquire: %v", win32.GetLastError())
+		return nil, false
+	}
+	e.thread.data = e
+	thread.start(e.thread)
+
+	wait := win32.WaitForSingleObject(e.ready_event, 5000)
+	if wait != win32.WAIT_OBJECT_0 {
+		log.errorf("encoder thread never signalled ready (0x%08X)", u32(wait))
+		intrinsics.atomic_store(&e.running, false)
+		thread.join(e.thread); thread.destroy(e.thread)
+		return nil, false
+	}
+
+	if !e.init_ok {
+		log.errorf("encoder thread MFT init failed")
+		thread.join(e.thread); thread.destroy(e.thread)
+		return nil, false
+	}
+
+	ok = true
+	g_encoder = e
+	g_encoder_refs = 1
+	return e, true
 }
 
 @(private)
-g_state: State
+encoder_thread :: proc(t: ^thread.Thread) {
+	e := (^Encoder)(t.data)
+	ctx := applog.Log_Context{sink = e.log_sink, tag = {.Encode, 0}}
+	context.logger = applog.make_logger(&ctx)
+	log.info("encoder thread started")
+	win32.CoInitializeEx(nil, .MULTITHREADED)
+	defer win32.CoUninitialize()
+
+	e.init_ok = create_mfts(e)
+	win32.SetEvent(e.ready_event)
+	if !e.init_ok do return
+
+	for intrinsics.atomic_load_explicit(&e.running, .Acquire) {
+		handles := [2]win32.HANDLE{e.video_event, e.audio_event}
+		r := win32.WaitForMultipleObjects(2, &handles[0], false, 200)
+		switch r {
+		case win32.WAIT_OBJECT_0:     e.wake_audio += 1   // fires on VIDEO
+		case win32.WAIT_OBJECT_0 + 1: e.wake_video += 1   // fires on AUDIO
+		case win32.WAIT_TIMEOUT:      e.wake_timeout += 1
+		case:
+			log.errorf("WaitForMultipleObjects failed: 0x%08X", u32(r))
+		}
+
+		drain_audio(e)
+		drain_video(e)
+		free_all(context.temp_allocator)
+	}
+
+	// teardown MFTs here, on the thread that made them
+	if e.encoder != nil {
+		tail := mf.end_h264_encoder(e.encoder)
+		e.encoder = nil
+		for n in tail do delete(n)
+		delete(tail)
+	}
+
+	if e.audio_encoder != nil {
+		audio_tail := mf.end_aac_encoder(e.audio_encoder)
+		e.audio_encoder = nil
+		for data in audio_tail do delete(data)
+		delete(audio_tail)
+	}
+
+	if e.processor != nil {
+		mf.end_video_processor(e.processor)
+		e.processor = nil
+	}
+
+	delete(e.sps)
+	delete(e.pps)
+	delete(e.aac_config)
+	e.sps = nil
+	e.pps = nil
+	e.aac_config = nil
+}
+
+@(private)
+drain_audio :: proc(e: ^Encoder) {
+
+}
+
+@(private)
+drain_video :: proc(e: ^Encoder) {
+	_, _, pts, ok := rtmp.mailbox_take(e.raw_mailbox, e.scratch)
+	if !ok do return
+	vid_group, vid_ok := pool_acquire(&e.video_pool)
+	if !vid_ok {
+		e.dropped_frames += 1
+		if e.dropped_frames % 60 == 1 {
+			log.warnf("video pool exhausted, dropped %v frame(s) so far", e.dropped_frames)
+		}
+		return
+	}
+
+	free_now := pool_free_count(&e.video_pool)
+	if free_now < e.pool_min_free do e.pool_min_free = free_now
+	group_reset(vid_group)
+	vid_group.pts = pts
+	vid_group.duration = e.frame_duration
+
+	sink := Nalu_Sink{g = vid_group}
+	n, enc_ok := mf.encode_bgra_frame_into(
+    e.processor, e.encoder, e.scratch, pts, e.frame_duration,
+    nalu_callback, &sink,
+	)
+	if !enc_ok || n == 0 {
+    // Nothing was published, so refcount is still 0 — recycle directly.
+    // group_release would decrement from 0 and trip the double-release assert.
+    pool_recycle(vid_group)
+    return
+	}
+
+	vid_group.is_keyframe = sink.is_keyframe
+	group_finish(vid_group)
+
+	e.encoded_frames += 1
+	if e.encoded_frames % 60 == 1 {
+		log.debugf("encoded frame group: nalus=%v keyframe=%v pts=%v", n, vid_group.is_keyframe, vid_group.pts)
+	}
+
+	snapshot: [8]Consumer
+	count: int
+	sync.mutex_lock(&e.consumers_mutex)
+	count = e.consumer_count
+	copy(snapshot[:], e.consumers[:count])
+	sync.mutex_unlock(&e.consumers_mutex)
+
+	if !group_publish(vid_group, count) do return   // zero consumers; already recycled
+
+	for c in snapshot[:count] do c.put(c.ctx, vid_group)
+	for c in snapshot[:count] do win32.SetEvent(c.event)
+}
+
+@(private)
+create_mfts :: proc(e: ^Encoder) -> bool {
+	proc_ok: bool
+	e.processor, proc_ok = mf.begin_video_processor(e.width, e.height)
+	if !proc_ok do return false
+
+	enc_ok: bool
+	e.encoder, e.sps, e.pps, enc_ok = mf.begin_h264_encoder(e.width, e.height, e.fps, e.bitrate)
+	if !enc_ok {
+		mf.end_video_processor(e.processor)
+		e.processor = nil
+		return false
+	}
+
+	audio_ok: bool
+	e.audio_encoder, e.aac_config, audio_ok = mf.begin_aac_encoder(
+		e.audio_sample_rate, e.audio_channels, e.audio_bitrate)
+	if !audio_ok {
+		mf.end_video_processor(e.processor)
+		e.processor = nil
+
+		tail := mf.end_h264_encoder(e.encoder)
+		e.encoder = nil
+		for n in tail do delete(n)
+		delete(tail)
+
+		delete(e.sps)
+		delete(e.pps)
+		e.sps = nil
+		e.pps = nil
+		return false
+	}
+	return true
+}
+
+// consumers must be stopped and joined before encoder_release
+encoder_release :: proc() {
+	if g_encoder_refs == 0 {
+		log.warnf("encoder_release with no active encoder")
+		return
+	}
+	g_encoder_refs -= 1
+	if g_encoder_refs > 0 do return
+
+	e := g_encoder
+	intrinsics.atomic_store(&e.running, false)
+	win32.SetEvent(e.video_event)   // wake it out of the 200ms wait
+	win32.SetEvent(e.audio_event)
+	thread.join(e.thread)
+	thread.destroy(e.thread)
+
+	log.infof("encoder wakeups: video=%v audio=%v timeout=%v; pool min free=%v; dropped=%v",
+		e.wake_video, e.wake_audio, e.wake_timeout, e.pool_min_free, e.dropped_frames)
+
+	pool_destroy(&e.video_pool)
+	pool_destroy(&e.audio_pool)
+	win32.CloseHandle(e.ready_event)
+	win32.CloseHandle(e.video_event)
+	win32.CloseHandle(e.audio_event)
+	delete(e.scratch)
+	rtmp.mailbox_destroy(e.raw_mailbox)
+	free(e)
+
+	g_encoder = nil
+}
 
 start :: proc(
     output_path: string,
@@ -120,129 +455,4 @@ stop :: proc() -> bool {
     g_state.sink_writer = nil
     g_state.recording = false
     return ok;
-}
-
-@(private)
-pool_init    :: proc(pool: ^Frame_Pool, slot_count: int, initial_buf_cap: int) -> bool {
-	assert(pool.slots == nil, "pool_init on a pool that was never destroyed")
-	err: runtime.Allocator_Error
-	pool.slots, err = make([]Frame_Group, slot_count)
-	if err != nil {
-		log.error("Error allocating pool slots")
-		pool_destroy(pool)
-		return false
-	}
-
-	for &slot, i in pool.slots {
-		assert(sync.atomic_load(&slot.refcount) == 0, "pool_destroy with groups still outstanding")
-	    slot.buf, err = make([dynamic]u8, 0, initial_buf_cap)
-	    if err != nil {
-			log.errorf("pool_init: slot %d buffer (%d bytes) failed", i, initial_buf_cap)
-	        pool_destroy(pool)
-	        return false
-	    }
-	    slot.nalus, err = make([dynamic][]u8, 0, 16)
-	    if err != nil {
-			log.errorf("pool_init: nalus %d buffer (%d bytes) failed", i, initial_buf_cap)
-	        pool_destroy(pool)
-	        return false
-	    }
-	    slot.offsets, err = make([dynamic]Nalu_Span, 0, 16)
-	    if err != nil {
-			log.errorf("pool_init: offsets %d buffer (%d bytes) failed", i, initial_buf_cap)
-	        pool_destroy(pool)
-	        return false
-	    }
-	    slot.pool = pool
-	    slot.refcount = 0
-	    slot.index = i
-	}
-
-	pool.free, err = make([dynamic]int, 0, slot_count)
-	if err != nil {
-		log.error("Error allocating free slots on pool")
-		pool_destroy(pool)
-		return false
-	}
-
-	for i in 0 ..< slot_count {
-		append(&pool.free, i)
-	}
-	return true
-}
-
-@(private)
-pool_destroy :: proc(pool: ^Frame_Pool) {
-	for &slot in pool.slots {
-		delete(slot.buf)
-		delete(slot.nalus)
-		delete(slot.offsets)
-	}
-	delete(pool.free)
-	delete(pool.slots)
-	pool^ = {}
-}
-
-@(private)
-pool_acquire :: proc(pool: ^Frame_Pool) -> (^Frame_Group, bool){   // encoder thread only
-	sync.mutex_lock(&pool.mutex)
-	defer sync.mutex_unlock(&pool.mutex)
-	if len(pool.free) == 0 {
-		return nil, false
-	}
-	index := pop(&pool.free)
-	slot := &pool.slots[index]
-	assert(sync.atomic_load(&slot.refcount) == 0, "acquired a slot with a live refcount")
-	return slot, true
-}
-
-@(private)
-pool_recycle :: proc(g: ^Frame_Group) {
-	pool := g.pool
-	assert(g.index >= 0 && g.index < len(pool.slots))
-	assert(g == &pool.slots[g.index], "frame group is not the slot it claims to be")
-	sync.mutex_lock(&pool.mutex)
-	append(&pool.free, g.index)
-	sync.mutex_unlock(&pool.mutex)
-}
-
-group_release :: proc(g: ^Frame_Group) {
-	// any consumer thread
-	prev := sync.atomic_sub_explicit(&g.refcount, 1, .Release)
-	assert(prev != 0, "double release of frame group")
-	if prev == 1 {
-		intrinsics.atomic_thread_fence(.Acquire)
-		pool_recycle(g)
-	}
-}
-
-group_reset       :: proc(g: ^Frame_Group) {
-	clear(&g.buf)
-	clear(&g.nalus)
-	clear(&g.offsets)
-}
-
-group_append_nalu :: proc(g: ^Frame_Group, nalu: []u8) {
-	// append bytes, then push subslice
-	append(&g.offsets, Nalu_Span{start = len(g.buf), length = len(nalu)})
-	append(&g.buf, ..nalu)
-}
-
-group_finish :: proc(g: ^Frame_Group) {
-	// build nalus[] from recorded offsets
-	clear(&g.nalus)
-	for span in g.offsets {
-		append(&g.nalus, g.buf[span.start:][:span.length])
-	}
-}
-
-@(private)
-group_publish :: proc(g: ^Frame_Group, consumer_count: int) -> bool {
-	if consumer_count <= 0 {
-		pool_recycle(g)
-		return false
-	}
-
-	sync.atomic_store_explicit(&g.refcount, u32(consumer_count), .Release)
-	return true
 }

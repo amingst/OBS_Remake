@@ -321,6 +321,29 @@ main :: proc() {
 	}
 	defer mf.MFShutdown()
 
+	// Diagnostic wiring: prove the encoder thread's acquire/release lifecycle
+	// works end to end before any real work is routed through it. Held for
+	// the whole app lifetime -- no consumers registered, no frames pushed.
+	// Registered after MFStartup/audio init so its LIFO release runs before
+	// mf.MFShutdown and audio.shutdown, while the encoder thread's COM/MF
+	// calls are still valid.
+	encoder_cfg := encode.Encoder_Config{
+		width              = preview_target.width,
+		height             = preview_target.height,
+		fps                = u32(cfg.video.fps),
+		bitrate            = u32(cfg.stream.bitrate),
+		audio_sample_rate  = 48000,
+		audio_channels     = 2,
+		audio_bitrate      = 16000,
+		frame_duration     = i64(10_000_000) / i64(cfg.video.fps),
+		log_sink           = log_sink,
+	}
+	enc, encoder_ok := encode.encoder_acquire(encoder_cfg)
+	if !encoder_ok {
+		log.error("encoder_acquire failed; continuing without encoder thread")
+	}
+	defer if encoder_ok do encode.encoder_release()
+
 	// Mixer state — allocated once, freed at exit.
 	CHANNELS :: 2
 	mix_buf := make([]f32, audio.BLOCK_SAMPLES * CHANNELS)
@@ -714,6 +737,10 @@ main :: proc() {
 				if output.streaming {
 					rtmp.mailbox_put(output.mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
 					win32.SetEvent(output.rtmp_stream.event)
+				}
+				if encoder_ok {
+					rtmp.mailbox_put(enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
+					win32.SetEvent(enc.video_event)
 				}
 				video_frame_count += 1
 			}

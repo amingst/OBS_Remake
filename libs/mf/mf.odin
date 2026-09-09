@@ -712,6 +712,136 @@ encode_bgra_frame :: proc(processor: ^IMFTransform, encoder: ^IMFTransform, bgra
     return out, true
 }
 
+encode_bgra_frame_into :: proc(
+    processor, encoder: ^IMFTransform,
+    bgra: []u8,
+    sample_time, sample_duration: i64,
+    on_nalu: proc(ctx: rawptr, nalu: []u8),
+    ctx: rawptr,
+) -> (nalu_count: int, ok: bool) {
+	assert(len(bgra) > 0, "bgra frame is empty")
+    buffer: ^IMFMediaBuffer
+    hr := MFCreateMemoryBuffer(u32(len(bgra)), &buffer)
+    if hr < 0 {
+        log.errorf("MFCreateMemoryBuffer failed: 0x%08X", u32(hr))
+        return 0, false
+    }
+
+    data: [^]u8
+    hr = buffer.Lock(buffer, &data, nil, nil)
+    if hr < 0 {
+        log.errorf("IMFMediaBuffer_Lock failed: 0x%08X", u32(hr))
+        buffer.Release(buffer)
+        return 0, false
+    }
+    mem.copy(data, raw_data(bgra), len(bgra))
+    buffer.Unlock(buffer)
+    buffer.SetCurrentLength(buffer, u32(len(bgra)))
+
+    sample: ^IMFSample
+    hr = MFCreateSample(&sample)
+    if hr < 0 {
+        log.errorf("MFCreateSample failed: 0x%08X", u32(hr))
+        buffer.Release(buffer)
+        return 0, false
+    }
+    sample.AddBuffer(sample, buffer)
+    sample.SetSampleTime(sample, sample_time)
+    sample.SetSampleDuration(sample, sample_duration)
+
+    hr = processor.ProcessInput(processor, 0, sample, 0)
+    sample.Release(sample)
+    buffer.Release(buffer)
+    if hr < 0 {
+        log.errorf("IMFTransform_ProcessInput failed: 0x%08X", u32(hr))
+        return 0, false
+    }
+
+    nv12_samples, drain_ok := drain_transform_samples(processor, 0, context.temp_allocator)
+    if !drain_ok {
+        log.errorf("drain_transform_samples failed")
+        return 0, false
+    }
+
+    for nv12 in nv12_samples {
+        n, enc_ok := encode_h264_frame_into(encoder, nv12, sample_time, sample_duration, on_nalu, ctx)
+        if !enc_ok {
+            log.errorf("encode_h264_frame_into failed")
+            return nalu_count, false
+        }
+        nalu_count += n
+    }
+    return nalu_count, true
+}
+
+@(private)
+drain_encoder_output_into :: proc(
+	encoder: ^IMFTransform,
+	on_nalu: proc(ctx: rawptr, nalu: []u8),
+	ctx: rawptr,
+) -> (nalu_count: int, ok: bool) {
+	raw_samples, drain_ok := drain_transform_samples(encoder, 0, context.temp_allocator)
+	if !drain_ok {
+		return 0, false
+	}
+
+	for sample_bytes in raw_samples {
+		for nalu in h264.split_annexb(sample_bytes, context.temp_allocator) {
+			on_nalu(ctx, nalu)
+			nalu_count += 1
+		}
+	}
+
+	return nalu_count, true
+}
+
+encode_h264_frame_into :: proc(
+	encoder: ^IMFTransform,
+	nv12: []u8,
+	sample_time: i64,
+	sample_duration: i64,
+	on_nalu: proc(ctx: rawptr, nalu: []u8),
+	ctx: rawptr) -> (nalu_count: int, ok: bool) {
+	buffer: ^IMFMediaBuffer
+	hr := MFCreateMemoryBuffer(u32(len(nv12)), &buffer)
+	if hr < 0 {
+		log.errorf("MFCreateMemoryBuffer failed: 0x%08X", u32(hr))
+		return 0, false
+	}
+
+	data: [^]u8
+	hr = buffer.Lock(buffer, &data, nil, nil)
+	if hr < 0 {
+		log.errorf("Lock failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return 0, false
+	}
+	mem.copy(data, raw_data(nv12), len(nv12))
+	buffer.Unlock(buffer)
+	buffer.SetCurrentLength(buffer, u32(len(nv12)))
+
+	sample: ^IMFSample
+	hr = MFCreateSample(&sample)
+	if hr < 0 {
+		log.errorf("MFCreateSample failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return 0, false
+	}
+	sample.AddBuffer(sample, buffer)
+	sample.SetSampleTime(sample, sample_time)
+	sample.SetSampleDuration(sample, sample_duration)
+
+	hr = encoder.ProcessInput(encoder, 0, sample, 0)
+	sample.Release(sample)
+	buffer.Release(buffer)
+	if hr < 0 {
+		log.errorf("ProcessInput failed: 0x%08X", u32(hr))
+		return 0, false
+	}
+
+	return drain_encoder_output_into(encoder, on_nalu, ctx)
+}
+
 end_video_processor :: proc(processor: ^IMFTransform) {
     processor.ProcessMessage(processor, MFT_MESSAGE_COMMAND_DRAIN, 0)
     leftover, _ := drain_transform_samples(processor, 0, context.temp_allocator)
