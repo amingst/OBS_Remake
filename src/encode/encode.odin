@@ -29,15 +29,6 @@ State :: struct {
     recording:          bool,
 }
 
-Consumer :: struct {
-	// put takes ownership of exactly one reference
-	// regardless of whether the group is dropped
-	// or kept.
-	put: proc(ctx: rawptr, g: ^Frame_Group),
-	ctx: rawptr,
-	event: win32.HANDLE
-}
-
 Encoder :: struct {
 	// consumers - main thread writes
 	consumers: [8]Consumer,
@@ -299,17 +290,22 @@ drain_video :: proc(e: ^Encoder) {
 		log.debugf("encoded frame group: nalus=%v keyframe=%v pts=%v", n, vid_group.is_keyframe, vid_group.pts)
 	}
 
-	snapshot: [8]Consumer
-	count: int
-	sync.mutex_lock(&e.consumers_mutex)
-	count = e.consumer_count
-	copy(snapshot[:], e.consumers[:count])
-	sync.mutex_unlock(&e.consumers_mutex)
+	sync.lock(&e.consumers_mutex)
+	defer sync.unlock(&e.consumers_mutex)
 
-	if !group_publish(vid_group, count) do return   // zero consumers; already recycled
+	count := 0
+	for c in e.consumers[:e.consumer_count] {
+    	if c.put_video != nil do count += 1
+	}
 
-	for c in snapshot[:count] do c.put(c.ctx, vid_group)
-	for c in snapshot[:count] do win32.SetEvent(c.event)
+	if !group_publish(vid_group, count) do return   // zero receivers; already recycled
+
+	for c in e.consumers[:e.consumer_count] {
+    	if c.put_video != nil do c.put_video(c.ctx, vid_group)
+	}
+	for c in e.consumers[:e.consumer_count] {
+    	if c.put_video != nil do win32.SetEvent(c.event)
+	}
 }
 
 @(private)
