@@ -8,6 +8,7 @@ import "core:sys/windows"
 import "core:log"
 import "base:intrinsics"
 import "../applog"
+import "../encode"
 
 Rtmp_Stream :: struct {
     running:        bool,
@@ -15,7 +16,7 @@ Rtmp_Stream :: struct {
     dropped_frames: u32,
     thread:         ^thread.Thread,
     event:          windows.HANDLE,
-    mailbox:        ^Frame_Mailbox,
+    mailbox:        ^encode.Raw_Mailbox,
     scratch:        []u8,
     conn:           Connection,
     processor:      ^mf.IMFTransform,
@@ -26,7 +27,7 @@ Rtmp_Stream :: struct {
     stream_key:     string,
     aac_config:         []u8,
     audio_encoder:      ^mf.IMFTransform,
-    audio_queue:        ^Audio_Queue,
+    audio_queue:        ^encode.Raw_Audio_Queue,
     audio_sample_rate:  u32,
     audio_scratch:      []u8,
     dropped_audio_blocks: u32,
@@ -37,7 +38,7 @@ Rtmp_Stream :: struct {
 }
 
 rtmp_stream_start :: proc(
-	mbox: ^Frame_Mailbox,
+	mbox: ^encode.Raw_Mailbox,
 	app,
 	host: string,
 	port: int,
@@ -46,7 +47,7 @@ rtmp_stream_start :: proc(
 	fps: u32,
 	width, height, bitrate: u32,
 	audio_channels, audio_bitrate, audio_sample_rate: u32,
-	audio_queue: ^Audio_Queue,
+	audio_queue: ^encode.Raw_Audio_Queue,
 	log_sink: ^applog.Sink,
 	stream_index: u8,
 ) -> (^Rtmp_Stream, bool) {
@@ -283,7 +284,7 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 		context.logger.lowest_level = intrinsics.atomic_load(&stream.log_level)
  		if windows.WaitForSingleObject(stream.event, 200) != windows.WAIT_OBJECT_0 do continue
 	   for {
-		       audio_pts, take_ok := audio_queue_take(stream.audio_queue, stream.audio_scratch)
+		       audio_pts, take_ok := encode.audio_queue_take(stream.audio_queue, stream.audio_scratch)
 		       if !take_ok do break
 		      	audio_take_count += 1
 		       	if audio_take_count % 60 == 0 {
@@ -313,7 +314,7 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 				delete(aac_data)
 				free_all(context.temp_allocator)
 	   }
-   		_, _, pts, mbox_take_ok := mailbox_take(stream.mailbox, stream.scratch)
+   		_, _, pts, mbox_take_ok := encode.mailbox_take(stream.mailbox, stream.scratch)
       	if !mbox_take_ok do continue
 
        	nalus, encode_bgra_ok := mf.encode_bgra_frame(

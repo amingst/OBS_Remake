@@ -4,7 +4,6 @@ import "base:intrinsics"
 import mf "libs:mf"
 import "core:log"
 import "core:sync"
-import "../rtmp"
 import "../applog"
 import win32 "core:sys/windows"
 import "core:thread"
@@ -36,8 +35,8 @@ Encoder :: struct {
 	consumers_mutex: sync.Mutex,
 
 	// inbound from main thread
-	raw_mailbox: ^rtmp.Frame_Mailbox,
-	pcm_queue: ^rtmp.Audio_Queue,
+	raw_mailbox: ^Raw_Mailbox,
+	pcm_queue: ^Raw_Audio_Queue,
 	video_event: win32.HANDLE,
 	audio_event: win32.HANDLE,
 
@@ -111,7 +110,7 @@ encoder_acquire :: proc(
 		pool_destroy(&e.video_pool)
 		pool_destroy(&e.audio_pool)
 		delete(e.scratch)
-		rtmp.mailbox_destroy(e.raw_mailbox)
+		mailbox_destroy(e.raw_mailbox)
 		free(e)
 	}
 
@@ -158,7 +157,7 @@ encoder_acquire :: proc(
 	e.pool_min_free = VIDEO_POOL_SLOTS
 
 	e.scratch = make([]u8, int(e.width) * int(e.height) * 4)
-	e.raw_mailbox = rtmp.mailbox_init(e.width, e.height)
+	e.raw_mailbox = mailbox_init(e.width, e.height)
 
 	intrinsics.atomic_store(&e.running, true)
 	e.thread = thread.create(encoder_thread)
@@ -253,7 +252,7 @@ drain_audio :: proc(e: ^Encoder) {
 
 @(private)
 drain_video :: proc(e: ^Encoder) {
-	_, _, pts, ok := rtmp.mailbox_take(e.raw_mailbox, e.scratch)
+	_, _, pts, ok := mailbox_take(e.raw_mailbox, e.scratch)
 	if !ok do return
 	vid_group, vid_ok := pool_acquire(&e.video_pool)
 	if !vid_ok {
@@ -368,7 +367,7 @@ encoder_release :: proc() {
 	win32.CloseHandle(e.video_event)
 	win32.CloseHandle(e.audio_event)
 	delete(e.scratch)
-	rtmp.mailbox_destroy(e.raw_mailbox)
+	mailbox_destroy(e.raw_mailbox)
 	free(e)
 
 	g_encoder = nil

@@ -1,9 +1,17 @@
-package rtmp
+package encode
 
-import "core:log"
 import "core:sync"
+import "core:log"
 
-Audio_Queue :: struct {
+Raw_Mailbox :: struct {
+	mutex: sync.Mutex,
+	buffer: []u8,
+	width, height: u32,
+	pts: i64,
+	has_frame: bool
+}
+
+Raw_Audio_Queue :: struct {
 	mutex: sync.Mutex,
 	buffer: []u8,
 	pts_list: []i64,
@@ -14,12 +22,60 @@ Audio_Queue :: struct {
 	capacity: u32
 }
 
-audio_queue_init :: proc(n: u32, block_byte_size: u32) -> ^Audio_Queue {
+mailbox_init :: proc(max_w: u32, max_h: u32) -> ^Raw_Mailbox {
+	buffer := make([]u8, max_w * max_h * 4)
+	mbox := new(Raw_Mailbox)
+
+	mbox^ = Raw_Mailbox{
+		buffer = buffer,
+		width = 0,
+		height = 0,
+		pts = 0,
+		has_frame = false
+	}
+
+	return mbox
+}
+
+mailbox_destroy :: proc(mbox: ^Raw_Mailbox) {
+	if mbox != nil {
+		delete(mbox.buffer)
+		free(mbox)
+	}
+}
+
+mailbox_put :: proc(mbox: ^Raw_Mailbox, frame: []u8, width, height: u32, pts: i64) {
+    sync.lock(&mbox.mutex)
+    defer sync.unlock(&mbox.mutex)
+    frame_bytes := int(width) * int(height) * 4
+    copy(mbox.buffer[:frame_bytes], frame)
+    mbox.width, mbox.height = width, height
+    mbox.pts = pts
+    mbox.has_frame = true
+}
+
+mailbox_take :: proc(mbox: ^Raw_Mailbox, dst: []u8) -> (width, height: u32, pts: i64, ok: bool) {
+    sync.lock(&mbox.mutex)
+    defer sync.unlock(&mbox.mutex)
+    if !mbox.has_frame {
+        return 0, 0, 0, false
+    }
+
+    frame_bytes := int(mbox.height) * int(mbox.width) * 4
+    copy(dst[:frame_bytes], mbox.buffer[:frame_bytes])
+    width, height = mbox.width, mbox.height
+    pts = mbox.pts
+    mbox.has_frame = false
+    ok = true
+    return
+}
+
+audio_queue_init :: proc(n: u32, block_byte_size: u32) -> ^Raw_Audio_Queue {
 	buffer := make([]u8, n * block_byte_size)
 	pts_list := make([]i64, n + 1)
 
-	audio_queue := new(Audio_Queue)
-	audio_queue^ = Audio_Queue{
+	audio_queue := new(Raw_Audio_Queue)
+	audio_queue^ = Raw_Audio_Queue{
 		buffer = buffer,
 		pts_list = pts_list,
 		stride = block_byte_size,
@@ -32,7 +88,7 @@ audio_queue_init :: proc(n: u32, block_byte_size: u32) -> ^Audio_Queue {
 	return audio_queue
 }
 
-audio_queue_destroy :: proc(audio_queue: ^Audio_Queue) {
+audio_queue_destroy :: proc(audio_queue: ^Raw_Audio_Queue) {
 	if audio_queue != nil {
 		delete(audio_queue.buffer)
 		delete(audio_queue.pts_list)
@@ -40,7 +96,7 @@ audio_queue_destroy :: proc(audio_queue: ^Audio_Queue) {
 	}
 }
 
-audio_queue_put :: proc(audio_queue: ^Audio_Queue, samples: []u8, pts: i64) -> bool {
+audio_queue_put :: proc(audio_queue: ^Raw_Audio_Queue, samples: []u8, pts: i64) -> bool {
 	sync.lock(&audio_queue.mutex)
 	defer sync.unlock(&audio_queue.mutex)
 
@@ -69,7 +125,7 @@ audio_queue_put :: proc(audio_queue: ^Audio_Queue, samples: []u8, pts: i64) -> b
 	return true
 }
 
-audio_queue_take :: proc(audio_queue: ^Audio_Queue, dst: []u8) -> (pts: i64, ok: bool) {
+audio_queue_take :: proc(audio_queue: ^Raw_Audio_Queue, dst: []u8) -> (pts: i64, ok: bool) {
 	sync.lock(&audio_queue.mutex)
 	defer sync.unlock(&audio_queue.mutex)
 

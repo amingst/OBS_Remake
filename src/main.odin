@@ -33,8 +33,8 @@ Output_State :: struct {
 	recording:		bool,
 	streaming:		bool,
 	rtmp_stream:	^rtmp.Rtmp_Stream,
-	mailbox:		^rtmp.Frame_Mailbox,
-	audio_queue:	^rtmp.Audio_Queue,
+	mailbox:		^encode.Raw_Mailbox,
+	audio_queue:	^encode.Raw_Audio_Queue,
 }
 
 main :: proc() {
@@ -672,7 +672,7 @@ main :: proc() {
 					encode.push_audio(pcm_buf, pts_100ns, duration_100ns)
 				}
 				if output.streaming {
-					if !rtmp.audio_queue_put(output.audio_queue, pcm_buf, pts_100ns) {
+					if !encode.audio_queue_put(output.audio_queue, pcm_buf, pts_100ns) {
 						audio_queue_full_count += 1
 						if audio_queue_full_count % 60 == 0 {
 							log.warnf("audio_queue_put failed (queue full), dropped %v block(s) so far", audio_queue_full_count)
@@ -735,11 +735,11 @@ main :: proc() {
 					encode.push_video(frame_bytes, video_pts)
 				}
 				if output.streaming {
-					rtmp.mailbox_put(output.mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
+					encode.mailbox_put(output.mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
 					win32.SetEvent(output.rtmp_stream.event)
 				}
 				if encoder_ok {
-					rtmp.mailbox_put(enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
+					encode.mailbox_put(enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
 					win32.SetEvent(enc.video_event)
 				}
 				video_frame_count += 1
@@ -817,8 +817,8 @@ main :: proc() {
 	if output.streaming {
 		log.info("closing stream on exit")
 		rtmp.rtmp_stream_close(output.rtmp_stream)
-		rtmp.mailbox_destroy(output.mailbox)
-		rtmp.audio_queue_destroy(output.audio_queue)
+		encode.mailbox_destroy(output.mailbox)
+		encode.audio_queue_destroy(output.audio_queue)
 	}
 
 	// Persist on a clean shutdown. Everything that reaches here left the loop
@@ -995,7 +995,7 @@ handle_controls_request :: proc(
 			return
 		}
 
-		mbox := rtmp.mailbox_init(settings.MAX_CANVAS_WIDTH, settings.MAX_CANVAS_HEIGHT)
+		mbox := encode.mailbox_init(settings.MAX_CANVAS_WIDTH, settings.MAX_CANVAS_HEIGHT)
 
 		// Fixed at 48kHz/stereo/16000 bytes-per-sec -- matches the mixer's
 		// hardcoded format elsewhere in main.odin (CHANNELS, the 48000 literal
@@ -1011,7 +1011,7 @@ handle_controls_request :: proc(
 		STREAM_AUDIO_CHANNELS    :: 2
 		STREAM_AUDIO_BITRATE     :: 16000
 
-		aq := rtmp.audio_queue_init(
+		aq := encode.audio_queue_init(
 			audio.BLOCK_LATENCY,
 			u32(audio.BLOCK_SAMPLES) * STREAM_AUDIO_CHANNELS * 2,
 		)
@@ -1030,16 +1030,16 @@ handle_controls_request :: proc(
 			output.streaming = true
 			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
 		} else {
-			rtmp.mailbox_destroy(mbox)
-			rtmp.audio_queue_destroy(aq)
+			encode.mailbox_destroy(mbox)
+			encode.audio_queue_destroy(aq)
 			log.warn("failed to start streaming (cause logged above)")
 		}
 
 	case .Stop_Streaming:
 		if !output.streaming do return
 		rtmp.rtmp_stream_close(output.rtmp_stream)
-		rtmp.mailbox_destroy(output.mailbox)
-		rtmp.audio_queue_destroy(output.audio_queue)
+		encode.mailbox_destroy(output.mailbox)
+		encode.audio_queue_destroy(output.audio_queue)
 		output.rtmp_stream = nil
 		output.mailbox = nil
 		output.audio_queue = nil

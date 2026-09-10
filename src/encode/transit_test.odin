@@ -1,4 +1,4 @@
-package rtmp
+package encode
 
 import "core:testing"
 

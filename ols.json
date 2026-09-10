@@ -11,7 +11,8 @@
 		{ "name": "mf", "path": "libs/mf" },
 		{ "name": "rtmp", "path": "src/rtmp"},
 		{ "name": "h264", "path": "libs/h264"},
-		{ "name": "flv", "path": "libs/flv"}
+		{ "name": "flv", "path": "libs/flv"},
+		{ "name": "encode", "path": "src/encode"}
 	],
 	"enable_semantic_tokens": true,
 	"enable_document_symbols": true,
