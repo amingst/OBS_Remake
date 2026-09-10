@@ -33,8 +33,6 @@ Output_State :: struct {
 	recording:		bool,
 	streaming:		bool,
 	rtmp_stream:	^rtmp.Rtmp_Stream,
-	mailbox:		^encode.Raw_Mailbox,
-	audio_queue:	^encode.Raw_Audio_Queue,
 }
 
 main :: proc() {
@@ -432,7 +430,6 @@ main :: proc() {
 	output: Output_State
 
 	video_frame_count: u64
-	audio_queue_full_count: u64 // throttles the "queue full" warning below, which can otherwise fire many times per second
 	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
 	has_audio_sources := false // set each frame, used by the recording-start handler next frame
 
@@ -532,7 +529,7 @@ main :: proc() {
 		if req := ui_state.controls.request; req != .None {
 			was_recording := output.recording
 			handle_controls_request(req, &ui_state.controls, &output,
-				&paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources, log_sink)
+				&paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources, log_sink, enc)
 			if output.recording && !was_recording {
 				// Reset clocks so the first sample/frame is PTS 0.
 				blocks_emitted = 0
@@ -671,14 +668,6 @@ main :: proc() {
 				if output.recording {
 					encode.push_audio(pcm_buf, pts_100ns, duration_100ns)
 				}
-				if output.streaming {
-					if !encode.audio_queue_put(output.audio_queue, pcm_buf, pts_100ns) {
-						audio_queue_full_count += 1
-						if audio_queue_full_count % 60 == 0 {
-							log.warnf("audio_queue_put failed (queue full), dropped %v block(s) so far", audio_queue_full_count)
-						}
-					}
-				}
 
 				blocks_emitted += 1
 			}
@@ -733,10 +722,6 @@ main :: proc() {
 			if read_ok {
 				if output.recording {
 					encode.push_video(frame_bytes, video_pts)
-				}
-				if output.streaming {
-					encode.mailbox_put(output.mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
-					win32.SetEvent(output.rtmp_stream.event)
 				}
 				if encoder_ok {
 					encode.mailbox_put(enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
@@ -817,8 +802,6 @@ main :: proc() {
 	if output.streaming {
 		log.info("closing stream on exit")
 		rtmp.rtmp_stream_close(output.rtmp_stream)
-		encode.mailbox_destroy(output.mailbox)
-		encode.audio_queue_destroy(output.audio_queue)
 	}
 
 	// Persist on a clean shutdown. Everything that reaches here left the loop
@@ -941,6 +924,7 @@ handle_controls_request :: proc(
 	stream_cfg:  settings.Stream_Settings,
 	has_audio:   bool,
 	log_sink:    ^applog.Sink,
+	enc:         ^encode.Encoder,
 ) {
 	state.request = .None
 
@@ -995,54 +979,31 @@ handle_controls_request :: proc(
 			return
 		}
 
-		mbox := encode.mailbox_init(settings.MAX_CANVAS_WIDTH, settings.MAX_CANVAS_HEIGHT)
+		if enc == nil {
+			log.warn("streaming requested, but no encoder is available")
+			return
+		}
 
-		// Fixed at 48kHz/stereo/16000 bytes-per-sec -- matches the mixer's
-		// hardcoded format elsewhere in main.odin (CHANNELS, the 48000 literal
-		// in the pts_100ns calc below) and is one of valid_aac_bitrate's fixed
-		// accepted values for non-5.1 channel counts. Streaming currently
-		// always sets up the AAC encoder regardless of has_audio, unlike
-		// recording's 0-means-no-audio branch -- rtmp_stream_start has no
-		// no-audio path yet, so a stream started with no audio sources present
-		// just sends an AAC sequence header and no further audio frames, rather
-		// than skipping audio setup entirely. Worth revisiting if that turns
-		// out to matter in practice.
-		STREAM_AUDIO_SAMPLE_RATE :: 48000
-		STREAM_AUDIO_CHANNELS    :: 2
-		STREAM_AUDIO_BITRATE     :: 16000
-
-		aq := encode.audio_queue_init(
-			audio.BLOCK_LATENCY,
-			u32(audio.BLOCK_SAMPLES) * STREAM_AUDIO_CHANNELS * 2,
-		)
+		STREAM_AUDIO_CHANNELS :: 2
 
 		// stream_index 0: a single stream is all this build supports today.
 		// A real id generator/registry belongs with fan-out, not here.
 		stream, ok := rtmp.rtmp_stream_start(
-			mbox, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
-			stream_cfg.stream_key, u32(fps), target.width, target.height, u32(stream_cfg.bitrate),
-			STREAM_AUDIO_CHANNELS, STREAM_AUDIO_BITRATE, STREAM_AUDIO_SAMPLE_RATE, aq,
+			enc, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
+			stream_cfg.stream_key, STREAM_AUDIO_CHANNELS,
 			log_sink, 0)
 		if ok {
-			output.mailbox = mbox
-			output.audio_queue = aq
 			output.rtmp_stream = stream
 			output.streaming = true
 			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
 		} else {
-			encode.mailbox_destroy(mbox)
-			encode.audio_queue_destroy(aq)
 			log.warn("failed to start streaming (cause logged above)")
 		}
 
 	case .Stop_Streaming:
 		if !output.streaming do return
 		rtmp.rtmp_stream_close(output.rtmp_stream)
-		encode.mailbox_destroy(output.mailbox)
-		encode.audio_queue_destroy(output.audio_queue)
 		output.rtmp_stream = nil
-		output.mailbox = nil
-		output.audio_queue = nil
 		output.streaming = false
 		log.info("streaming stopped")
 	}
