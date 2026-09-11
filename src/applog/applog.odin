@@ -9,7 +9,7 @@ import "core:os"
 CONSOLE_OUTPUT :: true
 
 Category :: enum u8 {
-	Main, Audio, Encode, Capture, Rtmp, Ui,
+	Main, Audio, Encode, Capture, Rtmp, Ui, Mp4,
 }
 
 Tag :: struct {
@@ -177,7 +177,7 @@ make_logger :: proc(ctx: ^Log_Context) -> log.Logger {
 @(private="file")
 category_names := [Category]string{
 	.Main = "main", .Audio = "audio", .Encode = "encode",
-	.Capture = "capture", .Rtmp = "rtmp", .Ui = "ui",
+	.Capture = "capture", .Rtmp = "rtmp", .Ui = "ui", .Mp4 = "mp4",
 }
 
 @(private="file")

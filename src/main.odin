@@ -27,12 +27,14 @@ import "capture"
 import "audio"
 import "encode"
 import "rtmp"
+import "mp4"
 import "applog"
 
 Output_State :: struct {
 	recording:		bool,
 	streaming:		bool,
 	rtmp_stream:	^rtmp.Rtmp_Stream,
+	mp4_sink:		^mp4.Mp4_Sink,
 }
 
 main :: proc() {
@@ -431,7 +433,6 @@ main :: proc() {
 
 	video_frame_count: u64
 	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
-	has_audio_sources := false // set each frame, used by the recording-start handler next frame
 
 	frame_bytes := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
 
@@ -523,19 +524,21 @@ main :: proc() {
 		}
 
 		// Service a pending recording request. Deliberately after reconcile,
-		// same as the requests above: a canvas resize landing between
-		// encode.start and the first pushed frame would hand the encoder a
-		// resolution that doesn't match what it was configured with.
+		// same as the requests above: a canvas resize landing between the
+		// output starting and the first pushed frame would hand the encoder
+		// a resolution that doesn't match what it was configured with.
 		if req := ui_state.controls.request; req != .None {
-			was_recording := output.recording
+			// blocks_emitted/video_frame_count/using_audio_clock feed the one
+			// PTS timeline shared by every consumer of enc (RTMP, MP4 sink,
+			// ...) -- they must track the encoder's lifetime, never a single
+			// output's. This used to reset them here on a recording start so
+			// that output's first sample would land at PTS 0, but that
+			// rebased every other active consumer's timestamps out from under
+			// it too (see the mp4 sink recon report). Per-output "first
+			// sample at 0" is now handled downstream, per consumer, by
+			// rebasing at the sink (see mp4_sink.odin's feeder thread).
 			handle_controls_request(req, &ui_state.controls, &output,
-				&paths, &preview_target, cfg.video.fps, cfg.stream, has_audio_sources, log_sink, enc)
-			if output.recording && !was_recording {
-				// Reset clocks so the first sample/frame is PTS 0.
-				blocks_emitted = 0
-				video_frame_count = 0
-				using_audio_clock = false
-			}
+				&paths, &preview_target, cfg.video.fps, cfg.stream, log_sink, enc)
 		}
 
 		// Neutral fallback for "no scene selected" -- selected_id 0, or the
@@ -644,7 +647,6 @@ main :: proc() {
 				}
 			}
 		}
-		has_audio_sources = len(inputs) > 0
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 
 		// -- Audio mixer --------------------------------------------------
@@ -662,11 +664,12 @@ main :: proc() {
 		if mixer_started {
 			for audio.mix_block(inputs[:], mix_buf, CHANNELS) {
 				pts_100ns := i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
-				duration_100ns := i64(audio.BLOCK_SAMPLES) * 10_000_000 / 48000
 				pcm_buf := f32_to_pcm16(mix_buf)
 
-				if output.recording {
-					encode.push_audio(pcm_buf, pts_100ns, duration_100ns)
+				if encoder_ok {
+					if encode.audio_queue_put(enc.pcm_queue, pcm_buf, pts_100ns) {
+						win32.SetEvent(enc.audio_event)
+					}
 				}
 
 				blocks_emitted += 1
@@ -675,18 +678,16 @@ main :: proc() {
 
 		// -- Video push ---------------------------------------------------
 		// Shared on recording || streaming: both consumers need the same GPU
-		// readback and PTS clock. push_video and mailbox_put/SetEvent are then
-		// independent conditionals below, not nested in each other, so either
-		// consumer can run alone.
+		// readback and PTS clock.
 		if output.recording || output.streaming {
 			// flip_vertical: MFVideoFormat_RGB32 is bottom-up by convention and
 			// MF ignores the MF_MT_DEFAULT_STRIDE hint that's supposed to
-			// override that (see the comment in mf.odin's begin_recording), so
-			// the rows are flipped here instead. This is a workaround for that
-			// one encoder, not the default -- every other read_target caller
-			// wants top-down rows. The RTMP path was already fed these flipped
-			// rows whenever recording+streaming were both active, so extending
-			// this block to run for streaming-only doesn't change that.
+			// override that, so the rows are flipped here instead. This is a
+			// workaround for that one encoder, not the default -- every other
+			// read_target caller wants top-down rows. The RTMP path was already
+			// fed these flipped rows whenever recording+streaming were both
+			// active, so extending this block to run for streaming-only
+			// doesn't change that.
 			video_pts: i64
 			// mixer_started gates this, not just len(inputs) > 0: audio sources
 			// can exist but still be warming up (ring buffers below
@@ -720,9 +721,6 @@ main :: proc() {
 			}
 
 			if read_ok {
-				if output.recording {
-					encode.push_video(frame_bytes, video_pts)
-				}
 				if encoder_ok {
 					encode.mailbox_put(enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
 					win32.SetEvent(enc.video_event)
@@ -797,7 +795,8 @@ main :: proc() {
 	// the MP4's sink writer never finalized -- this closes that gap.
 	if output.recording {
 		log.info("finalizing recording on exit")
-		encode.stop()
+		mp4.mp4_sink_stop(output.mp4_sink)
+		output.mp4_sink = nil
 	}
 	if output.streaming {
 		log.info("closing stream on exit")
@@ -922,7 +921,6 @@ handle_controls_request :: proc(
 	target:      ^render.Target,
 	fps:         i32,
 	stream_cfg:  settings.Stream_Settings,
-	has_audio:   bool,
 	log_sink:    ^applog.Sink,
 	enc:         ^encode.Encoder,
 ) {
@@ -933,6 +931,10 @@ handle_controls_request :: proc(
 		if output.recording do return
 		if paths.videos == "" {
 			log.warn("recording requested, but no videos directory is available")
+			return
+		}
+		if enc == nil {
+			log.warn("recording requested, but no encoder is available")
 			return
 		}
 
@@ -947,28 +949,24 @@ handle_controls_request :: proc(
 			log.warnf("could not build recording output path: %v", jerr)
 			return
 		}
-		// encode.start (via mf.begin_recording) converts this to a wide
-		// string synchronously and doesn't retain the Odin string, so it's
-		// safe to free right after the call returns.
+		// mp4_sink_start (via mf.begin_mp4_sink -> MFCreateFile) converts this
+		// to a wide string synchronously and doesn't retain the Odin string,
+		// so it's safe to free right after the call returns.
 		defer delete(out_path)
 
-		audio_rate: u32 = has_audio ? 48000 : 0
-		audio_ch:   u32 = has_audio ? 2 : 0
-		if encode.start(out_path, target.width, target.height, u32(fps),
-			audio_sample_rate = audio_rate, audio_channels = audio_ch) {
+		sink, ok := mp4.mp4_sink_start(enc, out_path)
+		if ok {
+			output.mp4_sink = sink
 			output.recording = true
-			if has_audio {
-				log.infof("recording started (video+audio) -> %v", out_path)
-			} else {
-				log.infof("recording started (video only) -> %v", out_path)
-			}
+			log.infof("recording started (video+audio) -> %v", out_path)
 		} else {
 			log.warn("failed to start recording (cause logged above)")
 		}
 
 	case .Stop_Recording:
 		if !output.recording do return
-		encode.stop()
+		mp4.mp4_sink_stop(output.mp4_sink)
+		output.mp4_sink = nil
 		output.recording = false
 		log.info("recording stopped")
 

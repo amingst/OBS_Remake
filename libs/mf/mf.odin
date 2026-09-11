@@ -7,7 +7,6 @@ import "libs:h264"
 import "core:slice"
 
 foreign import mfplat "system:mfplat.lib"
-foreign import mfreadwrite "system:mfreadwrite.lib"
 
 @(default_calling_convention="stdcall")
 foreign mfplat {
@@ -16,11 +15,6 @@ foreign mfplat {
     MFCreateMediaType   :: proc(media_type: ^^IMFMediaType) -> windows.HRESULT ---
     MFCreateMemoryBuffer:: proc(max_length: u32, buffer: ^^IMFMediaBuffer) -> windows.HRESULT ---
     MFCreateSample      :: proc(sample: ^^IMFSample) -> windows.HRESULT ---
-}
-
-@(default_calling_convention="stdcall")
-foreign mfreadwrite {
-    MFCreateSinkWriterFromURL :: proc(output_url: cstring16, byte_stream: rawptr, attributes: rawptr, sink_writer: ^^IMFSinkWriter) -> windows.HRESULT ---
 }
 
 @(default_calling_convention="stdcall")
@@ -58,219 +52,12 @@ valid_aac_bitrate :: proc(channels, bytes_per_sec: u32) -> bool {
     return false
 }
 
-begin_recording :: proc(
-    output_path: string,
-    width, height, fps, video_bitrate: u32,
-    audio_sample_rate, audio_channels, audio_bitrate: u32, // audio_channels == 0 -> no audio stream
-    out_writer: ^^IMFSinkWriter,
-    out_video_stream_index: ^u32,
-    out_audio_stream_index: ^u32,
-) -> bool {
-    path_w := windows.utf8_to_wstring(output_path)
-    sink_writer: ^IMFSinkWriter
-    hr := MFCreateSinkWriterFromURL(path_w, nil, nil, &sink_writer)
-    if !mf_succeeded(hr) {
-        log.errorf("MFCreateSinkWriterFromURL failed: 0x%08X", u32(hr))
-        return false
-    }
-
-    // ---- video output type: H264 ----
-    video_output_type: ^IMFMediaType
-    hr = MFCreateMediaType(&video_output_type)
-    if !mf_succeeded(hr) {
-        log.errorf("MFCreateMediaType (video output) failed: 0x%08X", u32(hr))
-        sink_writer.Release(sink_writer)
-        return false
-    }
-    defer video_output_type.Release(video_output_type)
-
-    video_output_type.SetGUID(video_output_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-    video_output_type.SetGUID(video_output_type, &MF_MT_SUBTYPE, &MFVideoFormat_H264)
-    video_output_type.SetUINT32(video_output_type, &MF_MT_AVG_BITRATE, video_bitrate)
-    video_output_type.SetUINT32(video_output_type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)
-    mf_set_size(video_output_type, &MF_MT_FRAME_SIZE, width, height)
-    mf_set_ratio(video_output_type, &MF_MT_FRAME_RATE, fps, 1)
-    mf_set_ratio(video_output_type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)
-
-    video_stream_index: u32
-    hr = sink_writer.AddStream(sink_writer, video_output_type, &video_stream_index)
-    if !mf_succeeded(hr) {
-        log.errorf("AddStream (video) failed: 0x%08X", u32(hr))
-        sink_writer.Release(sink_writer)
-        return false
-    }
-
-    // ---- video input type: RGB32, MF's own converter goes RGB32 -> NV12 ----
-    video_input_type: ^IMFMediaType
-    hr = MFCreateMediaType(&video_input_type)
-    if !mf_succeeded(hr) {
-        log.errorf("MFCreateMediaType (video input) failed: 0x%08X", u32(hr))
-        sink_writer.Release(sink_writer)
-        return false
-    }
-    defer video_input_type.Release(video_input_type)
-
-    video_input_type.SetGUID(video_input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-    video_input_type.SetGUID(video_input_type, &MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-    video_input_type.SetUINT32(video_input_type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)
-    video_input_type.SetUINT32(video_input_type, &MF_MT_ALL_SAMPLES_INDEPENDENT, 1)
-    mf_set_size(video_input_type, &MF_MT_FRAME_SIZE, width, height)
-    mf_set_ratio(video_input_type, &MF_MT_FRAME_RATE, fps, 1)
-    mf_set_ratio(video_input_type, &MF_MT_PIXEL_ASPECT_RATIO, 1, 1)
-
-    hr = sink_writer.SetInputMediaType(sink_writer, video_stream_index, video_input_type, nil)
-    if !mf_succeeded(hr) {
-        log.errorf("SetInputMediaType (video) failed: 0x%08X", u32(hr))
-        sink_writer.Release(sink_writer)
-        return false
-    }
-
-    audio_stream_index: u32 = max(u32) // sentinel: no audio stream configured
-
-    if audio_channels > 0 {
-        if !valid_aac_bitrate(audio_channels, audio_bitrate) {
-            log.errorf("audio_bitrate %d bytes/sec is not a value the AAC encoder accepts for %d channel(s) (valid: 12000/16000/20000/24000, x6 for 5.1)", audio_bitrate, audio_channels)
-            sink_writer.Release(sink_writer)
-            return false
-        }
-
-        // ---- audio output type: AAC ----
-        audio_output_type: ^IMFMediaType
-        hr = MFCreateMediaType(&audio_output_type)
-        if !mf_succeeded(hr) {
-            log.errorf("MFCreateMediaType (audio output) failed: 0x%08X", u32(hr))
-            sink_writer.Release(sink_writer)
-            return false
-        }
-        defer audio_output_type.Release(audio_output_type)
-
-        audio_output_type.SetGUID(audio_output_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
-        audio_output_type.SetGUID(audio_output_type, &MF_MT_SUBTYPE, &MFAudioFormat_AAC)
-        audio_output_type.SetUINT32(audio_output_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
-        audio_output_type.SetUINT32(audio_output_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate)
-        audio_output_type.SetUINT32(audio_output_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels)
-        audio_output_type.SetUINT32(audio_output_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_bitrate)
-
-        hr = sink_writer.AddStream(sink_writer, audio_output_type, &audio_stream_index)
-        if !mf_succeeded(hr) {
-            log.errorf("AddStream (audio) failed: 0x%08X", u32(hr))
-            sink_writer.Release(sink_writer)
-            return false
-        }
-
-        // ---- audio input type: 16-bit PCM ----
-        // The AAC encoder requires MFAudioFormat_PCM / 16-bit input - it does not
-        // accept MFAudioFormat_Float, unlike the video path's implicit RGB32->NV12
-        // conversion. Convert float32 -> int16 upstream, in the mixer.
-        audio_input_type: ^IMFMediaType
-        hr = MFCreateMediaType(&audio_input_type)
-        if !mf_succeeded(hr) {
-            log.errorf("MFCreateMediaType (audio input) failed: 0x%08X", u32(hr))
-            sink_writer.Release(sink_writer)
-            return false
-        }
-        defer audio_input_type.Release(audio_input_type)
-
-        block_align := audio_channels * 2 // 16-bit samples
-        audio_input_type.SetGUID(audio_input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
-        audio_input_type.SetGUID(audio_input_type, &MF_MT_SUBTYPE, &MFAudioFormat_PCM)
-        audio_input_type.SetUINT32(audio_input_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
-        audio_input_type.SetUINT32(audio_input_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate)
-        audio_input_type.SetUINT32(audio_input_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels)
-        audio_input_type.SetUINT32(audio_input_type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align)
-        audio_input_type.SetUINT32(audio_input_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_sample_rate * block_align)
-
-        hr = sink_writer.SetInputMediaType(sink_writer, audio_stream_index, audio_input_type, nil)
-        if !mf_succeeded(hr) {
-            log.errorf("SetInputMediaType (audio) failed: 0x%08X", u32(hr))
-            sink_writer.Release(sink_writer)
-            return false
-        }
-    }
-
-    hr = sink_writer.BeginWriting(sink_writer)
-    if !mf_succeeded(hr) {
-        log.errorf("BeginWriting failed: 0x%08X", u32(hr))
-        sink_writer.Release(sink_writer)
-        return false
-    }
-
-    out_writer^ = sink_writer
-    out_video_stream_index^ = video_stream_index
-    out_audio_stream_index^ = audio_stream_index
-    return true
-}
-
-@(private)
-write_stream_sample :: proc(
-    sink_writer: ^IMFSinkWriter,
-    stream_index: u32,
-    data: []u8,
-    sample_time, sample_duration: i64,
-) -> bool {
-    size := u32(len(data))
-
-    buffer: ^IMFMediaBuffer
-    hr := MFCreateMemoryBuffer(size, &buffer)
-    if !mf_succeeded(hr) {
-        log.errorf("MFCreateMemoryBuffer failed: 0x%08X", u32(hr))
-        return false
-    }
-
-    dst: [^]u8
-    hr = buffer.Lock(buffer, &dst, nil, nil)
-    if !mf_succeeded(hr) {
-        log.errorf("Buffer Lock failed: 0x%08X", u32(hr))
-        buffer.Release(buffer)
-        return false
-    }
-
-    mem.copy(dst, raw_data(data), int(size))
-    buffer.Unlock(buffer)
-    buffer.SetCurrentLength(buffer, size)
-
-    sample: ^IMFSample
-    hr = MFCreateSample(&sample)
-    if !mf_succeeded(hr) {
-        log.errorf("MFCreateSample failed: 0x%08X", u32(hr))
-        buffer.Release(buffer)
-        return false
-    }
-
-    sample.AddBuffer(sample, buffer)
-    sample.SetSampleTime(sample, sample_time)
-    sample.SetSampleDuration(sample, sample_duration)
-
-    hr = sink_writer.WriteSample(sink_writer, stream_index, sample)
-
-    sample.Release(sample)
-    buffer.Release(buffer)
-
-    if !mf_succeeded(hr) {
-        log.errorf("WriteSample failed: 0x%08X", u32(hr))
-        return false
-    }
-    return true
-}
-
-write_video_frame :: proc(sink_writer: ^IMFSinkWriter, stream_index: u32, pixels: []u8, sample_time, sample_duration: i64) -> bool {
-    return write_stream_sample(sink_writer, stream_index, pixels, sample_time, sample_duration)
-}
-
-write_audio_frame :: proc(sink_writer: ^IMFSinkWriter, stream_index: u32, samples: []u8, sample_time, sample_duration: i64) -> bool {
-    return write_stream_sample(sink_writer, stream_index, samples, sample_time, sample_duration)
-}
-
-end_recording :: proc(sink_writer: ^IMFSinkWriter) -> bool {
-    hr := sink_writer.Finalize(sink_writer)
-    sink_writer.Release(sink_writer)
-
-    if !mf_succeeded(hr) {
-        log.errorf("Finalize failed: 0x%08X", u32(hr))
-        return false
-    }
-    return true
-}
+// Declared here (rather than mf_types.odin, alongside CODECAPI_AVEncMPVGOPSize)
+// because this fix is scoped to mf.odin only. Values verified against the
+// Windows 10.0.26100.0 SDK's codecapi.h.
+CODECAPI_AVEncCommonRateControlMode := windows.GUID{0x1c0608e9, 0x370c, 0x4710, {0x8a, 0x58, 0xcb, 0x61, 0x81, 0xc4, 0x24, 0x23}}
+CODECAPI_AVEncCommonMeanBitRate     := windows.GUID{0xf7222374, 0x2144, 0x4815, {0xb5, 0x50, 0xa3, 0x7f, 0x8e, 0x12, 0xee, 0x52}}
+eAVEncCommonRateControlMode_CBR :: 0
 
 begin_h264_encoder :: proc(width, height, fps, bitrate: u32) -> (encoder: ^IMFTransform, sps, pps: []u8, ok: bool) {
     output_filter := MFT_REGISTER_TYPE_INFO{MFMediaType_Video, MFVideoFormat_H264}
@@ -317,6 +104,40 @@ begin_h264_encoder :: proc(width, height, fps, bitrate: u32) -> (encoder: ^IMFTr
     output_type.SetUINT32(output_type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive)
     mf_set_size(output_type, &MF_MT_FRAME_SIZE, width, height)
     mf_set_ratio(output_type, &MF_MT_FRAME_RATE, fps, 1)
+
+    // ---- rate control + GOP size via ICodecAPI, set BEFORE SetOutputType ----
+    // The MS software H.264 MFT frequently requires CODECAPI properties to be
+    // committed before the output type is negotiated for them to actually
+    // take effect; setting them afterward (as set_encoder_gop_size does, from
+    // create_mfts) is accepted (S_OK) but silently ignored by this MFT. Also
+    // set an explicit rate control mode: with none configured, the encoder
+    // can default to a mode that does not honor GOP size at all.
+    codec_api: ^ICodecAPI
+    qi_hr := encoder.QueryInterface(encoder, &IID_ICodecAPI, cast(^rawptr)&codec_api)
+    if qi_hr < 0 {
+        log.warnf("QueryInterface(ICodecAPI) failed: 0x%08X", u32(qi_hr))
+    } else {
+        rc_mode := VARIANT{vt = VT_UI4, val = u64(eAVEncCommonRateControlMode_CBR)}
+        rc_hr := codec_api.SetValue(codec_api, &CODECAPI_AVEncCommonRateControlMode, &rc_mode)
+        if rc_hr < 0 {
+            log.warnf("ICodecAPI::SetValue(AVEncCommonRateControlMode=CBR) failed: 0x%08X", u32(rc_hr))
+        }
+
+        mean_bitrate := VARIANT{vt = VT_UI4, val = u64(bitrate)}
+        mbr_hr := codec_api.SetValue(codec_api, &CODECAPI_AVEncCommonMeanBitRate, &mean_bitrate)
+        if mbr_hr < 0 {
+            log.warnf("ICodecAPI::SetValue(AVEncCommonMeanBitRate=%v) failed: 0x%08X", bitrate, u32(mbr_hr))
+        }
+
+        gop_size := fps * 2
+        gop := VARIANT{vt = VT_UI4, val = u64(gop_size)}
+        gop_hr := codec_api.SetValue(codec_api, &CODECAPI_AVEncMPVGOPSize, &gop)
+        if gop_hr < 0 {
+            log.warnf("ICodecAPI::SetValue(AVEncMPVGOPSize=%v) failed: 0x%08X", gop_size, u32(gop_hr))
+        }
+
+        codec_api.Release(codec_api)
+    }
 
     hr = encoder.SetOutputType(encoder, 0, output_type, 0)
     if hr < 0 {
@@ -898,17 +719,47 @@ begin_aac_encoder :: proc(audio_sample_rate, audio_channels, audio_bitrate: u32)
     defer output_type.Release(output_type)
     output_type.SetGUID(output_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
     output_type.SetGUID(output_type, &MF_MT_SUBTYPE, &MFAudioFormat_AAC)
-    output_type.SetUINT32(output_type, &MF_MT_AAC_PAYLOAD_TYPE, 0)
-    output_type.SetUINT32(output_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels)
-    output_type.SetUINT32(output_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate)
-    output_type.SetUINT32(output_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
-    output_type.SetUINT32(output_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_bitrate)
+    if hr = output_type.SetUINT32(output_type, &MF_MT_AAC_PAYLOAD_TYPE, 0); hr < 0 {
+        log.errorf("SetUINT32(MF_MT_AAC_PAYLOAD_TYPE) failed: 0x%08X", u32(hr))
+    }
+    if hr = output_type.SetUINT32(output_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels); hr < 0 {
+        log.errorf("SetUINT32(output MF_MT_AUDIO_NUM_CHANNELS) failed: 0x%08X", u32(hr))
+    }
+    if hr = output_type.SetUINT32(output_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate); hr < 0 {
+        log.errorf("SetUINT32(output MF_MT_AUDIO_SAMPLES_PER_SECOND) failed: 0x%08X", u32(hr))
+    }
+    if hr = output_type.SetUINT32(output_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16); hr < 0 {
+        log.errorf("SetUINT32(output MF_MT_AUDIO_BITS_PER_SAMPLE) failed: 0x%08X", u32(hr))
+    }
+    if hr = output_type.SetUINT32(output_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_bitrate); hr < 0 {
+        log.errorf("SetUINT32(output MF_MT_AUDIO_AVG_BYTES_PER_SECOND) failed: 0x%08X", u32(hr))
+    }
     hr = encoder.SetOutputType(encoder, 0, output_type, 0)
     if hr < 0 {
         log.errorf("SetOutputType failed: 0x%08X", u32(hr))
         encoder.Release(encoder)
         return nil, nil, false
     }
+
+    // Diagnostic: read back what the MFT actually negotiated for the output
+    // type, to determine whether a requested/negotiated mismatch (e.g. a
+    // captured stream reporting 44100 Hz when 48000 was requested) originates
+    // here, at type negotiation, rather than downstream.
+    current_output: ^IMFMediaType
+    hr = encoder.GetOutputCurrentType(encoder, 0, &current_output)
+    if hr < 0 {
+        log.errorf("GetOutputCurrentType failed: 0x%08X", u32(hr))
+        encoder.Release(encoder)
+        return nil, nil, false
+    }
+    defer current_output.Release(current_output)
+
+    neg_out_rate, neg_out_channels, neg_out_bytes: u32
+    current_output.GetUINT32(current_output, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &neg_out_rate)
+    current_output.GetUINT32(current_output, &MF_MT_AUDIO_NUM_CHANNELS, &neg_out_channels)
+    current_output.GetUINT32(current_output, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &neg_out_bytes)
+    log.infof("AAC output type negotiated: sample_rate requested=%v negotiated=%v, channels requested=%v negotiated=%v, avg_bytes_per_sec requested=%v negotiated=%v",
+        audio_sample_rate, neg_out_rate, audio_channels, neg_out_channels, audio_bitrate, neg_out_bytes)
 
     // ---- input type: PCM ----
     input_type: ^IMFMediaType
@@ -920,15 +771,26 @@ begin_aac_encoder :: proc(audio_sample_rate, audio_channels, audio_bitrate: u32)
     }
 
     block_align := audio_channels * 2
+    input_avg_bytes := audio_sample_rate * block_align
 
     defer input_type.Release(input_type)
     input_type.SetGUID(input_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Audio)
     input_type.SetGUID(input_type, &MF_MT_SUBTYPE, &MFAudioFormat_PCM)
-    input_type.SetUINT32(input_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels)
-    input_type.SetUINT32(input_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate)
-    input_type.SetUINT32(input_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16)
-    input_type.SetUINT32(input_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, audio_sample_rate * block_align)
-    input_type.SetUINT32(input_type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align)
+    if hr = input_type.SetUINT32(input_type, &MF_MT_AUDIO_NUM_CHANNELS, audio_channels); hr < 0 {
+        log.errorf("SetUINT32(input MF_MT_AUDIO_NUM_CHANNELS) failed: 0x%08X", u32(hr))
+    }
+    if hr = input_type.SetUINT32(input_type, &MF_MT_AUDIO_SAMPLES_PER_SECOND, audio_sample_rate); hr < 0 {
+        log.errorf("SetUINT32(input MF_MT_AUDIO_SAMPLES_PER_SECOND) failed: 0x%08X", u32(hr))
+    }
+    if hr = input_type.SetUINT32(input_type, &MF_MT_AUDIO_BITS_PER_SAMPLE, 16); hr < 0 {
+        log.errorf("SetUINT32(input MF_MT_AUDIO_BITS_PER_SAMPLE) failed: 0x%08X", u32(hr))
+    }
+    if hr = input_type.SetUINT32(input_type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, input_avg_bytes); hr < 0 {
+        log.errorf("SetUINT32(input MF_MT_AUDIO_AVG_BYTES_PER_SECOND) failed: 0x%08X", u32(hr))
+    }
+    if hr = input_type.SetUINT32(input_type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align); hr < 0 {
+        log.errorf("SetUINT32(input MF_MT_AUDIO_BLOCK_ALIGNMENT) failed: 0x%08X", u32(hr))
+    }
     hr = encoder.SetInputType(encoder, 0, input_type, 0)
     if hr < 0 {
         log.errorf("SetInputType failed: 0x%08X", u32(hr))
@@ -936,16 +798,26 @@ begin_aac_encoder :: proc(audio_sample_rate, audio_channels, audio_bitrate: u32)
         return nil, nil, false
     }
 
-    // TODO: extract aac_config via MF_MT_USER_DATA
-    current_output: ^IMFMediaType
-    hr = encoder.GetOutputCurrentType(encoder, 0, &current_output)
+    // Diagnostic: read back the negotiated input type the same way as the
+    // output type above. IMFTransform::GetInputCurrentType is not bound in
+    // the IMFTransform vtable in mf_interfaces.odin (declared `rawptr`), so
+    // it's invoked here via a local cast rather than widening that file.
+    get_input_current_type := cast(proc "stdcall" (this: ^IMFTransform, stream_id: u32, media_type: ^^IMFMediaType) -> windows.HRESULT)(encoder.GetInputCurrentType)
+    current_input: ^IMFMediaType
+    hr = get_input_current_type(encoder, 0, &current_input)
     if hr < 0 {
-        log.errorf("GetOutputCurrentType failed: 0x%08X", u32(hr))
-        encoder.Release(encoder)
-        return nil, nil, false
+        log.errorf("GetInputCurrentType failed: 0x%08X", u32(hr))
+    } else {
+        defer current_input.Release(current_input)
+        neg_in_rate, neg_in_channels, neg_in_bytes: u32
+        current_input.GetUINT32(current_input, &MF_MT_AUDIO_SAMPLES_PER_SECOND, &neg_in_rate)
+        current_input.GetUINT32(current_input, &MF_MT_AUDIO_NUM_CHANNELS, &neg_in_channels)
+        current_input.GetUINT32(current_input, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &neg_in_bytes)
+        log.infof("AAC input type negotiated: sample_rate requested=%v negotiated=%v, channels requested=%v negotiated=%v, avg_bytes_per_sec requested=%v negotiated=%v",
+            audio_sample_rate, neg_in_rate, audio_channels, neg_in_channels, input_avg_bytes, neg_in_bytes)
     }
-    defer current_output.Release(current_output)
 
+    // TODO: extract aac_config via MF_MT_USER_DATA
     aac_size: u32
     hr = current_output.GetBlobSize(current_output, &MF_MT_USER_DATA, &aac_size)
     if hr < 0 {
@@ -961,6 +833,20 @@ begin_aac_encoder :: proc(audio_sample_rate, audio_channels, audio_bitrate: u32)
         return nil, nil, false
     }
     aac_config = slice.clone(asc_blob[12:])
+
+    // Diagnostic: decode the ASC's leading fields to determine whether the
+    // [12:] slice offset above is correct, independent of what FLV's own
+    // audio tag header (capped at 44100 Hz) reports downstream.
+    if len(aac_config) >= 2 {
+        b0, b1 := aac_config[0], aac_config[1]
+        audio_object_type := (b0 >> 3) & 0x1F
+        sampling_freq_index := ((b0 & 0x07) << 1) | (b1 >> 7)
+        channel_config := (b1 >> 3) & 0x0F
+        log.infof("AAC ASC: raw MF_MT_USER_DATA blob (%v bytes)=%x, extracted ASC after [12:] (%v bytes)=%x, audio_object_type=%v sampling_freq_index=%v channel_config=%v",
+            aac_size, asc_blob, len(aac_config), aac_config, audio_object_type, sampling_freq_index, channel_config)
+    } else {
+        log.warnf("AAC ASC: extracted ASC too short to decode (%v bytes), raw MF_MT_USER_DATA blob (%v bytes)=%x", len(aac_config), aac_size, asc_blob)
+    }
 
     hr = encoder.ProcessMessage(encoder, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
     if hr < 0 {
@@ -1019,6 +905,73 @@ encode_aac_frame :: proc(encoder: ^IMFTransform, raw_pcm_samples: []u8, pcm_samp
 	}
 
 	return drain_transform_samples(encoder, 0)
+}
+
+// Non-allocating counterpart to encode_aac_frame: on_frame is invoked once per
+// AAC frame the MFT produces from this PCM block (usually one, but the MFT is
+// free to emit zero or several), with a byte slice backed by context.temp_allocator
+// that is only valid until the caller's next free_all.
+encode_aac_frame_into :: proc(
+	encoder: ^IMFTransform,
+	raw_pcm_samples: []u8,
+	pcm_sample_time, pcm_sample_duration: i64,
+	on_frame: proc(ctx: rawptr, frame: []u8),
+	ctx: rawptr,
+) -> (frame_count: int, ok: bool) {
+	buffer: ^IMFMediaBuffer
+	hr := MFCreateMemoryBuffer(u32(len(raw_pcm_samples)), &buffer)
+	if hr < 0 {
+		log.errorf("MFCreateMemoryBuffer failed: 0x%08X", u32(hr))
+		return 0, false
+	}
+
+	data: [^]u8
+	hr = buffer.Lock(buffer, &data, nil, nil)
+	if hr < 0 {
+		log.errorf("Lock failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return 0, false
+	}
+	mem.copy(data, raw_data(raw_pcm_samples), len(raw_pcm_samples))
+	hr = buffer.Unlock(buffer)
+	if hr < 0 {
+		log.errorf("Unlock failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return 0, false
+	}
+	buffer.SetCurrentLength(buffer, u32(len(raw_pcm_samples)))
+
+	sample: ^IMFSample
+	hr = MFCreateSample(&sample)
+	if hr < 0 {
+		log.errorf("MFCreateSample failed: 0x%08X", u32(hr))
+		buffer.Release(buffer)
+		return 0, false
+	}
+
+	sample.AddBuffer(sample, buffer)
+	sample.SetSampleTime(sample, pcm_sample_time)
+	sample.SetSampleDuration(sample, pcm_sample_duration)
+
+	hr = encoder.ProcessInput(encoder, 0, sample, 0)
+	sample.Release(sample)
+	buffer.Release(buffer)
+	if hr < 0 {
+		log.errorf("ProcessInput failed: 0x%08X", u32(hr))
+		return 0, false
+	}
+
+	raw_frames, drain_ok := drain_transform_samples(encoder, 0, context.temp_allocator)
+	if !drain_ok {
+		log.errorf("drain_transform_samples failed")
+		return 0, false
+	}
+
+	for frame_bytes in raw_frames {
+		on_frame(ctx, frame_bytes)
+		frame_count += 1
+	}
+	return frame_count, true
 }
 
 end_aac_encoder :: proc(encoder: ^IMFTransform) -> [][]u8 {

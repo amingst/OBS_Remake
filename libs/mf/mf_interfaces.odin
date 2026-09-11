@@ -61,30 +61,6 @@ IMFMediaType_VTable :: struct {
 IMFMediaType :: struct { using vtbl: ^IMFMediaType_VTable }
 
 // ---------------------------------------------------------------------
-// IMFSinkWriter : IUnknown  (14 slots)
-// ---------------------------------------------------------------------
-
-IMFSinkWriter_VTable :: struct {
-    QueryInterface: proc "stdcall" (this: ^IMFSinkWriter, riid: ^windows.GUID, ppv: ^rawptr) -> windows.HRESULT,
-    AddRef:         proc "stdcall" (this: ^IMFSinkWriter) -> u32,
-    Release:        proc "stdcall" (this: ^IMFSinkWriter) -> u32,
-
-    AddStream: proc "stdcall" (this: ^IMFSinkWriter, target_type: ^IMFMediaType, stream_index: ^u32) -> windows.HRESULT,
-    SetInputMediaType: proc "stdcall" (this: ^IMFSinkWriter, stream_index: u32, input_type: ^IMFMediaType, encoding_params: rawptr) -> windows.HRESULT,
-    BeginWriting: proc "stdcall" (this: ^IMFSinkWriter) -> windows.HRESULT,
-    WriteSample: proc "stdcall" (this: ^IMFSinkWriter, stream_index: u32, sample: ^IMFSample) -> windows.HRESULT,
-    SendStreamTick:      rawptr,
-    PlaceMarker:         rawptr,
-    NotifyEndOfSegment:  rawptr,
-    Flush:               rawptr,
-    Finalize: proc "stdcall" (this: ^IMFSinkWriter) -> windows.HRESULT,
-    GetServiceForStream: rawptr,
-    GetStatistics:       rawptr,
-}
-
-IMFSinkWriter :: struct { using vtbl: ^IMFSinkWriter_VTable }
-
-// ---------------------------------------------------------------------
 // IMFSample : IMFAttributes : IUnknown  (3 + 30 + 14 = 47 slots)
 // ---------------------------------------------------------------------
 

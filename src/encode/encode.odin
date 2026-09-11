@@ -9,7 +9,6 @@ import win32 "core:sys/windows"
 import "core:thread"
 import "libs:h264"
 
-@(private) g_state: State
 @(private) g_encoder:      ^Encoder
 @(private) g_encoder_refs: int
 
@@ -17,16 +16,11 @@ VIDEO_POOL_SLOTS :: 64
 AUDIO_POOL_SLOTS :: 64
 AUDIO_BUF_CAP :: 2048
 
-@(private)
-State :: struct {
-    sink_writer:        ^mf.IMFSinkWriter,
-    video_stream_index: u32,
-    audio_stream_index: u32,
-    has_audio:          bool,
-    width, height:      u32,
-    frame_duration:     i64,
-    recording:          bool,
-}
+// Matches audio.BLOCK_SAMPLES / audio.BLOCK_LATENCY (src/audio/mixer.odin) --
+// this package can't import src/audio without a cycle, so the values are
+// mirrored here, same as src/rtmp/commands_test.odin already does.
+AUDIO_BLOCK_SAMPLES :: 1024
+AUDIO_QUEUE_CAPACITY :: 4
 
 Encoder :: struct {
 	// consumers - main thread writes
@@ -69,10 +63,12 @@ Encoder :: struct {
 	wake_video, wake_audio, wake_timeout: u64,
 	pool_min_free: int,
 	dropped_frames: u32,
+	dropped_audio_frames: u32,
 	encoded_frames: u32,
 
 	log_sink: ^applog.Sink,
 	scratch: []u8,
+	audio_scratch: []u8,
 }
 
 Encoder_Config :: struct {
@@ -110,7 +106,9 @@ encoder_acquire :: proc(
 		pool_destroy(&e.video_pool)
 		pool_destroy(&e.audio_pool)
 		delete(e.scratch)
+		delete(e.audio_scratch)
 		mailbox_destroy(e.raw_mailbox)
+		audio_queue_destroy(e.pcm_queue)
 		free(e)
 	}
 
@@ -159,6 +157,10 @@ encoder_acquire :: proc(
 	e.scratch = make([]u8, int(e.width) * int(e.height) * 4)
 	e.raw_mailbox = mailbox_init(e.width, e.height)
 
+	audio_stride := AUDIO_BLOCK_SAMPLES * e.audio_channels * 2
+	e.audio_scratch = make([]u8, audio_stride)
+	e.pcm_queue = audio_queue_init(AUDIO_QUEUE_CAPACITY, audio_stride)
+
 	intrinsics.atomic_store(&e.running, true)
 	e.thread = thread.create(encoder_thread)
 	if e.thread == nil {
@@ -202,11 +204,12 @@ encoder_thread :: proc(t: ^thread.Thread) {
 	if !e.init_ok do return
 
 	for intrinsics.atomic_load_explicit(&e.running, .Acquire) {
+		// handles order and the switch case labels below must stay tied together
 		handles := [2]win32.HANDLE{e.video_event, e.audio_event}
 		r := win32.WaitForMultipleObjects(2, &handles[0], false, 200)
 		switch r {
-		case win32.WAIT_OBJECT_0:     e.wake_audio += 1   // fires on VIDEO
-		case win32.WAIT_OBJECT_0 + 1: e.wake_video += 1   // fires on AUDIO
+		case win32.WAIT_OBJECT_0:     e.wake_video += 1
+		case win32.WAIT_OBJECT_0 + 1: e.wake_audio += 1
 		case win32.WAIT_TIMEOUT:      e.wake_timeout += 1
 		case:
 			log.errorf("WaitForMultipleObjects failed: 0x%08X", u32(r))
@@ -246,8 +249,70 @@ encoder_thread :: proc(t: ^thread.Thread) {
 }
 
 @(private)
-drain_audio :: proc(e: ^Encoder) {
+Aac_Sink :: struct {
+	e:              ^Encoder,
+	block_pts:      i64,
+	frame_duration: i64,
+	index:          int,
+}
 
+@(private)
+aac_frame_callback :: proc(ctx: rawptr, frame: []u8) {
+	sink := (^Aac_Sink)(ctx)
+	e := sink.e
+	defer sink.index += 1
+
+	aud_group, aud_ok := pool_acquire(&e.audio_pool)
+	if !aud_ok {
+		e.dropped_audio_frames += 1
+		if e.dropped_audio_frames % 60 == 1 {
+			log.warnf("audio pool exhausted, dropped %v frame(s) so far", e.dropped_audio_frames)
+		}
+		return
+	}
+
+	group_reset(aud_group)
+	append(&aud_group.buf, ..frame)
+	aud_group.pts = sink.block_pts + i64(sink.index) * sink.frame_duration
+	aud_group.duration = sink.frame_duration
+	group_finish(aud_group)
+
+	sync.lock(&e.consumers_mutex)
+	defer sync.unlock(&e.consumers_mutex)
+
+	count := 0
+	for c in e.consumers[:e.consumer_count] {
+		if c.put_audio != nil do count += 1
+	}
+
+	if !group_publish(aud_group, count) do return   // zero receivers; already recycled
+
+	for c in e.consumers[:e.consumer_count] {
+		if c.put_audio != nil do c.put_audio(c.ctx, aud_group)
+	}
+	for c in e.consumers[:e.consumer_count] {
+		if c.put_audio != nil do win32.SetEvent(c.event)
+	}
+}
+
+@(private)
+drain_audio :: proc(e: ^Encoder) {
+	pts, ok := audio_queue_take(e.pcm_queue, e.audio_scratch)
+	if !ok do return
+
+	// AAC LC emits 1024 samples per frame regardless of input block size;
+	// AUDIO_BLOCK_SAMPLES happens to match that, so the same duration serves
+	// both as this PCM block's input duration and each output frame's duration.
+	aac_frame_duration := i64(AUDIO_BLOCK_SAMPLES) * 10_000_000 / i64(e.audio_sample_rate)
+
+	sink := Aac_Sink{e = e, block_pts = pts, frame_duration = aac_frame_duration}
+	_, enc_ok := mf.encode_aac_frame_into(
+		e.audio_encoder, e.audio_scratch, pts, aac_frame_duration,
+		aac_frame_callback, &sink,
+	)
+	if !enc_ok {
+		log.warnf("encode_aac_frame_into failed")
+	}
 }
 
 @(private)
@@ -321,6 +386,10 @@ create_mfts :: proc(e: ^Encoder) -> bool {
 		return false
 	}
 
+	if !mf.set_encoder_gop_size(e.encoder, e.fps * 2) {
+		log.warnf("set_encoder_gop_size failed -- encoder will use its default keyframe interval")
+	}
+
 	audio_ok: bool
 	e.audio_encoder, e.aac_config, audio_ok = mf.begin_aac_encoder(
 		e.audio_sample_rate, e.audio_channels, e.audio_bitrate)
@@ -339,6 +408,7 @@ create_mfts :: proc(e: ^Encoder) -> bool {
 		e.pps = nil
 		return false
 	}
+	log.debugf("encoder created: sps=%v pps=%v sample_rate=%v", e.sps, e.pps, e.audio_sample_rate)
 	return true
 }
 
@@ -367,87 +437,11 @@ encoder_release :: proc() {
 	win32.CloseHandle(e.video_event)
 	win32.CloseHandle(e.audio_event)
 	delete(e.scratch)
+	delete(e.audio_scratch)
 	mailbox_destroy(e.raw_mailbox)
+	audio_queue_destroy(e.pcm_queue)
 	free(e)
 
 	g_encoder = nil
 }
 
-start :: proc(
-    output_path: string,
-    width, height, fps: u32,
-    video_bitrate: u32 = 4_000_000,
-    audio_sample_rate: u32 = 0,  // 0 = no audio stream
-    audio_channels: u32 = 0,
-    audio_bitrate: u32 = 16_000, // bytes/sec - must be 12000/16000/20000/24000 for mono/stereo
-) -> bool {
-    if g_state.recording {
-        log.errorf("encode.start called with an already active recording")
-        return false
-    }
-
-    ok := mf.begin_recording(
-        output_path, width, height, fps, video_bitrate,
-        audio_sample_rate, audio_channels, audio_bitrate,
-        &g_state.sink_writer,
-        &g_state.video_stream_index,
-        &g_state.audio_stream_index,
-    )
-    if !ok do return false
-
-    g_state.width = width
-    g_state.height = height
-    g_state.frame_duration = i64(10_000_000) / i64(fps)
-    g_state.has_audio = audio_channels > 0
-    g_state.recording = true
-    return true
-}
-
-push_video :: proc(pixels: []u8, pts_100ns: i64) -> bool {
-    if !g_state.recording {
-        log.errorf("encode.push_video called with no active recording")
-        return false
-    }
-
-    expected := int(g_state.width) * int(g_state.height) * 4
-    if len(pixels) != expected {
-        log.errorf("encode.push_video: expected %d bytes, got %d", expected, len(pixels))
-        return false
-    }
-
-    return mf.write_video_frame(g_state.sink_writer, g_state.video_stream_index, pixels, pts_100ns, g_state.frame_duration)
-}
-
-// Caller supplies the timestamp explicitly, in 100ns units - the video/audio
-// clock strategy isn't decided yet, so this package isn't computing one for
-// audio internally either. samples is already-converted interleaved 16-bit
-// PCM matching whatever audio_channels was passed to start.
-push_audio :: proc(samples: []u8, pts_100ns, duration_100ns: i64) -> bool {
-    if !g_state.recording {
-        log.errorf("encode.push_audio called with no active recording")
-        return false
-    }
-    if !g_state.has_audio {
-        log.errorf("encode.push_audio called but recording was started without an audio stream")
-        return false
-    }
-    if duration_100ns <= 0 {
-        log.errorf("encode.push_audio: duration_100ns must be > 0 (zero duration causes a divide-by-zero inside the AAC encoder's ProcessOutput)")
-        return false
-    }
-
-    return mf.write_audio_frame(g_state.sink_writer, g_state.audio_stream_index, samples, pts_100ns, duration_100ns)
-}
-
-stop :: proc() -> bool {
-    if !g_state.recording {
-        log.errorf("encode.stop called with no active recording")
-        return false
-    }
-
-    // NOTE: Look to see if I should be handling !ok
-    ok := mf.end_recording(g_state.sink_writer)
-    g_state.sink_writer = nil
-    g_state.recording = false
-    return ok;
-}
