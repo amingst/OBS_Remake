@@ -229,7 +229,7 @@ log_device_format :: proc(dev: Device_Info) {
 
     log.infof("%q: %v Hz, %v ch, %v-bit, tag=0x%04X, block=%v",
         dev.name, wfx.nSamplesPerSec, wfx.nChannels,
-        wfx.wBitsPerSample, wfx.wFormatTag, wfx.nBlockAlign)
+        wfx.wBitsPerSample, u16(wfx.wFormatTag), wfx.nBlockAlign)
 }
 
 @(private="file")

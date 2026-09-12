@@ -178,12 +178,18 @@ from_dto :: proc(dto: ^Settings_DTO, cfg: ^Profile) {
         fps           = dto.video.fps,
     }
 
+    stream_bitrate := dto.stream.bitrate
+    if stream_bitrate <= 0 {
+        log.warnf("settings: bitrate is %v, substituting default %v", stream_bitrate, DEFAULT_BITRATE)
+        stream_bitrate = DEFAULT_BITRATE
+    }
+
     cfg.stream = {
         host       = strings.clone(dto.stream.host),
         port       = dto.stream.port,
         app        = strings.clone(dto.stream.app),
         tc_url     = strings.clone(dto.stream.tc_url),
         stream_key = strings.clone(dto.stream.stream_key),
-        bitrate    = dto.stream.bitrate,
+        bitrate    = stream_bitrate,
     }
 }

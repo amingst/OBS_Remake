@@ -1,6 +1,7 @@
 package audio
 
 import "core:sys/windows"
+import "core:time"
 import "vendor:windows/wasapi"
 import "core:log"
 import "core:thread"
@@ -11,6 +12,9 @@ import "../applog"
 IID_IAudioCaptureClient := &windows.IID{
     0xC8ADBD64, 0xE71E, 0x48a0, {0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17},
 }
+
+// {00000001-0000-0010-8000-00aa00389b71}
+KSDATAFORMAT_SUBTYPE_PCM := windows.GUID{0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}}
 
 IAudioCaptureClient :: struct #raw_union {
     using iaudiocaptureclient_vtable: ^IAudioCaptureClient_VTable,
@@ -53,6 +57,8 @@ Stream :: struct {
     ring: Ring,
     thread: ^thread.Thread,
     running: bool,
+    starved_since: time.Time,
+    starvation_logged: bool,
 }
 
 open_stream  :: proc(s: ^Stream, device_id: string, is_loopback: bool) -> bool {
@@ -89,6 +95,27 @@ open_stream  :: proc(s: ^Stream, device_id: string, is_loopback: bool) -> bool {
         return false
     }
     defer windows.CoTaskMemFree(wfx)
+
+    // Log the actual sample format so we know whether the f32 cast in
+    // drain_packets is valid for this device.
+    if wfx.wFormatTag == .EXTENSIBLE && wfx.cbSize >= 22 {
+        wfxe := (^wasapi.WAVEFORMATEXTENSIBLE)(wfx)
+        sf := wfxe.SubFormat
+        if sf == wasapi.KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+            log.infof("stream %q: SubFormat=KSDATAFORMAT_SUBTYPE_IEEE_FLOAT", device_id)
+        } else if sf == KSDATAFORMAT_SUBTYPE_PCM {
+            log.infof("stream %q: SubFormat=KSDATAFORMAT_SUBTYPE_PCM", device_id)
+        } else {
+            log.infof("stream %q: SubFormat={%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                device_id,
+                sf.Data1, sf.Data2, sf.Data3,
+                sf.Data4[0], sf.Data4[1], sf.Data4[2], sf.Data4[3],
+                sf.Data4[4], sf.Data4[5], sf.Data4[6], sf.Data4[7])
+        }
+    } else {
+        log.infof("stream %q: wFormatTag=0x%04X (not EXTENSIBLE)", device_id, u16(wfx.wFormatTag))
+    }
+
     flags := u32(wasapi.AUDCLNT_FLAG.STREAM_EVENTCALLBACK)
     if is_loopback do flags |= u32(wasapi.AUDCLNT_FLAG.STREAM_LOOPBACK)
     BUFFER_DURATION :: 100_000   // 10ms in 100ns units
@@ -192,8 +219,20 @@ drain_packets :: proc(s: ^Stream) {
         flags: u32
 
         if hr := s.capture->GetBuffer(&data, &frames, &flags, nil, nil); windows.FAILED(hr) do return
-        if flags & 0x2 == 0 && data != nil {
-            samples := (cast([^]f32)data)[:frames * u32(s.channels)]
+
+        count := frames * u32(s.channels)
+        if flags & 0x2 != 0 {
+            // AUDCLNT_BUFFERFLAGS_SILENT — write zeros so the ring
+            // advances at the device clock rate.
+            silence: [4096]f32
+            for written := u32(0); written < count; {
+                n := min(int(count - written), len(silence))
+                w := ring_write(&s.ring, silence[:n])
+                written += u32(w)
+                if w < n do break
+            }
+        } else if data != nil {
+            samples := (cast([^]f32)data)[:count]
             if n := ring_write(&s.ring, samples); n < len(samples) {
                 //log.debugf("audio ring overflow: dropped %v samples", len(samples) - n)
             }

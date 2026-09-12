@@ -14,18 +14,18 @@ Applied :: struct {
 	video: settings.Video_Settings,
 }
 
-reconcile :: proc(applied: ^Applied, desired: ^settings.Profile, device: ^d3d11.IDevice, target: ^render.Target, recording: bool) {
+reconcile :: proc(applied: ^Applied, desired: ^settings.Profile, device: ^d3d11.IDevice, target: ^render.Target, output_active: bool) {
 	// Canvas resolution
 	if desired.video.canvas_width  != applied.video.canvas_width ||
 	   desired.video.canvas_height != applied.video.canvas_height {
-		if recording {
+		if output_active {
 			// The encoder was configured with the applied dimensions; resizing
-			// the target out from under it mid-stream would break the
-			// recording. Revert desired rather than just skipping the block,
-			// so this check doesn't re-fire every frame for as long as
-			// recording continues -- same shape as the invalid-resolution
-			// case below.
-			log.warnf("ignoring canvas resolution change %vx%v -> %vx%v while recording, keeping %vx%v",
+			// the target out from under it mid-run would break any active
+			// output (recording or streaming). Revert desired rather than just
+			// skipping the block, so this check doesn't re-fire every frame
+			// for as long as the output continues -- same shape as the
+			// invalid-resolution case below.
+			log.warnf("ignoring canvas resolution change %vx%v -> %vx%v while output is active, keeping %vx%v",
 				applied.video.canvas_width, applied.video.canvas_height,
 				desired.video.canvas_width, desired.video.canvas_height,
 				applied.video.canvas_width, applied.video.canvas_height)

@@ -96,8 +96,10 @@ test_mp4_sink_start_stop_leak_clean :: proc(t: ^testing.T) {
 	frame_duration := i64(10_000_000) / i64(FPS)
 	for i in 0 ..< FRAME_COUNT {
 		pts := i64(i) * frame_duration
-		encode.mailbox_put(enc.raw_mailbox, bgra, WIDTH, HEIGHT, pts)
-		windows.SetEvent(enc.video_event)
+		encode.mailbox_put(enc.raw_mailbox, bgra, WIDTH, HEIGHT)
+		// Video wake is now driven by the encoder's waitable timer, not an
+		// event from the main thread. The encoder thread picks up mailbox
+		// contents on its next timer tick.
 		if encode.audio_queue_put(enc.pcm_queue, pcm, pts) {
 			windows.SetEvent(enc.audio_event)
 		}
@@ -105,7 +107,11 @@ test_mp4_sink_start_stop_leak_clean :: proc(t: ^testing.T) {
 	}
 	windows.Sleep(300) // let the encoder thread and this sink's feeder thread drain
 
-	mp4_sink_stop(sink)
+	mp4_sink_signal_stop(sink)
+	for !mp4_sink_is_stopped(sink) {
+		windows.Sleep(50)
+	}
+	mp4_sink_reap(sink)
 
 	info, stat_err := os.stat(out_path, context.allocator)
 	if testing.expect(t, stat_err == nil, "os.stat on output file failed") {

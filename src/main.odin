@@ -35,6 +35,8 @@ Output_State :: struct {
 	streaming:		bool,
 	rtmp_stream:	^rtmp.Rtmp_Stream,
 	mp4_sink:		^mp4.Mp4_Sink,
+	finalizing_sink:	^mp4.Mp4_Sink,
+	enc:			^encode.Encoder,
 }
 
 main :: proc() {
@@ -321,35 +323,19 @@ main :: proc() {
 	}
 	defer mf.MFShutdown()
 
-	// Diagnostic wiring: prove the encoder thread's acquire/release lifecycle
-	// works end to end before any real work is routed through it. Held for
-	// the whole app lifetime -- no consumers registered, no frames pushed.
-	// Registered after MFStartup/audio init so its LIFO release runs before
-	// mf.MFShutdown and audio.shutdown, while the encoder thread's COM/MF
-	// calls are still valid.
-	encoder_cfg := encode.Encoder_Config{
-		width              = preview_target.width,
-		height             = preview_target.height,
-		fps                = u32(cfg.video.fps),
-		bitrate            = u32(cfg.stream.bitrate),
-		audio_sample_rate  = 48000,
-		audio_channels     = 2,
-		audio_bitrate      = 16000,
-		frame_duration     = i64(10_000_000) / i64(cfg.video.fps),
-		log_sink           = log_sink,
-	}
-	enc, encoder_ok := encode.encoder_acquire(encoder_cfg)
-	if !encoder_ok {
-		log.error("encoder_acquire failed; continuing without encoder thread")
-	}
-	defer if encoder_ok do encode.encoder_release()
-
 	// Mixer state — allocated once, freed at exit.
 	CHANNELS :: 2
 	mix_buf := make([]f32, audio.BLOCK_SAMPLES * CHANNELS)
 	defer delete(mix_buf)
 	blocks_emitted: u64
 	mixer_started := false
+
+	// Per-second audio instrumentation — diffs against previous snapshot.
+	audio_diag_last_tick := time.tick_now()
+	audio_diag_last_blocks: u64
+	audio_diag_last_aac_recv: u64
+	audio_diag_last_ps_attempted: u64
+	audio_diag_last_ps_dropped: u64
 
 	// The active scene collection. Same load-active/pick-first/create-Default
 	// shape as the profile selection above; unlike profiles there's no
@@ -431,9 +417,6 @@ main :: proc() {
 
 	output: Output_State
 
-	video_frame_count: u64
-	using_audio_clock := false // tracks which PTS mode is active, for logging transitions
-
 	frame_bytes := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
 
 	// Main loop
@@ -473,7 +456,7 @@ main :: proc() {
 		// Ordering constraints and the reasoning live in reconcile.odin; the
 		// only thing that matters here is that this runs well before
 		// im.NewFrame().
-		reconcile(&applied, &cfg, win.device, &preview_target, output.recording)
+		reconcile(&applied, &cfg, win.device, &preview_target, output.recording || output.streaming || output.finalizing_sink != nil)
 
 		// Check each frame for resize after each reconcile call
 		needed := int(preview_target.width) * int(preview_target.height) * 4
@@ -528,17 +511,38 @@ main :: proc() {
 		// output starting and the first pushed frame would hand the encoder
 		// a resolution that doesn't match what it was configured with.
 		if req := ui_state.controls.request; req != .None {
-			// blocks_emitted/video_frame_count/using_audio_clock feed the one
-			// PTS timeline shared by every consumer of enc (RTMP, MP4 sink,
-			// ...) -- they must track the encoder's lifetime, never a single
-			// output's. This used to reset them here on a recording start so
-			// that output's first sample would land at PTS 0, but that
-			// rebased every other active consumer's timestamps out from under
-			// it too (see the mp4 sink recon report). Per-output "first
-			// sample at 0" is now handled downstream, per consumer, by
-			// rebasing at the sink (see mp4_sink.odin's feeder thread).
+			// blocks_emitted feeds the audio PTS timeline. Video PTS is now
+			// computed on the encoder thread from its tick_index, so only the
+			// audio counter needs to track the encoder's lifetime here.
+			pre_blocks := blocks_emitted
 			handle_controls_request(req, &ui_state.controls, &output,
-				&paths, &preview_target, cfg.video.fps, cfg.stream, log_sink, enc)
+				&paths, &preview_target, cfg.video.fps, cfg.stream, log_sink,
+				&blocks_emitted)
+			// ensure_encoder resets blocks_emitted to 0; reset the diag
+			// snapshots so the unsigned delta doesn't wrap.
+			if blocks_emitted < pre_blocks {
+				audio_diag_last_blocks = 0
+				audio_diag_last_aac_recv = 0
+				audio_diag_last_ps_attempted = 0
+				audio_diag_last_ps_dropped = 0
+				audio_diag_last_tick = time.tick_now()
+			}
+		}
+
+		// Reap a finalizing MP4 sink once its feeder thread is done.  Also
+		// catches auto-stops (spillover ceiling breach) on the active sink.
+		if output.mp4_sink != nil && mp4.mp4_sink_is_stopped(output.mp4_sink) {
+			log.warn("recording auto-stopped (spillover ceiling breach)")
+			mp4.mp4_sink_reap(output.mp4_sink)
+			output.mp4_sink = nil
+			output.recording = false
+			maybe_release_encoder(&output)
+		}
+		if output.finalizing_sink != nil && mp4.mp4_sink_is_stopped(output.finalizing_sink) {
+			mp4.mp4_sink_reap(output.finalizing_sink)
+			output.finalizing_sink = nil
+			maybe_release_encoder(&output)
+			log.info("recording finalized")
 		}
 
 		// Neutral fallback for "no scene selected" -- selected_id 0, or the
@@ -666,14 +670,45 @@ main :: proc() {
 				pts_100ns := i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
 				pcm_buf := f32_to_pcm16(mix_buf)
 
-				if encoder_ok {
-					if encode.audio_queue_put(enc.pcm_queue, pcm_buf, pts_100ns) {
-						win32.SetEvent(enc.audio_event)
+				if output.enc != nil {
+					if encode.audio_queue_put(output.enc.pcm_queue, pcm_buf, pts_100ns) {
+						win32.SetEvent(output.enc.audio_event)
 					}
 				}
 
 				blocks_emitted += 1
 			}
+		}
+
+		// Per-second audio instrumentation.
+		if time.duration_seconds(time.tick_since(audio_diag_last_tick)) >= 1.0 {
+			aac_recv: u64
+			ps_attempted: u64
+			ps_dropped: u64
+			if output.mp4_sink != nil {
+				aac_recv = output.mp4_sink.diag.put_audio_groups_received
+				ps_attempted = output.mp4_sink.diag.audio_stats.attempted
+				ps_dropped = output.mp4_sink.diag.audio_stats.other_fail
+			} else {
+				// No active sink — reset snapshots so they don't underflow
+				// when a new sink starts with fresh counters.
+				audio_diag_last_aac_recv = 0
+				audio_diag_last_ps_attempted = 0
+				audio_diag_last_ps_dropped = 0
+			}
+			d_blocks := blocks_emitted - audio_diag_last_blocks
+			d_aac := aac_recv - audio_diag_last_aac_recv
+			d_attempts := ps_attempted - audio_diag_last_ps_attempted
+			d_drops := ps_dropped - audio_diag_last_ps_dropped
+			if d_blocks > 0 || d_aac > 0 || d_attempts > 0 {
+				log.infof("audio/sec: mixed_blocks=%v aac_to_sink=%v ps_attempts=%v ps_drops=%v",
+					d_blocks, d_aac, d_attempts, d_drops)
+			}
+			audio_diag_last_blocks = blocks_emitted
+			audio_diag_last_aac_recv = aac_recv
+			audio_diag_last_ps_attempted = ps_attempted
+			audio_diag_last_ps_dropped = ps_dropped
+			audio_diag_last_tick = time.tick_now()
 		}
 
 		// -- Video push ---------------------------------------------------
@@ -688,44 +723,20 @@ main :: proc() {
 			// fed these flipped rows whenever recording+streaming were both
 			// active, so extending this block to run for streaming-only
 			// doesn't change that.
-			video_pts: i64
-			// mixer_started gates this, not just len(inputs) > 0: audio sources
-			// can exist but still be warming up (ring buffers below
-			// audio.mixer_ready's threshold), during which blocks_emitted never
-			// advances. Previously that warm-up window fell into the "audio
-			// clock" branch anyway and produced video_pts == 0 for every frame
-			// until mixer_started flipped true -- FLV/RTMP require strictly
-			// increasing timestamps per stream, so ffmpeg silently dropped
-			// every repeated pts=0 frame, producing no output for the whole
-			// warm-up window (up to ~53s observed, bounded by the slowest
-			// input's ring fill time). Falling back to the frame counter during
-			// warm-up keeps video_pts valid and monotonic from frame one.
-			want_audio_clock := len(inputs) > 0 && mixer_started
-			if want_audio_clock {
-				video_pts = i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
-			} else {
-				video_pts = i64(video_frame_count) * (i64(10_000_000) / i64(cfg.video.fps))
-			}
-			if want_audio_clock != using_audio_clock {
-				if want_audio_clock {
-					log.info("video PTS: switching to audio-master clock")
-				} else {
-					log.info("video PTS: switching to frame-counter fallback (no audio sources, or audio sources still warming up)")
-				}
-				using_audio_clock = want_audio_clock
-			}
+			//
+			// Video PTS is now computed on the encoder thread from a
+			// high-resolution timer tick count. The main thread just pushes
+			// the latest BGRA into the mailbox; the encoder picks it up on
+			// the next timer tick (or re-encodes the previous frame if the
+			// desktop is static).
 			read_ok := render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true)
 
 			if !read_ok {
 				log.warnf("read_target failed (recording=%v streaming=%v); frame_bytes left stale from the last successful read", output.recording, output.streaming)
 			}
 
-			if read_ok {
-				if encoder_ok {
-					encode.mailbox_put(enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height, video_pts)
-					win32.SetEvent(enc.video_event)
-				}
-				video_frame_count += 1
+			if read_ok && output.enc != nil {
+				encode.mailbox_put(output.enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height)
 			}
 		}
 		@static dumped := false
@@ -756,6 +767,7 @@ main :: proc() {
         // every frame, for the Controls panel to read.
         ui_state.controls.recording = output.recording
         ui_state.controls.streaming = output.streaming
+        ui_state.controls.finalizing = output.finalizing_sink != nil
 
         ui.draw(&ui_state, &cfg, &doc, &clear_color, preview_tex, outputs, profile_infos, collection_infos,
             f32(preview_target.width), f32(preview_target.height), audio_devices)
@@ -790,17 +802,52 @@ main :: proc() {
 
 	delete(frame_bytes)
 
-	// Finalize any still-active recording/stream before persisting. Previously
-	// there was no such call here, so closing the window mid-recording left
-	// the MP4's sink writer never finalized -- this closes that gap.
+	// Finalize any still-active recording/stream before releasing the encoder.
+	// Both consumers must be fully stopped/joined before encoder_release, which
+	// joins the encoder thread and asserts no outstanding pool groups remain.
 	if output.recording {
-		log.info("finalizing recording on exit")
-		mp4.mp4_sink_stop(output.mp4_sink)
+		log.info("signalling recording stop on exit")
+		mp4.mp4_sink_signal_stop(output.mp4_sink)
+		output.finalizing_sink = output.mp4_sink
 		output.mp4_sink = nil
+		output.recording = false
 	}
 	if output.streaming {
 		log.info("closing stream on exit")
 		rtmp.rtmp_stream_close(output.rtmp_stream)
+		output.streaming = false
+	}
+
+	// Wait for the finalizing sink with a 10s timeout.  The feeder thread
+	// calls consumer_remove internally, so by the time it sets Stopped the
+	// consumer is already unregistered and encoder_release is safe.
+	if output.finalizing_sink != nil {
+		EXIT_TIMEOUT_MS :: 10_000
+		start_tick := time.tick_now()
+		for {
+			if mp4.mp4_sink_is_stopped(output.finalizing_sink) {
+				mp4.mp4_sink_reap(output.finalizing_sink)
+				output.finalizing_sink = nil
+				break
+			}
+			if time.duration_milliseconds(time.tick_since(start_tick)) >= EXIT_TIMEOUT_MS {
+				log.warn("mp4 sink finalize timed out after 10s, abandoning — skipping encoder_release")
+				break
+			}
+			win32.Sleep(50)
+		}
+		if output.finalizing_sink != nil {
+			// Timed out — the feeder thread is still running.  Releasing the
+			// encoder now would join its thread and assert no pool groups
+			// remain, but the feeder may still hold refs.  Let the process
+			// exit tear everything down instead.
+			return
+		}
+	}
+
+	if output.enc != nil {
+		encode.encoder_release()
+		output.enc = nil
 	}
 
 	// Persist on a clean shutdown. Everything that reaches here left the loop
@@ -908,33 +955,85 @@ handle_profile_request :: proc(
 	}
 }
 
+// Release encoder when the last output stops.  A finalizing sink still
+// has its consumer registered (the feeder thread is still running), so
+// the encoder must stay alive until the sink is reaped.
+@(private = "file")
+maybe_release_encoder :: proc(output: ^Output_State) {
+	if output.recording || output.streaming || output.finalizing_sink != nil do return
+	encode.encoder_release()
+	output.enc = nil
+}
+
 // Dispatches a Controls panel request raised by ui. Same one-shot contract as
 // handle_profile_request: the request is always cleared, whether or not the
 // action actually went through. Starting while already recording, or
 // stopping while not, is a no-op rather than a double call into encode.
+//
+// Encoder lifecycle: the first output start acquires the encoder; the last
+// output stop releases it. The encoder's internal refcount is at most 1 from
+// main's perspective (the second output reuses output.enc without a second
+// acquire). Video PTS is now computed on the encoder thread from a timer tick
+// count; only the audio block counter (blocks_emitted) is reset here.
 @(private = "file")
 handle_controls_request :: proc(
-	req:         ui.Controls_Request,
-	state:       ^ui.Controls_State,
-	output:		 ^Output_State,
-	paths:       ^config.Paths,
-	target:      ^render.Target,
-	fps:         i32,
-	stream_cfg:  settings.Stream_Settings,
-	log_sink:    ^applog.Sink,
-	enc:         ^encode.Encoder,
+	req:               ui.Controls_Request,
+	state:             ^ui.Controls_State,
+	output:            ^Output_State,
+	paths:             ^config.Paths,
+	target:            ^render.Target,
+	fps:               i32,
+	stream_cfg:        settings.Stream_Settings,
+	log_sink:          ^applog.Sink,
+	blocks_emitted:    ^u64,
 ) {
 	state.request = .None
+
+	// Shared helper: acquire encoder on the first output start. Returns false
+	// if the acquire fails, in which case the caller should bail.
+	ensure_encoder :: proc(
+		output: ^Output_State, target: ^render.Target, fps: i32,
+		stream_cfg: settings.Stream_Settings, log_sink: ^applog.Sink,
+		blocks_emitted: ^u64,
+	) -> bool {
+		if output.enc != nil do return true
+		if fps <= 0 {
+			log.errorf("ensure_encoder: fps is %v, cannot compute frame_duration", fps)
+			return false
+		}
+		encoder_cfg := encode.Encoder_Config{
+			width              = target.width,
+			height             = target.height,
+			fps                = u32(fps),
+			bitrate            = u32(stream_cfg.bitrate),
+			audio_sample_rate  = 48000,
+			audio_channels     = 2,
+			audio_bitrate      = 16000,
+			frame_duration     = i64(10_000_000) / i64(fps),
+			log_sink           = log_sink,
+		}
+		enc, enc_ok := encode.encoder_acquire(encoder_cfg)
+		if !enc_ok do return false
+		output.enc = enc
+		blocks_emitted^ = 0
+		return true
+	}
 
 	#partial switch req {
 	case .Start_Recording:
 		if output.recording do return
+		if output.finalizing_sink != nil {
+			log.warn("recording requested while previous recording is still finalizing")
+			return
+		}
 		if paths.videos == "" {
 			log.warn("recording requested, but no videos directory is available")
 			return
 		}
-		if enc == nil {
-			log.warn("recording requested, but no encoder is available")
+
+		if !ensure_encoder(output, target, fps, stream_cfg, log_sink,
+			blocks_emitted) {
+			log.warn("recording requested, but encoder_acquire failed")
 			return
 		}
 
@@ -947,6 +1046,7 @@ handle_controls_request :: proc(
 		out_path, jerr := filepath.join({paths.videos, filename})
 		if jerr != nil {
 			log.warnf("could not build recording output path: %v", jerr)
+			maybe_release_encoder(output)
 			return
 		}
 		// mp4_sink_start (via mf.begin_mp4_sink -> MFCreateFile) converts this
@@ -954,21 +1054,23 @@ handle_controls_request :: proc(
 		// so it's safe to free right after the call returns.
 		defer delete(out_path)
 
-		sink, ok := mp4.mp4_sink_start(enc, out_path)
-		if ok {
+		sink, sink_ok := mp4.mp4_sink_start(output.enc, out_path)
+		if sink_ok {
 			output.mp4_sink = sink
 			output.recording = true
 			log.infof("recording started (video+audio) -> %v", out_path)
 		} else {
 			log.warn("failed to start recording (cause logged above)")
+			maybe_release_encoder(output)
 		}
 
 	case .Stop_Recording:
 		if !output.recording do return
-		mp4.mp4_sink_stop(output.mp4_sink)
+		mp4.mp4_sink_signal_stop(output.mp4_sink)
+		output.finalizing_sink = output.mp4_sink
 		output.mp4_sink = nil
 		output.recording = false
-		log.info("recording stopped")
+		log.info("recording stop signalled, finalizing")
 
 	case .Start_Streaming:
 		if output.streaming do return
@@ -977,8 +1079,9 @@ handle_controls_request :: proc(
 			return
 		}
 
-		if enc == nil {
-			log.warn("streaming requested, but no encoder is available")
+		if !ensure_encoder(output, target, fps, stream_cfg, log_sink,
+			blocks_emitted) {
+			log.warn("streaming requested, but encoder_acquire failed")
 			return
 		}
 
@@ -986,16 +1089,17 @@ handle_controls_request :: proc(
 
 		// stream_index 0: a single stream is all this build supports today.
 		// A real id generator/registry belongs with fan-out, not here.
-		stream, ok := rtmp.rtmp_stream_start(
-			enc, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
+		stream, stream_ok := rtmp.rtmp_stream_start(
+			output.enc, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
 			stream_cfg.stream_key, STREAM_AUDIO_CHANNELS,
 			log_sink, 0)
-		if ok {
+		if stream_ok {
 			output.rtmp_stream = stream
 			output.streaming = true
 			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
 		} else {
 			log.warn("failed to start streaming (cause logged above)")
+			maybe_release_encoder(output)
 		}
 
 	case .Stop_Streaming:
@@ -1003,6 +1107,7 @@ handle_controls_request :: proc(
 		rtmp.rtmp_stream_close(output.rtmp_stream)
 		output.rtmp_stream = nil
 		output.streaming = false
+		maybe_release_encoder(output)
 		log.info("streaming stopped")
 	}
 }

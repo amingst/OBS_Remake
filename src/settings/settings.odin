@@ -26,6 +26,13 @@ Stream_Settings :: struct {
     bitrate: i32,
 }
 
+// 2.5 Mbps — a conservative but usable 1080p default. Twitch recommends
+// 3000–6000 kbps for 1080p; YouTube recommends 4500–9000 kbps. 2500 kbps
+// sits below both ranges but produces watchable output and is safe for
+// most uplinks. Used as the floor in from_dto when loading a profile that
+// predates the bitrate field (JSON key absent → zero after unmarshal).
+DEFAULT_BITRATE :: 2_500_000
+
 Profile :: struct {
     id: string,
     name: string,
@@ -59,7 +66,7 @@ create_default :: proc() -> Profile {
             app = strings.clone(""),
             tc_url = strings.clone(""),
             stream_key = strings.clone(""),
-            bitrate = 2_000_000,
+            bitrate = DEFAULT_BITRATE,
         },
     }
 }

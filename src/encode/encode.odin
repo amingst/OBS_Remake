@@ -31,7 +31,6 @@ Encoder :: struct {
 	// inbound from main thread
 	raw_mailbox: ^Raw_Mailbox,
 	pcm_queue: ^Raw_Audio_Queue,
-	video_event: win32.HANDLE,
 	audio_event: win32.HANDLE,
 
 	// MFT's created and owned
@@ -54,13 +53,20 @@ Encoder :: struct {
 	ready_event: win32.HANDLE,
 	init_ok: bool,
 
+	// video timer — created on the encoder thread, paces drain_video.
+	// Video PTS is tick_index * frame_duration; tick_index counts emitted
+	// groups, not timer ticks, so the timeline starts at zero.
+	timer_handle: win32.HANDLE,
+	tick_index: u64,
+	has_frame_ever: bool,
+
 	// config, frozen on first acquire
 	width, height, fps, bitrate: u32,
 	audio_sample_rate, audio_channels, audio_bitrate: u32,
 	frame_duration: i64,
 
 	// diagnostics, logged at release
-	wake_video, wake_audio, wake_timeout: u64,
+	wake_timer, wake_audio, wake_timeout: u64,
 	pool_min_free: int,
 	dropped_frames: u32,
 	dropped_audio_frames: u32,
@@ -92,6 +98,17 @@ nalu_callback :: proc(ctx: rawptr, nalu: []u8) {
 encoder_acquire :: proc(
 	cfg: Encoder_Config,
 ) -> (^Encoder, bool) {
+	// Reject unusable configs before any MF work so the caller gets one
+	// clear message instead of cryptic HRESULTs from deep inside MFT setup.
+	if cfg.width == 0  { log.errorf("encoder_acquire: width is 0");  return nil, false }
+	if cfg.height == 0 { log.errorf("encoder_acquire: height is 0"); return nil, false }
+	if cfg.fps == 0    { log.errorf("encoder_acquire: fps is 0");    return nil, false }
+	if cfg.bitrate == 0 { log.errorf("encoder_acquire: bitrate is 0"); return nil, false }
+	if cfg.audio_sample_rate == 0 { log.errorf("encoder_acquire: audio_sample_rate is 0"); return nil, false }
+	if cfg.audio_channels == 0    { log.errorf("encoder_acquire: audio_channels is 0");    return nil, false }
+	if cfg.audio_bitrate == 0     { log.errorf("encoder_acquire: audio_bitrate is 0");     return nil, false }
+	if cfg.frame_duration <= 0    { log.errorf("encoder_acquire: frame_duration is %v", cfg.frame_duration); return nil, false }
+
 	if g_encoder_refs > 0 {
 		g_encoder_refs += 1
 		return g_encoder, true
@@ -101,7 +118,6 @@ encoder_acquire :: proc(
 	ok := false
 	defer if !ok {
 		if e.ready_event != nil do win32.CloseHandle(e.ready_event)
-		if e.video_event != nil do win32.CloseHandle(e.video_event)
 		if e.audio_event != nil do win32.CloseHandle(e.audio_event)
 		pool_destroy(&e.video_pool)
 		pool_destroy(&e.audio_pool)
@@ -121,12 +137,6 @@ encoder_acquire :: proc(
 	e.audio_bitrate = cfg.audio_bitrate
 	e.frame_duration = cfg.frame_duration
 	e.log_sink = cfg.log_sink
-
-	e.video_event = win32.CreateEventW(nil, false, false, nil)
-	if e.video_event == nil {
-		log.errorf("encoder_acquire: %v", win32.GetLastError())
-		return nil, false
-	}
 
 	e.audio_event = win32.CreateEventW(nil, false, false, nil)
 	if e.audio_event == nil {
@@ -200,25 +210,83 @@ encoder_thread :: proc(t: ^thread.Thread) {
 	defer win32.CoUninitialize()
 
 	e.init_ok = create_mfts(e)
+	if !e.init_ok {
+		win32.SetEvent(e.ready_event)
+		return
+	}
+
+	// High-resolution waitable timer — created here on the encoder thread,
+	// non-periodic (lPeriod = 0). Re-armed every tick from an accumulated
+	// absolute target so wake latency never integrates into drift.
+	e.timer_handle = win32.CreateWaitableTimerExW(
+		nil, nil,
+		win32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+		win32.TIMER_ALL_ACCESS,
+	)
+	if e.timer_handle == nil {
+		log.errorf("CreateWaitableTimerExW failed: %v", win32.GetLastError())
+		e.init_ok = false
+		win32.SetEvent(e.ready_event)
+		return
+	}
+
 	win32.SetEvent(e.ready_event)
-	if !e.init_ok do return
+
+	period_100ns := e.frame_duration  // already 10_000_000 / fps
+
+	// Seed next_due from the system clock (FILETIME, 100ns since 1601).
+	now_ft := filetime_now()
+	next_due := now_ft + period_100ns
+
+	// Arm the first tick.
+	arm_timer(e.timer_handle, next_due)
 
 	for intrinsics.atomic_load_explicit(&e.running, .Acquire) {
-		// handles order and the switch case labels below must stay tied together
-		handles := [2]win32.HANDLE{e.video_event, e.audio_event}
+		// handles[0] = timer, handles[1] = audio_event
+		handles := [2]win32.HANDLE{e.timer_handle, e.audio_event}
 		r := win32.WaitForMultipleObjects(2, &handles[0], false, 200)
+
+		is_timer_tick := false
 		switch r {
-		case win32.WAIT_OBJECT_0:     e.wake_video += 1
-		case win32.WAIT_OBJECT_0 + 1: e.wake_audio += 1
-		case win32.WAIT_TIMEOUT:      e.wake_timeout += 1
+		case win32.WAIT_OBJECT_0:
+			e.wake_timer += 1
+			is_timer_tick = true
+		case win32.WAIT_OBJECT_0 + 1:
+			e.wake_audio += 1
+		case win32.WAIT_TIMEOUT:
+			e.wake_timeout += 1
 		case:
 			log.errorf("WaitForMultipleObjects failed: 0x%08X", u32(r))
 		}
 
+		// Audio drains on every wake, regardless of which handle fired.
 		drain_audio(e)
-		drain_video(e)
+
+		// Video drains only on a timer tick.
+		if is_timer_tick {
+			drain_video(e)
+
+			// Re-arm: advance next_due by one period, then check for
+			// late ticks. If we're behind by more than one whole period,
+			// skip ahead and log.
+			next_due += period_100ns
+			now_ft = filetime_now()
+			if now_ft > next_due {
+				skipped := (now_ft - next_due) / period_100ns
+				next_due += (skipped + 1) * period_100ns
+				if skipped > 0 {
+					log.warnf("timer late, skipped %v tick(s)", skipped)
+				}
+			}
+			arm_timer(e.timer_handle, next_due)
+		}
+
 		free_all(context.temp_allocator)
 	}
+
+	// Close the timer handle on the same thread that created it.
+	win32.CloseHandle(e.timer_handle)
+	e.timer_handle = nil
 
 	// teardown MFTs here, on the thread that made them
 	if e.encoder != nil {
@@ -246,6 +314,23 @@ encoder_thread :: proc(t: ^thread.Thread) {
 	e.sps = nil
 	e.pps = nil
 	e.aac_config = nil
+}
+
+// Returns the current system time as a 100ns count (FILETIME epoch).
+@(private)
+filetime_now :: proc() -> i64 {
+	ft: win32.FILETIME
+	win32.GetSystemTimePreciseAsFileTime(&ft)
+	return i64(ft.dwLowDateTime) | (i64(ft.dwHighDateTime) << 32)
+}
+
+// Arm the waitable timer to fire at the given absolute FILETIME value.
+@(private)
+arm_timer :: proc(timer: win32.HANDLE, due_100ns: i64) {
+	due := win32.LARGE_INTEGER(due_100ns)
+	if win32.SetWaitableTimerEx(timer, &due, 0, nil, nil, nil, 0) == false {
+		log.errorf("SetWaitableTimerEx failed: %v", win32.GetLastError())
+	}
 }
 
 @(private)
@@ -317,8 +402,18 @@ drain_audio :: proc(e: ^Encoder) {
 
 @(private)
 drain_video :: proc(e: ^Encoder) {
-	_, _, pts, ok := mailbox_take(e.raw_mailbox, e.scratch)
-	if !ok do return
+	// Try to pick up a new frame from the mailbox. On success, e.scratch is
+	// overwritten with the new BGRA data. On failure (no new frame from
+	// capture), e.scratch still holds the previous frame — re-encode it to
+	// keep CFR output on a static desktop.
+	took := mailbox_take(e.raw_mailbox, e.scratch)
+	if took {
+		e.has_frame_ever = true
+	}
+	if !e.has_frame_ever do return  // no frame has ever arrived; emit nothing
+
+	pts := i64(e.tick_index) * e.frame_duration
+
 	vid_group, vid_ok := pool_acquire(&e.video_pool)
 	if !vid_ok {
 		e.dropped_frames += 1
@@ -336,19 +431,20 @@ drain_video :: proc(e: ^Encoder) {
 
 	sink := Nalu_Sink{g = vid_group}
 	n, enc_ok := mf.encode_bgra_frame_into(
-    e.processor, e.encoder, e.scratch, pts, e.frame_duration,
-    nalu_callback, &sink,
+		e.processor, e.encoder, e.scratch, pts, e.frame_duration,
+		nalu_callback, &sink,
 	)
 	if !enc_ok || n == 0 {
-    // Nothing was published, so refcount is still 0 — recycle directly.
-    // group_release would decrement from 0 and trip the double-release assert.
-    pool_recycle(vid_group)
-    return
+		// Nothing was published, so refcount is still 0 — recycle directly.
+		// group_release would decrement from 0 and trip the double-release assert.
+		pool_recycle(vid_group)
+		return
 	}
 
 	vid_group.is_keyframe = sink.is_keyframe
 	group_finish(vid_group)
 
+	e.tick_index += 1
 	e.encoded_frames += 1
 	if e.encoded_frames % 60 == 1 {
 		log.debugf("encoded frame group: nalus=%v keyframe=%v pts=%v", n, vid_group.is_keyframe, vid_group.pts)
@@ -359,16 +455,16 @@ drain_video :: proc(e: ^Encoder) {
 
 	count := 0
 	for c in e.consumers[:e.consumer_count] {
-    	if c.put_video != nil do count += 1
+		if c.put_video != nil do count += 1
 	}
 
 	if !group_publish(vid_group, count) do return   // zero receivers; already recycled
 
 	for c in e.consumers[:e.consumer_count] {
-    	if c.put_video != nil do c.put_video(c.ctx, vid_group)
+		if c.put_video != nil do c.put_video(c.ctx, vid_group)
 	}
 	for c in e.consumers[:e.consumer_count] {
-    	if c.put_video != nil do win32.SetEvent(c.event)
+		if c.put_video != nil do win32.SetEvent(c.event)
 	}
 }
 
@@ -423,18 +519,16 @@ encoder_release :: proc() {
 
 	e := g_encoder
 	intrinsics.atomic_store(&e.running, false)
-	win32.SetEvent(e.video_event)   // wake it out of the 200ms wait
-	win32.SetEvent(e.audio_event)
+	win32.SetEvent(e.audio_event)   // wake it out of the wait
 	thread.join(e.thread)
 	thread.destroy(e.thread)
 
-	log.infof("encoder wakeups: video=%v audio=%v timeout=%v; pool min free=%v; dropped=%v",
-		e.wake_video, e.wake_audio, e.wake_timeout, e.pool_min_free, e.dropped_frames)
+	log.infof("encoder wakeups: timer=%v audio=%v timeout=%v; pool min free=%v; dropped=%v",
+		e.wake_timer, e.wake_audio, e.wake_timeout, e.pool_min_free, e.dropped_frames)
 
 	pool_destroy(&e.video_pool)
 	pool_destroy(&e.audio_pool)
 	win32.CloseHandle(e.ready_event)
-	win32.CloseHandle(e.video_event)
 	win32.CloseHandle(e.audio_event)
 	delete(e.scratch)
 	delete(e.audio_scratch)

@@ -25,6 +25,11 @@ Controls_State :: struct {
 
     // Mirrors main's rtmp streaming state, same reasoning as recording above.
     streaming: bool,
+
+    // True while a previous recording's MP4 sink is draining and finalizing.
+    // Neither recording nor idle — the button shows "Finalizing..." and
+    // refuses a new recording start until the sink has been reaped.
+    finalizing: bool,
 }
 
 init_controls_state :: proc() -> Controls_State {
@@ -33,7 +38,9 @@ init_controls_state :: proc() -> Controls_State {
 
 draw_controls :: proc(state: ^Controls_State) {
     if im.Begin("Controls") {
-        if state.recording {
+        if state.finalizing {
+            im.TextColored({1, 1, 0, 1}, "Finalizing...")
+        } else if state.recording {
             if im.Button("Stop") {
                 state.request = .Stop_Recording
             }

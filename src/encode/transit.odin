@@ -7,8 +7,7 @@ Raw_Mailbox :: struct {
 	mutex: sync.Mutex,
 	buffer: []u8,
 	width, height: u32,
-	pts: i64,
-	has_frame: bool
+	has_frame: bool,
 }
 
 Raw_Audio_Queue :: struct {
@@ -30,8 +29,7 @@ mailbox_init :: proc(max_w: u32, max_h: u32) -> ^Raw_Mailbox {
 		buffer = buffer,
 		width = 0,
 		height = 0,
-		pts = 0,
-		has_frame = false
+		has_frame = false,
 	}
 
 	return mbox
@@ -44,30 +42,26 @@ mailbox_destroy :: proc(mbox: ^Raw_Mailbox) {
 	}
 }
 
-mailbox_put :: proc(mbox: ^Raw_Mailbox, frame: []u8, width, height: u32, pts: i64) {
+mailbox_put :: proc(mbox: ^Raw_Mailbox, frame: []u8, width, height: u32) {
     sync.lock(&mbox.mutex)
     defer sync.unlock(&mbox.mutex)
     frame_bytes := int(width) * int(height) * 4
     copy(mbox.buffer[:frame_bytes], frame)
     mbox.width, mbox.height = width, height
-    mbox.pts = pts
     mbox.has_frame = true
 }
 
-mailbox_take :: proc(mbox: ^Raw_Mailbox, dst: []u8) -> (width, height: u32, pts: i64, ok: bool) {
+mailbox_take :: proc(mbox: ^Raw_Mailbox, dst: []u8) -> bool {
     sync.lock(&mbox.mutex)
     defer sync.unlock(&mbox.mutex)
     if !mbox.has_frame {
-        return 0, 0, 0, false
+        return false
     }
 
     frame_bytes := int(mbox.height) * int(mbox.width) * 4
     copy(dst[:frame_bytes], mbox.buffer[:frame_bytes])
-    width, height = mbox.width, mbox.height
-    pts = mbox.pts
     mbox.has_frame = false
-    ok = true
-    return
+    return true
 }
 
 audio_queue_init :: proc(n: u32, block_byte_size: u32) -> ^Raw_Audio_Queue {
@@ -130,7 +124,6 @@ audio_queue_take :: proc(audio_queue: ^Raw_Audio_Queue, dst: []u8) -> (pts: i64,
 	defer sync.unlock(&audio_queue.mutex)
 
 	if audio_queue.count == 0 {
-		log.debug("No audio bytes to send to stream")
 		return {}, false
 	}
 
