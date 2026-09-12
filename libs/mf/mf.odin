@@ -7,6 +7,7 @@ import "libs:h264"
 import "core:slice"
 
 foreign import mfplat "system:mfplat.lib"
+foreign import mfreadwrite "system:mfreadwrite.lib"
 
 @(default_calling_convention="stdcall")
 foreign mfplat {
@@ -15,6 +16,9 @@ foreign mfplat {
     MFCreateMediaType   :: proc(media_type: ^^IMFMediaType) -> windows.HRESULT ---
     MFCreateMemoryBuffer:: proc(max_length: u32, buffer: ^^IMFMediaBuffer) -> windows.HRESULT ---
     MFCreateSample      :: proc(sample: ^^IMFSample) -> windows.HRESULT ---
+    MFEnumDeviceSources :: proc(pAttributes: ^IMFAttributes, pppSourceActivate: ^[^]^IMFActivate, pcSourceActivate: ^u32) -> windows.HRESULT ---
+    MFCreateDeviceSource:: proc(pAttributes: ^IMFAttributes, ppSource: ^^IMFMediaSource) -> windows.HRESULT ---
+    MFCreateAttributes  :: proc(ppMFAttributes: ^^IMFAttributes, cInitialSize: u32) -> windows.HRESULT ---
 }
 
 @(default_calling_convention="stdcall")
@@ -27,6 +31,11 @@ foreign mfplat {
         activates: ^[^]^IMFActivate,                // pointer to a fresh CoTaskMemAlloc'd array of IMFActivate*
         count: ^u32,
     ) -> windows.HRESULT ---
+}
+
+@(default_calling_convention="stdcall")
+foreign mfreadwrite {
+    MFCreateSourceReaderFromMediaSource :: proc(pMediaSource: ^IMFMediaSource, pAttributes: ^IMFAttributes, ppSourceReader: ^^IMFSourceReader) -> windows.HRESULT ---
 }
 
 @(private)

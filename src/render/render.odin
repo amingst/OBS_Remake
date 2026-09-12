@@ -76,12 +76,12 @@ create_target :: proc(device: ^d3d11.IDevice, w, h: u32) -> (Target, bool) {
 destroy_target :: proc(target: ^Target) {
     if target == nil { return }
     log.debugf("releasing render target (%vx%v)", target.width, target.height)
-    
+
     if target.staging != nil {
         target.staging->Release()
         target.staging = nil
     }
-    
+
     if target.srv != nil {
         target.srv->Release()
         target.srv = nil
@@ -140,7 +140,12 @@ draw_scene :: proc(ctx: ^d3d11.IDeviceContext, target: ^Target, pipeline: ^Pipel
         consts := Quad_Constants{
             scale  = { 2 * quad.w / W, -2 * quad.h / H },
             offset = { 2 * quad.x / W - 1, 1 - 2 * quad.y / H },
-            color  = quad.color,
+            color  = {
+                quad.color.r * quad.color.a,
+                quad.color.g * quad.color.a,
+                quad.color.b * quad.color.a,
+                quad.color.a,
+            },
         }
 
         mapped: d3d11.MAPPED_SUBRESOURCE
@@ -189,10 +194,6 @@ read_target :: proc(
     }
     defer ctx->Unmap((^d3d11.IResource)(target.staging), 0)
 
-    // RowPitch is not necessarily width*4 -- D3D pads rows for alignment, so
-    // copying the whole thing in one memcpy would shear the image. Flipping
-    // costs nothing extra here since the loop already goes row by row --
-    // just write row y to height-1-y instead of y.
     src := ([^]u8)(mapped.pData)
     for y in 0..<int(target.height) {
         src_off := y * int(mapped.RowPitch)

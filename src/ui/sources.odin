@@ -1,5 +1,6 @@
 package ui
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:log"
 import "core:strings"
@@ -7,6 +8,7 @@ import im "libs:odin-imgui"
 import "../capture"
 import "../scene"
 import "../audio"
+import "../platform"
 
 // Audio input and output are separate choices here but construct the same
 // Audio_Data variant -- they differ only in the loopback flag.
@@ -15,6 +17,9 @@ Source_Kind_Choice :: enum i32 {
     Display,
     Audio_Input,
     Audio_Output,
+    Image,
+    Window,
+    Camera
 }
 
 Sources_State :: struct {
@@ -23,10 +28,36 @@ Sources_State :: struct {
     kind_choice:   Source_Kind_Choice,
     output_choice: int, // index into the enumerated outputs, for the Add popup
     audio_choice:  int, // index into the *filtered* device list, for the Add popup
+
+    // Window picker. enumerate_windows is called exactly once, when the
+    // popup opens (the button below), and destroy_window_list exactly once,
+    // when it closes (pick, cancel, or app shutdown via destroy_sources_state)
+    // -- never per frame.
+    window_picker_list:     []capture.Window_Info,
+    window_picker_show_all: bool, // bypasses the game-capture default filter
+
+    // Camera picker. enumerate_cameras is called exactly once, when the
+    // popup opens, and destroy_camera_list exactly once, when it closes
+    // (pick, cancel, or app shutdown via destroy_sources_state).
+    camera_picker_list: []capture.Camera_Info,
 }
 
 init_sources_state :: proc() -> Sources_State {
     return Sources_State{}
+}
+
+// Only needed for the edge case of exiting with the window picker popup left
+// open -- draw_window_picker's own Cancel/pick paths already destroy the
+// list in the ordinary case.
+destroy_sources_state :: proc(state: ^Sources_State) {
+    if state.window_picker_list != nil {
+        capture.destroy_window_list(state.window_picker_list)
+        state.window_picker_list = nil
+    }
+    if state.camera_picker_list != nil {
+        capture.destroy_camera_list(state.camera_picker_list)
+        state.camera_picker_list = nil
+    }
 }
 
 // "\\.\DISPLAY1 (2560x1600)". Temp-allocated, so it lives until the end of the
@@ -72,11 +103,34 @@ audio_devices_for :: proc(devices: []audio.Device_Info, is_loopback: bool) -> []
 @(private="file")
 fit_to_canvas :: proc(src: ^scene.Source, outputs: []capture.Output_Info, canvas_w, canvas_h: f32) {
     aspect := canvas_w / canvas_h
-    if d, is_display := src.data.(scene.Display_Data); is_display {
+    switch d in src.data {
+    case scene.Display_Data:
         if i := find_output(outputs, d.adapter_index, d.output_index); i >= 0 && outputs[i].height > 0 {
             aspect = f32(outputs[i].width) / f32(outputs[i].height)
         }
+    case scene.Image_Data:
+        if d.width > 0 && d.height > 0 {
+            aspect = f32(d.width) / f32(d.height)
+        }
+    case scene.Window_Data:
+        // Same shape as Image_Data: no native size until capture starts, so
+        // fall through to the canvas aspect until then.
+        //
+        // This does not re-run when a captured window resizes -- the source
+        // keeps its canvas rectangle and the content changes resolution
+        // inside it. That matches display's behaviour and is the intended
+        // default for this step, not a bug.
+        if d.capture != nil && d.capture.width > 0 && d.capture.height > 0 {
+            aspect = f32(d.capture.width) / f32(d.capture.height)
+        }
+    case scene.Camera_Data:
+        if d.cam != nil && d.width > 0 && d.height > 0 {
+            aspect = f32(d.width) / f32(d.height)
+        }
+    case scene.Color_Data, scene.Audio_Data:
+        // no native size, keep canvas aspect
     }
+
 
     size := [2]f32{canvas_w, canvas_w / aspect}
     if size.y > canvas_h {
@@ -155,6 +209,91 @@ draw_audio_picker :: proc(d: ^scene.Audio_Data, devices: []audio.Device_Info) {
     im.Checkbox("Muted", &d.muted)
 }
 
+// Picking a window frees the old identity and stores the new one, stops any
+// existing capture, and arms an immediate retry -- but never calls
+// start_window_capture. THE UI NEVER CALLS A CAPTURE PROC: stopping the old
+// capture here is a teardown, not an acquisition, so it's fine on this side
+// of that rule; the main loop starts the new one next frame the same way it
+// starts any other (re)resolved window source. That keeps exactly one
+// acquisition path (main.odin's retry block) instead of two.
+@(private="file")
+draw_window_picker :: proc(d: ^scene.Window_Data, state: ^Sources_State) {
+    if d.title != "" {
+        im.TextWrapped(fmt.ctprintf("Window: %v", d.title))
+    } else {
+        im.TextDisabled("No window selected")
+    }
+    if d.class_name != "" || d.exe_name != "" {
+        im.TextDisabled(fmt.ctprintf("Class: %v   Exe: %v",
+            d.class_name != "" ? d.class_name : "?",
+            d.exe_name   != "" ? d.exe_name   : "?"))
+    }
+    if d.capture != nil {
+        im.Text(fmt.ctprintf("%v x %v", d.capture.width, d.capture.height))
+    }
+    if d.lost {
+        im.TextDisabled("Lost -- retrying")
+    }
+
+    // Changes only the picker's default filter (below) and, applied by the
+    // main loop on (re)start -- not here, the UI never calls a capture proc
+    // -- forces cursor capture off regardless of hide_cursor.
+    im.Checkbox("Game Capture", &d.game_capture)
+    im.Checkbox("Hide cursor", &d.hide_cursor)
+    im.Checkbox("Hide capture border", &d.hide_border)
+
+    if im.Button("Pick Window...") {
+        state.window_picker_list = capture.enumerate_windows()
+        state.window_picker_show_all = false
+        im.OpenPopup("Pick Window")
+    }
+
+    if im.BeginPopupModal("Pick Window") {
+        im.Checkbox("Show all windows", &state.window_picker_show_all)
+        im.Separator()
+
+        any_shown := false
+        for w in state.window_picker_list {
+            if d.game_capture && !state.window_picker_show_all && !w.likely_game {
+                continue
+            }
+            any_shown = true
+
+            exe: cstring = w.exe_name != "" ? fmt.ctprintf("%v", w.exe_name) : "?"
+            label := fmt.ctprintf("%v  [%v]", w.title, exe)
+            if im.Selectable(label, false) {
+                if d.capture != nil {
+                    capture.stop_window_capture(d.capture)
+                    d.capture = nil
+                }
+                if d.title      != "" do delete(d.title)
+                if d.class_name != "" do delete(d.class_name)
+                if d.exe_name   != "" do delete(d.exe_name)
+                d.title      = strings.clone(w.title)
+                d.class_name = strings.clone(w.class_name)
+                d.exe_name   = strings.clone(w.exe_name)
+                d.lost       = false
+                d.next_retry = {}
+
+                capture.destroy_window_list(state.window_picker_list)
+                state.window_picker_list = nil
+                im.CloseCurrentPopup()
+            }
+        }
+        if !any_shown {
+            im.TextDisabled(d.game_capture ? "No likely-game windows found (try Show all windows)" : "No windows found")
+        }
+
+        im.Separator()
+        if im.Button("Cancel") {
+            capture.destroy_window_list(state.window_picker_list)
+            state.window_picker_list = nil
+            im.CloseCurrentPopup()
+        }
+        im.EndPopup()
+    }
+}
+
 draw_sources :: proc(
     state: ^Sources_State,
     scenes: ^Scenes_State,
@@ -171,6 +310,24 @@ draw_sources :: proc(
             if im.Button("+") {
                 im.OpenPopup("Add Source")
             }
+            im.SameLine()
+            if im.ArrowButton("##up", .Up) {
+                for i in 0..<len(sc.sources) {
+                    if sc.sources[i].id == state.selected_id && i > 0 {
+                        sc.sources[i], sc.sources[i - 1] = sc.sources[i - 1], sc.sources[i]
+                        break
+                    }
+                }
+            }
+            im.SameLine()
+            if im.ArrowButton("##down", .Down) {
+                for i in 0..<len(sc.sources) {
+                    if sc.sources[i].id == state.selected_id && i < len(sc.sources) - 1 {
+                        sc.sources[i], sc.sources[i + 1] = sc.sources[i + 1], sc.sources[i]
+                        break
+                    }
+                }
+            }
 
             if im.BeginPopupModal("Add Source") {
                 im.InputText("Name", cstring(&state.name_buf[0]), len(state.name_buf))
@@ -181,7 +338,11 @@ draw_sources :: proc(
                 im.RadioButtonIntPtr("Audio Input", (^i32)(&state.kind_choice), i32(Source_Kind_Choice.Audio_Input))
                 im.SameLine()
                 im.RadioButtonIntPtr("Audio Output", (^i32)(&state.kind_choice), i32(Source_Kind_Choice.Audio_Output))
-
+                im.RadioButtonIntPtr("Image", (^i32)(&state.kind_choice), i32(Source_Kind_Choice.Image))
+                im.SameLine()
+                im.RadioButtonIntPtr("Window Capture", (^i32)(&state.kind_choice), i32(Source_Kind_Choice.Window))
+                im.SameLine()
+                im.RadioButtonIntPtr("Camera", (^i32)(&state.kind_choice), i32(Source_Kind_Choice.Camera))
                 if state.kind_choice == .Display {
                     if len(outputs) == 0 {
                         im.TextDisabled("No outputs available")
@@ -250,6 +411,15 @@ draw_sources :: proc(
                                 a.device_id = strings.clone(matching[state.audio_choice].id)
                             }
                             data = a
+                        case .Image:
+                            data = scene.Image_Data{}
+                        case .Window:
+                            // Empty title: unresolvable until step 7's picker
+                            // can supply one. The main loop will log once and
+                            // mark it lost on the first frame it's visible.
+                            data = scene.Window_Data{}
+                        case .Camera:
+                            data = scene.Camera_Data{}
                         }
 
                         state.selected_id = scene.create_source(doc, sc, name, data)
@@ -331,8 +501,42 @@ draw_sources :: proc(
                     draw_output_picker(&d, outputs)
                 case scene.Audio_Data:
                     draw_audio_picker(&d, devices)
-                }
+                case scene.Image_Data:
+                    if d.path != "" {
+                        im.TextWrapped(fmt.ctprintf("Path: %v", d.path))
+                    } else {
+                        im.TextDisabled("No path set")
+                    }
+                    if d.lost {
+                        im.TextDisabled("Failed to load")
+                    } else if d.texture != nil {
+                        im.Text(fmt.ctprintf("%v x %v", d.width, d.height))
+                    }
+                    if im.Button("Browse...") {
+                        if picked, pick_ok := platform.open_image_dialog(); pick_ok {
+                            if d.srv != nil     { d.srv->Release();     d.srv = nil }
+                            if d.texture != nil { d.texture->Release(); d.texture = nil }
+                            if d.path != "" do delete(d.path)
+                            d.path   = picked
+                            d.width  = 0
+                            d.height = 0
+                            d.lost   = false
+                        }
+                    }
+                    im.SameLine()
+                    if im.Button("Reload") && d.path != "" {
+                        if d.srv != nil     { d.srv->Release();     d.srv = nil }
+                        if d.texture != nil { d.texture->Release(); d.texture = nil }
+                        d.width  = 0
+                        d.height = 0
+                        d.lost   = false
+                    }
+                case scene.Window_Data:
+                    draw_window_picker(&d, state)
 
+                case scene.Camera_Data:
+                    draw_camera_picker(&d, state)
+                }
                 if !is_audio {
                     if im.Button("Fit to canvas") {
                         fit_to_canvas(src, outputs, canvas_w, canvas_h)
@@ -354,4 +558,66 @@ draw_sources :: proc(
     }
 
     im.End()
+}
+
+// Picking a camera frees the old identity and stores the new one, stops any
+// existing reader, and drops the old texture (a different device means a
+// different frame size) -- but never calls camera_start. THE UI NEVER CALLS
+// A CAPTURE PROC: stopping the old reader here is a teardown, not an
+// acquisition, so it's fine on this side of that rule; the main loop starts
+// the new one next frame via its lazy-start check (cam == nil && symlink !=
+// ""), same as draw_window_picker's identity swap for window sources.
+@(private="file")
+draw_camera_picker :: proc(d: ^scene.Camera_Data, state: ^Sources_State) {
+    if d.friendly_name != "" {
+        im.TextWrapped(fmt.ctprintf("Device: %v", d.friendly_name))
+    } else {
+        im.TextDisabled("No device selected")
+    }
+    if d.cam != nil && intrinsics.atomic_load(&d.cam.lost) {
+        im.TextDisabled("Reconnecting...")
+    } else if d.texture != nil {
+        im.Text(fmt.ctprintf("%v x %v", d.width, d.height))
+    }
+
+    if im.Button("Pick Camera...") {
+        state.camera_picker_list = capture.enumerate_cameras()
+        im.OpenPopup("Pick Camera")
+    }
+
+    if im.BeginPopupModal("Pick Camera") {
+        if len(state.camera_picker_list) == 0 {
+            im.TextDisabled("No cameras found")
+        }
+        for dev in state.camera_picker_list {
+            label := fmt.ctprintf("%v", dev.friendly_name)
+            if im.Selectable(label, false) {
+                if d.cam != nil {
+                    capture.camera_stop(d.cam)
+                    d.cam = nil
+                }
+                if d.srv != nil     { d.srv->Release();     d.srv = nil }
+                if d.texture != nil { d.texture->Release(); d.texture = nil }
+                d.width  = 0
+                d.height = 0
+
+                if d.symlink       != "" do delete(d.symlink)
+                if d.friendly_name != "" do delete(d.friendly_name)
+                d.symlink       = strings.clone(dev.symlink)
+                d.friendly_name = strings.clone(dev.friendly_name)
+
+                capture.destroy_camera_list(state.camera_picker_list)
+                state.camera_picker_list = nil
+                im.CloseCurrentPopup()
+            }
+        }
+
+        im.Separator()
+        if im.Button("Cancel") {
+            capture.destroy_camera_list(state.camera_picker_list)
+            state.camera_picker_list = nil
+            im.CloseCurrentPopup()
+        }
+        im.EndPopup()
+    }
 }

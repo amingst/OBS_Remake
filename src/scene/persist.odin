@@ -12,7 +12,7 @@ Source_DTO :: struct {
     x, y:    f32,
     w, h:    f32,
     color:   [4]f32,
-    kind:    string, // "color" | "display" | "audio"
+    kind:    string, // "color" | "display" | "audio" | "image" | "window"
 
     adapter_index: i32,
     output_index:  i32,
@@ -20,7 +20,29 @@ Source_DTO :: struct {
     device_id: string,
     is_loopback: bool,
     volume: f32,
-    muted: bool
+    muted: bool,
+
+    path: string,
+
+    // Window identity: title alone is the backward-compatible case (a
+    // collection saved before class_name/exe_name existed has them absent
+    // from the JSON, which json.unmarshal leaves at "" -- resolve_window
+    // treats class_name == "" as "no class recorded" and falls back to
+    // title-only FindWindowW, exactly the old behaviour). With class_name
+    // present, resolution prefers class+exe over title -- see
+    // capture.resolve_window.
+    title:      string,
+    class_name: string,
+    exe_name:   string,
+
+    // Session toggles, stored inverted (false = WGC default) for the same
+    // backward-compatibility reason: absent from an older file, they
+    // unmarshal to false, which means "no opinion" here, not "explicitly
+    // disabled".
+    game_capture: bool,
+    hide_cursor:  bool,
+    hide_border:  bool,
+    symlink:      string,
 }
 
 Scene_DTO :: struct {
@@ -114,6 +136,20 @@ to_dto :: proc(c: ^Collection) -> Collection_DTO {
                     dto.volume = d.params.volume
                     dto.muted = d.params.muted
                     dto.is_loopback = d.is_loopback
+                case Image_Data:
+                    dto.kind = "image"
+                    dto.path = d.path
+                case Window_Data:
+                    dto.kind         = "window"
+                    dto.title        = d.title
+                    dto.class_name   = d.class_name
+                    dto.exe_name     = d.exe_name
+                    dto.game_capture = d.game_capture
+                    dto.hide_cursor  = d.hide_cursor
+                    dto.hide_border  = d.hide_border
+                case Camera_Data:
+                    dto.kind = "camera"
+                    dto.symlink = d.symlink
             }
             sources[j] = dto
         }
@@ -170,6 +206,23 @@ from_dto :: proc(dto: ^Collection_DTO, c: ^Collection) {
                         muted = src_dto.muted
                     }
                 }
+            case "image":
+                data = Image_Data{
+                    path = strings.clone(src_dto.path),
+                }
+            case "window":
+                data = Window_Data{
+                    title        = strings.clone(src_dto.title),
+                    class_name   = strings.clone(src_dto.class_name),
+                    exe_name     = strings.clone(src_dto.exe_name),
+                    game_capture = src_dto.game_capture,
+                    hide_cursor  = src_dto.hide_cursor,
+                    hide_border  = src_dto.hide_border,
+                }
+            case "camera":
+            data = Camera_Data{
+                symlink = strings.clone(src_dto.symlink),
+            }
             case:
                 // One bad source must not sink the whole collection.
                 log.warnf("scene collection: skipping source %q (id %v) — unrecognised kind %q",

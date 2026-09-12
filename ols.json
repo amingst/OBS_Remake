@@ -12,7 +12,9 @@
 		{ "name": "rtmp", "path": "src/rtmp"},
 		{ "name": "h264", "path": "libs/h264"},
 		{ "name": "flv", "path": "libs/flv"},
-		{ "name": "encode", "path": "src/encode"}
+		{ "name": "encode", "path": "src/encode"},
+		{ "name": "wic", "path": "libs/wic"},
+		{ "name": "wgc", "path": "libs/wgc"}
 	],
 	"enable_semantic_tokens": true,
 	"enable_document_symbols": true,

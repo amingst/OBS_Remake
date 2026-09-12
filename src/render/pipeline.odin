@@ -114,7 +114,7 @@ create_pipeline :: proc(device: ^d3d11.IDevice) -> (Pipeline, bool) {
     blend_desc := d3d11.BLEND_DESC{}
     blend_desc.RenderTarget[0] = {
         BlendEnable           = true,
-        SrcBlend              = .SRC_ALPHA,
+        SrcBlend              = .ONE,
         DestBlend             = .INV_SRC_ALPHA,
         BlendOp               = .ADD,
         SrcBlendAlpha         = .ONE,

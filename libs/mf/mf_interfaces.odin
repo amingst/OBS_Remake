@@ -12,12 +12,13 @@ IMFAttributes_VTable :: struct($T: typeid) {
     CompareItem:        rawptr,
     Compare:            rawptr,
     GetUINT32: proc "stdcall" (this: ^T, key: ^windows.GUID, value: ^u32) -> windows.HRESULT,
-    GetUINT64_:         rawptr,
+    GetUINT64: proc "stdcall" (this: ^T, key: ^windows.GUID, value: ^u64) -> windows.HRESULT,
     GetDouble:          rawptr,
     GetGUID_:           rawptr,
     GetStringLength:    rawptr,
     GetString:          rawptr,
-    GetAllocatedString: proc "stdcall" (this: ^T, key: ^windows.GUID, value: ^cstring16, length: ^u32) -> windows.HRESULT,
+    //GetAllocatedString: proc "stdcall" (this: ^T, key: ^windows.GUID, value: ^cstring16, length: ^u32) -> windows.HRESULT,
+    GetAllocatedString: proc "stdcall" (this: ^T, key: ^windows.GUID, value: ^[^]u16, length: ^u32) -> windows.HRESULT,
     GetBlobSize: proc "stdcall" (this: ^T, key: ^windows.GUID, size: ^u32) -> windows.HRESULT,
     GetBlob: proc "stdcall" (this: ^T, key: ^windows.GUID, buf: [^]u8, buf_size: u32, blob_size: ^u32) -> windows.HRESULT,
     GetAllocatedBlob:   rawptr,
@@ -29,7 +30,7 @@ IMFAttributes_VTable :: struct($T: typeid) {
     SetUINT64: proc "stdcall" (this: ^T, key: ^windows.GUID, value: u64) -> windows.HRESULT,
     SetDouble:          rawptr,
     SetGUID: proc "stdcall" (this: ^T, key: ^windows.GUID, value: ^windows.GUID) -> windows.HRESULT,
-    SetString:          rawptr,
+    SetString: proc "stdcall" (this: ^T, key: ^windows.GUID, value: ^u16) -> windows.HRESULT,
     SetBlob:            rawptr,
     SetUnknown:         rawptr,
     LockStore:          rawptr,
@@ -38,6 +39,33 @@ IMFAttributes_VTable :: struct($T: typeid) {
     GetItemByIndex:     rawptr,
     CopyAllItems:       rawptr,
 }
+
+IMFAttributes_Full_VTable :: struct {
+    QueryInterface: proc "stdcall" (this: ^IMFAttributes, riid: ^windows.GUID, out: ^rawptr) -> windows.HRESULT,
+    AddRef:         proc "stdcall" (this: ^IMFAttributes) -> u32,
+    Release:        proc "stdcall" (this: ^IMFAttributes) -> u32,
+    using attrs:    IMFAttributes_VTable(IMFAttributes),   // GetItem @ slot 3, correct
+}
+IMFAttributes :: struct { using vtbl: ^IMFAttributes_Full_VTable }
+
+IMFMediaSource_VTable :: struct {
+    QueryInterface: proc "stdcall" (this: ^IMFMediaSource, riid: ^windows.GUID, out: ^rawptr) -> windows.HRESULT,
+    AddRef:         proc "stdcall" (this: ^IMFMediaSource) -> u32,
+    Release:        proc "stdcall" (this: ^IMFMediaSource) -> u32,
+    // IMFMediaEventGenerator
+    GetEvent:       rawptr,
+    BeginGetEvent:  rawptr,
+    EndGetEvent:    rawptr,
+    QueueEvent:     rawptr,
+    // IMFMediaSource
+    GetCharacteristics:            rawptr,
+    CreatePresentationDescriptor:  rawptr,
+    Start:          rawptr,
+    Stop:           rawptr,
+    Pause:          rawptr,
+    Shutdown:       proc "stdcall" (this: ^IMFMediaSource) -> windows.HRESULT,
+}
+IMFMediaSource :: struct { using vtbl: ^IMFMediaSource_VTable }
 
 // ---------------------------------------------------------------------
 // IMFMediaType : IMFAttributes : IUnknown
@@ -88,7 +116,7 @@ IMFSample_VTable :: struct {
     GetSampleDuration: rawptr,
     SetSampleDuration: proc "stdcall" (this: ^IMFSample, duration: i64) -> windows.HRESULT,
     GetBufferCount:    rawptr,
-    GetBufferByIndex:  rawptr,
+    GetBufferByIndex: proc "stdcall" (this: ^IMFSample, index: u32, buffer: ^^IMFMediaBuffer) -> windows.HRESULT,
     ConvertToContiguousBuffer: proc "stdcall" (this: ^IMFSample, buffer: ^^IMFMediaBuffer) -> windows.HRESULT,
     AddBuffer: proc "stdcall" (this: ^IMFSample, buffer: ^IMFMediaBuffer) -> windows.HRESULT,
     RemoveBufferByIndex: rawptr,
@@ -215,3 +243,21 @@ ICodecAPI_VTable :: struct {
 }
 
 ICodecAPI :: struct { using vtbl: ^ICodecAPI_VTable }
+
+IMFSourceReader_VTable :: struct {
+    QueryInterface:          proc "stdcall" (this: ^IMFSourceReader, riid: ^windows.GUID, out: ^rawptr) -> windows.HRESULT,
+    AddRef:                  proc "stdcall" (this: ^IMFSourceReader) -> u32,
+    Release:                 proc "stdcall" (this: ^IMFSourceReader) -> u32,
+    GetStreamSelection:      rawptr,
+    SetStreamSelection:      rawptr,
+    GetNativeMediaType:      rawptr,
+    GetCurrentMediaType:     proc "stdcall" (this: ^IMFSourceReader, stream_index: u32, media_type: ^^IMFMediaType) -> windows.HRESULT,
+    SetCurrentMediaType:     proc "stdcall" (this: ^IMFSourceReader, stream_index: u32, reserved: ^u32, media_type: ^IMFMediaType) -> windows.HRESULT,
+    SetCurrentPosition:      rawptr,
+    ReadSample:              proc "stdcall" (this: ^IMFSourceReader, stream_index: u32, control_flags: u32, actual_stream_index: ^u32, stream_flags: ^u32, timestamp: ^windows.LONGLONG, sample: ^^IMFSample) -> windows.HRESULT,
+    Flush:                   rawptr,
+    GetServiceForStream:     rawptr,
+    GetPresentationAttribute: rawptr,
+}
+
+IMFSourceReader :: struct { using vtbl: ^IMFSourceReader_VTable }

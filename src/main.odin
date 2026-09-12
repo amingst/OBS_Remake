@@ -7,10 +7,13 @@ import "core:log"
 @(require) import "core:mem"
 import win32 "core:sys/windows"
 import "vendor:directx/dxgi"
+import "vendor:directx/d3d11"
 import im      "libs:odin-imgui"
 import imwin32 "libs:odin-imgui/backends/win32"
 import imdx11  "libs:odin-imgui/backends/dx11"
 import mf      "libs:mf"
+import "libs:wic"
+import "libs:wgc"
 import time "core:time"
 import "core:os"
 import "core:strings"
@@ -30,6 +33,8 @@ import "rtmp"
 import "mp4"
 import "applog"
 
+import "core:sys/windows"
+
 Output_State :: struct {
 	recording:		bool,
 	streaming:		bool,
@@ -37,6 +42,44 @@ Output_State :: struct {
 	mp4_sink:		^mp4.Mp4_Sink,
 	finalizing_sink:	^mp4.Mp4_Sink,
 	enc:			^encode.Encoder,
+}
+
+// The D3D11 debug layer (.DEBUG create flag, enabled under ODIN_DEBUG in
+// platform.odin) has been on since the device was created, but nothing ever
+// read ID3D11InfoQueue before now -- its output went nowhere. QI's the
+// device fresh each call rather than caching the interface: this runs once
+// per frame regardless of whether any window source exists this run, and
+// the QI itself is cheap next to everything else already happening at the
+// top of the loop.
+@(private = "file")
+drain_d3d11_debug_layer :: proc(device: ^d3d11.IDevice) {
+	info_queue: ^d3d11.IInfoQueue
+	if hr := device->QueryInterface(d3d11.IInfoQueue_UUID, (^rawptr)(&info_queue)); hr < 0 {
+		return
+	}
+	defer info_queue->Release()
+
+	n := info_queue->GetNumStoredMessages()
+	for i: u64 = 0; i < n; i += 1 {
+		size: d3d11.SIZE_T
+		if hr := info_queue->GetMessage(i, nil, &size); hr < 0 || size == 0 {
+			continue
+		}
+		buf := make([]u8, int(size), context.temp_allocator)
+		msg := (^d3d11.MESSAGE)(raw_data(buf))
+		if hr := info_queue->GetMessage(i, msg, &size); hr < 0 {
+			continue
+		}
+		switch msg.Severity {
+		case .CORRUPTION, .ERROR:
+			log.errorf("d3d11 debug layer: %s", msg.pDescription)
+		case .WARNING:
+			log.warnf("d3d11 debug layer: %s", msg.pDescription)
+		case .INFO, .MESSAGE:
+			log.infof("d3d11 debug layer: %s", msg.pDescription)
+		}
+	}
+	info_queue->ClearStoredMessages()
 }
 
 main :: proc() {
@@ -317,7 +360,91 @@ main :: proc() {
 		audio.log_device_format(dev)
 	}
 
-	if hr := mf.MFStartup(mf.MF_VERSION, mf.MFSTARTUP_FULL); hr < 0 {
+	enum_attrs: ^mf.IMFAttributes
+    hr := mf.MFCreateAttributes(&enum_attrs, 1)
+    if hr < 0 {
+        log.errorf("cam probe: MFCreateAttributes failed: 0x%08X", u32(hr))
+    } else {
+        defer enum_attrs->Release()
+        enum_attrs->SetGUID(
+            &mf.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+            &mf.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+        )
+
+        activates: [^]^mf.IMFActivate
+        count:     u32
+        hr = mf.MFEnumDeviceSources(enum_attrs, &activates, &count)
+        if hr < 0 {
+            log.errorf("cam probe: MFEnumDeviceSources failed: 0x%08X", u32(hr))
+        } else if count == 0 {
+            log.info("cam probe: no video devices")
+            // activates is nil / nothing to free when count == 0
+        } else {
+            // Release every activate and free the array, no matter what happens below.
+            defer {
+                for i in 0..<count {
+                    activates[i]->Release()
+                }
+                windows.CoTaskMemFree(activates)
+            }
+
+            // Pull the symbolic link off device 0.
+            raw:     [^]u16     // CoTaskMemAlloc'd by GetAllocatedString — we free it
+            raw_len: u32
+            hr = activates[0]->GetAllocatedString(
+                &mf.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
+                &raw, &raw_len,
+            )
+            if hr < 0 {
+                log.errorf("cam probe: GetAllocatedString failed: 0x%08X", u32(hr))
+            } else {
+                defer windows.CoTaskMemFree(raw)
+
+                // raw_len is the count of UTF-16 code units, not counting the null.
+                symlink := raw[:raw_len]
+
+                log.infof("cam probe: device 0 symlink len=%d", raw_len)
+
+                cam := capture.camera_start(symlink, log_sink, 0)  // camera_start copies the symlink
+                time.sleep(500 * time.Millisecond)
+                capture.camera_stop(cam)                          // frees cam
+            }
+        }
+    }
+
+	// WinRT apartment setup. audio.get_enumerator() (line above) established
+	// this thread as an STA via CoInitializeEx(.APARTMENTTHREADED). Both
+	// wic.wic_init() (below) and WinRT activation depend on that apartment
+	// existing: wic_init's CoCreateInstance returns CO_E_NOTINITIALIZED
+	// without one, and RoInitialize needs the mode to match so the capture
+	// pool's free-threaded callback can marshal back correctly.
+	//
+	// Expected return: S_FALSE (0x00000001) — apartment already initialised.
+	// S_OK means the audio enumerator path didn't run, which is an ordering
+	// regression. RPC_E_CHANGED_MODE means somebody switched to MTA.
+	{
+		hr = wgc.RoInitialize(wgc.RO_INIT_SINGLETHREADED)
+		if hr < 0 {
+			log.errorf("RoInitialize failed: 0x%08X", u32(hr))
+			if hr == wgc.RPC_E_CHANGED_MODE {
+				log.error("RoInitialize: apartment is MTA, expected STA — WinRT capture will not work")
+			}
+			return
+		}
+		if hr == 0 { // S_OK — we established the apartment, meaning audio.get_enumerator didn't
+			log.warnf("RoInitialize returned S_OK (0x%08X) — expected S_FALSE; check init ordering", u32(hr))
+		} else {
+			log.infof("RoInitialize: 0x%08X", u32(hr))
+		}
+	}
+
+	if !wic.wic_init() {
+		log.error("WIC factory creation failed (cause logged above)")
+	}
+	defer wic.wic_shutdown()
+
+	hr = mf.MFStartup(mf.MF_VERSION, mf.MFSTARTUP_FULL)
+	if hr < 0 {
 		log.errorf("MFStartup failed: 0x%08X", u32(hr))
 		return
 	}
@@ -336,6 +463,31 @@ main :: proc() {
 	audio_diag_last_aac_recv: u64
 	audio_diag_last_ps_attempted: u64
 	audio_diag_last_ps_dropped: u64
+
+	// Balances our RoInitialize above, not audio.get_enumerator's
+	// CoInitializeEx (which has no matching CoUninitialize — the apartment
+	// survives to process exit either way). Declared here so it fires after
+	// scene.destroy_all releases any WinRT capture objects but before
+	// wic_shutdown / platform.destroy_window release their COM objects.
+	// Today the main thread's COM refcount never reaches zero (2 inits,
+	// 1 uninit), so this is latent — but it documents intent, and if
+	// someone later adds CoUninitialize to audio.shutdown, the ordering
+	// comment here is what stops them getting the teardown wrong.
+	defer wgc.RoUninitialize()
+
+	// wgc_init creates the process-lifetime HSTRINGs RoGetActivationFactory
+	// needs for the two WinRT class names window.odin activates. Must run
+	// after RoInitialize, before anything in capture/window.odin. Its defer
+	// is registered after RoUninitialize's immediately above, so on the way
+	// out it runs first -- WinRT objects must be released while the
+	// apartment is still alive. scene.destroy_all's defer (below) is
+	// registered later still, for the same reason: Window_Data sources own
+	// WinRT capture objects now, and destroy_source must release them before
+	// wgc_shutdown/RoUninitialize run.
+	if !wgc.wgc_init() {
+		log.error("wgc_init failed (cause logged above); window capture will not work")
+	}
+	defer wgc.wgc_shutdown()
 
 	// The active scene collection. Same load-active/pick-first/create-Default
 	// shape as the profile selection above; unlike profiles there's no
@@ -421,6 +573,8 @@ main :: proc() {
 
 	// Main loop
 	for !done {
+		drain_d3d11_debug_layer(win.device)
+
 		// Poll and handle messages (inputs, window resize, etc.)
         if platform.pump_messages(&win) {
             break
@@ -445,7 +599,8 @@ main :: proc() {
 		if win.resize_width != 0 && win.resize_height != 0 {
 			log.debugf("swapchain resize %vx%v", win.resize_width, win.resize_height)
 			platform.cleanup_render_target(&win)
-			if hr := win.swap_chain->ResizeBuffers(0, win.resize_width, win.resize_height, .UNKNOWN, {}); hr < 0 {
+			hr = win.swap_chain->ResizeBuffers(0, win.resize_width, win.resize_height, .UNKNOWN, {})
+			if hr < 0 {
 				log.errorf("ResizeBuffers failed: HRESULT 0x%08X", u32(hr))
 			}
 			win.resize_width, win.resize_height = 0, 0
@@ -589,6 +744,27 @@ main :: proc() {
 							x = src.x, y = src.y, w = src.w, h = src.h,
 							color = src.color,
 						})
+					case scene.Image_Data:
+						if d.texture == nil && !d.lost {
+							tex, srv, w, h, img_ok := capture.load_image(win.device, d.path)
+							if img_ok {
+								d.texture = tex
+								d.srv = srv
+								d.width = w
+								d.height = h
+								log.infof("image loaded: %v (%vx%v)", d.path, w, h)
+							} else {
+								d.lost = true
+								log.errorf("image decode failed, will not retry: %v", d.path)
+							}
+						}
+						if d.srv != nil {
+							append(&quads, render.Quad{
+								x = src.x, y = src.y, w = src.w, h = src.h,
+								color = {1, 1, 1, 1},
+								texture = d.srv,
+							})
+						}
 					case scene.Display_Data:
 						if d.dupl == nil && time.now()._nsec >= d.next_retry._nsec {
 							if dupl, ok := capture.start_duplication(win.device, u32(d.adapter_index), u32(d.output_index)); ok {
@@ -598,14 +774,36 @@ main :: proc() {
 							}
 						}
 
-						if d.dupl != nil && d.texture == nil {
+						if d.dupl != nil {
 							desc: dxgi.OUTDUPL_DESC
 							d.dupl->GetDesc(&desc)
-							tex, srv, ok := capture.create_capture_texture(
-								win.device, desc.ModeDesc.Width, desc.ModeDesc.Height)
-							if ok {
-								d.texture = tex
-								d.srv = srv
+
+							// The producer can restart at a different
+							// resolution than the texture it left behind
+							// (ACCESS_LOST only releases d.dupl, not
+							// d.texture/d.srv -- correct, that's what keeps
+							// the last frame drawing through the outage).
+							// Recreate on mismatch instead of reusing the old
+							// texture at its old size forever.
+							if d.texture != nil {
+								tex_desc: d3d11.TEXTURE2D_DESC
+								d.texture->GetDesc(&tex_desc)
+								if tex_desc.Width != desc.ModeDesc.Width || tex_desc.Height != desc.ModeDesc.Height {
+									log.infof("display source: output %v/%v resized %vx%v -> %vx%v, recreating texture",
+										d.adapter_index, d.output_index, tex_desc.Width, tex_desc.Height,
+										desc.ModeDesc.Width, desc.ModeDesc.Height)
+									if d.srv != nil     { d.srv->Release();     d.srv = nil }
+									if d.texture != nil { d.texture->Release(); d.texture = nil }
+								}
+							}
+
+							if d.texture == nil {
+								tex, srv, ok := capture.create_capture_texture(
+									win.device, desc.ModeDesc.Width, desc.ModeDesc.Height)
+								if ok {
+									d.texture = tex
+									d.srv = srv
+								}
 							}
 						}
 						if d.dupl != nil && d.texture != nil {
@@ -648,7 +846,102 @@ main :: proc() {
 							color = {1, 1, 1, 1},
 							texture = d.srv,
 						})
-				}
+					case scene.Window_Data:
+						if d.capture != nil && capture.window_capture_lost(d.capture) && !d.lost {
+							log.warnf("window source: %q lost", d.title)
+							d.lost = true
+							d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
+						}
+						if (d.capture == nil || d.lost) && time.now()._nsec >= d.next_retry._nsec {
+							hwnd, resolved := capture.resolve_window(d.title, d.class_name, d.exe_name)
+							if !resolved {
+								if !d.lost {
+									log.warnf("window source: window %q not found", d.title)
+									d.lost = true
+								} else {
+									log.debugf("window source: retry: %q still not found", d.title)
+								}
+								d.next_retry = time.time_add(time.now(), 2 * time.Second)
+							} else {
+								if wc, wc_ok := capture.start_window_capture(win.device, win.device_context, hwnd, log_sink); wc_ok {
+									// Apply the source's stored toggles before
+									// this capture is used for anything --
+									// see item 6: a source recovering from
+									// loss must come back with them intact,
+									// which is why they live on Window_Data
+									// and not only on the session. game_capture
+									// forces cursor capture off regardless of
+									// hide_cursor; it does not overwrite the
+									// user's separate hide_cursor preference.
+									capture.window_capture_set_cursor_capture(wc, !d.hide_cursor && !d.game_capture)
+									capture.window_capture_set_border_required(wc, !d.hide_border)
+
+									// Swap in the new capture and only then
+									// release the old one -- its srv is what
+									// may have been drawn this frame already
+									// (or will be, below, using d.capture
+									// which is now the new one) and must
+									// never be released while a quad this
+									// frame could still reference it.
+									old := d.capture
+									d.capture = wc
+									if old != nil {
+										capture.stop_window_capture(old)
+									}
+									if d.lost {
+										log.infof("window source: %q recovered (%vx%v)", d.title, wc.width, wc.height)
+									} else {
+										log.infof("window source: capture started for %q (%vx%v)", d.title, wc.width, wc.height)
+									}
+									d.lost = false
+								} else {
+									if !d.lost {
+										log.errorf("window source: start_window_capture failed for %q", d.title)
+										d.lost = true
+									} else {
+										log.debugf("window source: retry: start_window_capture failed again for %q", d.title)
+									}
+									d.next_retry = time.time_add(time.now(), 2 * time.Second)
+								}
+							}
+						}
+						if d.capture != nil && !d.lost {
+							if !capture.window_capture_service_resize(d.capture, win.device) {
+								log.errorf("window source: %q resize failed, treating as lost", d.title)
+								capture.stop_window_capture(d.capture)
+								d.capture = nil
+								d.lost = true
+								d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
+							}
+						}
+
+
+						if d.capture != nil && d.capture.srv != nil {
+							append(&quads, render.Quad{
+								x = src.x, y = src.y, w = src.w, h = src.h,
+								color = {1, 1, 1, 1},
+								texture = d.capture.srv,
+							})
+						}
+					case scene.Camera_Data:
+						// Lazy start: first visible frame with a device set spawns the reader.
+						if d.cam == nil && d.symlink != "" {
+							wide := windows.utf8_to_utf16(d.symlink, context.temp_allocator)
+							d.cam = capture.camera_start(wide, log_sink, capture.next_camera_tag_index(src.id))
+						}
+						// Per-frame upload: pull the latest CPU frame onto the dynamic texture.
+						if d.cam != nil {
+							capture.camera_upload(d.cam, win.device, &d.texture, &d.srv, &d.width, &d.height)
+						}
+						if d.srv != nil {
+							append(&quads, render.Quad{
+								x = src.x, y = src.y, w = src.w, h = src.h,
+								color = {1, 1, 1, 1},
+								texture = d.srv,
+							})
+						}
+					}
+
 			}
 		}
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
@@ -749,6 +1042,8 @@ main :: proc() {
 			dumped = true
 		}
 
+		ui.load_layout()
+
 		// Start the Dear ImGui frame
 		imdx11.NewFrame()
 		imwin32.NewFrame()
@@ -791,7 +1086,7 @@ main :: proc() {
 		}
 
 		// Present
-		hr := win.swap_chain->Present(1, {}) // Present with vsync
+		hr = win.swap_chain->Present(1, {}) // Present with vsync
 		//hr := win.swap_chain->Present(0, {}) // Present without vsync
         free_all(context.temp_allocator)
 		if hr < 0 && hr != dxgi.STATUS_OCCLUDED {

@@ -89,6 +89,21 @@ present :: proc(win: ^Window) {
 
 }
 
+// ID3D11Multithread — not in vendor bindings; hand-written from d3d11_4.h
+ID3D11Multithread_VTable :: struct {
+	// IUnknown
+	QueryInterface:          proc "stdcall" (this: ^ID3D11Multithread, riid: ^win32.GUID, ppv: ^rawptr) -> win32.HRESULT,
+	AddRef:                  proc "stdcall" (this: ^ID3D11Multithread) -> u32,
+	Release:                 proc "stdcall" (this: ^ID3D11Multithread) -> u32,
+	// ID3D11Multithread
+	Enter:                   proc "stdcall" (this: ^ID3D11Multithread),
+	Leave:                   proc "stdcall" (this: ^ID3D11Multithread),
+	SetMultithreadProtected: proc "stdcall" (this: ^ID3D11Multithread, bMTProtect: win32.BOOL) -> win32.BOOL,
+	GetMultithreadProtected: proc "stdcall" (this: ^ID3D11Multithread) -> win32.BOOL,
+}
+ID3D11Multithread :: struct { using vtbl: ^ID3D11Multithread_VTable }
+IID_ID3D11Multithread := win32.GUID{0x9B7E4E00, 0x342C, 0x4106, {0xA1, 0x9F, 0x4F, 0x27, 0x04, 0xF6, 0x89, 0xF0}}
+
 // Helper functions
 create_device_d3d :: proc(win: ^Window) -> bool {
 	sd := dxgi.SWAP_CHAIN_DESC{
@@ -107,7 +122,7 @@ create_device_d3d :: proc(win: ^Window) -> bool {
 		SwapEffect  = .DISCARD,
 	}
 
-	create_device_flags: d3d11.CREATE_DEVICE_FLAGS
+	create_device_flags := d3d11.CREATE_DEVICE_FLAGS{.BGRA_SUPPORT, .VIDEO_SUPPORT}
 	when ODIN_DEBUG do create_device_flags += {.DEBUG}
 	feature_level: d3d11.FEATURE_LEVEL
 	feature_level_array := [2]d3d11.FEATURE_LEVEL{._11_0, ._10_0}
@@ -150,6 +165,17 @@ create_device_d3d :: proc(win: ^Window) -> bool {
 		pSwapChainFactory->Release()
 	} else {
 		log.warn("GetParent on swap chain failed, Alt+Enter remains enabled")
+	}
+
+	// Enable D3D11 multithread protection so the immediate context is safe
+	// to use from the WGC frame-arrived callback thread.
+	mt: ^ID3D11Multithread
+	if hr := win.device_context->QueryInterface(&IID_ID3D11Multithread, (^rawptr)(&mt)); hr >= 0 {
+		mt->SetMultithreadProtected(win32.TRUE) // returns previous state, not HRESULT
+		log.info("ID3D11Multithread: protection enabled on immediate context")
+		mt->Release()
+	} else {
+		log.warnf("ID3D11Multithread QI failed: HRESULT 0x%08X", u32(hr))
 	}
 
 	create_render_target(win)

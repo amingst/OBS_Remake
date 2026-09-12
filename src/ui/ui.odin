@@ -1,5 +1,6 @@
 package ui
 
+import "core:os"
 import "core:log"
 import im "libs:odin-imgui"
 
@@ -7,6 +8,8 @@ import "../capture"
 import "../scene"
 import "../settings"
 import "../audio"
+
+DEFAULT_LAYOUT :: #load("default_layout.ini", string)
 
 State :: struct {
     show_demo: bool,
@@ -63,7 +66,21 @@ init_state :: proc(doc: ^scene.Collection) -> State {
     return state
 }
 
+load_layout :: proc() {
+// Load Default IMGUI Layout from default_layout.ini
+		io := im.GetIO()
+		io.IniFilename = "imgui.ini"
+
+		if !os.exists(string(io.IniFilename)) {
+			im.LoadIniSettingsFromMemory(
+				cstring(raw_data(DEFAULT_LAYOUT)),
+				uint(len(DEFAULT_LAYOUT))
+			)
+		}
+}
+
 destroy :: proc(state: ^State) {
     log.debug("UI state torn down")
+    destroy_sources_state(&state.sources)
     // future panels' destroyers go here
 }
