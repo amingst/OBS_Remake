@@ -126,7 +126,17 @@ get_exe_basename :: proc(hwnd: win32.HWND, allocator: runtime.Allocator) -> stri
 // open file), else unresolved. Empty class_name falls back to title-only
 // FindWindowW for sources persisted before class/exe tracking existed.
 resolve_window :: proc(title, class_name, exe_name: string) -> (hwnd: win32.HWND, ok: bool) {
+	// A source with no identity yet (added, but no window picked) resolves to nothing:
+	// FindWindowW with an empty title matches an arbitrary untitled window, which then
+	// fails CreateForWindow with E_INVALIDARG on every retry.
+	if title == "" && class_name == "" && exe_name == "" {
+		return nil, false
+	}
+
 	if class_name == "" {
+		if title == "" {
+			return nil, false
+		}
 		h := win32.FindWindowW(nil, win32.utf8_to_wstring(title))
 		return h, h != nil
 	}

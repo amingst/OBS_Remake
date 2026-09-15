@@ -219,8 +219,11 @@ draw_window_picker :: proc(d: ^scene.Window_Data, state: ^Sources_State) {
         im.Checkbox("Show all windows", &state.window_picker_show_all)
         im.Separator()
 
+        // The list is freed after the loop, not inside it: destroying it mid-iteration
+        // leaves the range walking freed Window_Info strings.
+        picked := -1
         any_shown := false
-        for w in state.window_picker_list {
+        for w, i in state.window_picker_list {
             if d.game_capture && !state.window_picker_show_all && !w.likely_game {
                 continue
             }
@@ -229,25 +232,30 @@ draw_window_picker :: proc(d: ^scene.Window_Data, state: ^Sources_State) {
             exe: cstring = w.exe_name != "" ? fmt.ctprintf("%v", w.exe_name) : "?"
             label := fmt.ctprintf("%v  [%v]", w.title, exe)
             if im.Selectable(label, false) {
-                if d.capture != nil {
-                    capture.stop_window_capture(d.capture)
-                    d.capture = nil
-                }
-                if d.title      != "" do delete(d.title)
-                if d.class_name != "" do delete(d.class_name)
-                if d.exe_name   != "" do delete(d.exe_name)
-                d.title      = strings.clone(w.title)
-                d.class_name = strings.clone(w.class_name)
-                d.exe_name   = strings.clone(w.exe_name)
-                d.lost       = false
-                d.next_retry = {}
-
-                capture.destroy_window_list(state.window_picker_list)
-                state.window_picker_list = nil
-                im.CloseCurrentPopup()
+                picked = i
+                break
             }
         }
-        if !any_shown {
+
+        if picked >= 0 {
+            w := state.window_picker_list[picked]
+            if d.capture != nil {
+                capture.stop_window_capture(d.capture)
+                d.capture = nil
+            }
+            if d.title      != "" do delete(d.title)
+            if d.class_name != "" do delete(d.class_name)
+            if d.exe_name   != "" do delete(d.exe_name)
+            d.title      = strings.clone(w.title)
+            d.class_name = strings.clone(w.class_name)
+            d.exe_name   = strings.clone(w.exe_name)
+            d.lost       = false
+            d.next_retry = {}
+
+            capture.destroy_window_list(state.window_picker_list)
+            state.window_picker_list = nil
+            im.CloseCurrentPopup()
+        } else if !any_shown {
             im.TextDisabled(d.game_capture ? "No likely-game windows found (try Show all windows)" : "No windows found")
         }
 
@@ -544,27 +552,35 @@ draw_camera_picker :: proc(d: ^scene.Camera_Data, state: ^Sources_State) {
         if len(state.camera_picker_list) == 0 {
             im.TextDisabled("No cameras found")
         }
-        for dev in state.camera_picker_list {
+        // Freed after the loop, for the same reason as the window picker above.
+        picked := -1
+        for dev, i in state.camera_picker_list {
             label := fmt.ctprintf("%v", dev.friendly_name)
             if im.Selectable(label, false) {
-                if d.cam != nil {
-                    capture.camera_stop(d.cam)
-                    d.cam = nil
-                }
-                if d.srv != nil     { d.srv->Release();     d.srv = nil }
-                if d.texture != nil { d.texture->Release(); d.texture = nil }
-                d.width  = 0
-                d.height = 0
-
-                if d.symlink       != "" do delete(d.symlink)
-                if d.friendly_name != "" do delete(d.friendly_name)
-                d.symlink       = strings.clone(dev.symlink)
-                d.friendly_name = strings.clone(dev.friendly_name)
-
-                capture.destroy_camera_list(state.camera_picker_list)
-                state.camera_picker_list = nil
-                im.CloseCurrentPopup()
+                picked = i
+                break
             }
+        }
+
+        if picked >= 0 {
+            dev := state.camera_picker_list[picked]
+            if d.cam != nil {
+                capture.camera_stop(d.cam)
+                d.cam = nil
+            }
+            if d.srv != nil     { d.srv->Release();     d.srv = nil }
+            if d.texture != nil { d.texture->Release(); d.texture = nil }
+            d.width  = 0
+            d.height = 0
+
+            if d.symlink       != "" do delete(d.symlink)
+            if d.friendly_name != "" do delete(d.friendly_name)
+            d.symlink       = strings.clone(dev.symlink)
+            d.friendly_name = strings.clone(dev.friendly_name)
+
+            capture.destroy_camera_list(state.camera_picker_list)
+            state.camera_picker_list = nil
+            im.CloseCurrentPopup()
         }
 
         im.Separator()
