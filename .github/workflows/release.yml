@@ -23,7 +23,7 @@ jobs:
           release: nightly
 
       - name: Install premake5
-        run: choco install premake5 -y
+        run: choco install premake5 -y --pre
 
       - name: Build imgui lib
         run: setup.bat
