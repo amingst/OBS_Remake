@@ -38,7 +38,8 @@ draw_preview :: proc(
     tex:      im.TextureRef,
     canvas_w, canvas_h: f32,
 ) {
-    if im.Begin("Preview") {
+    p := panel_begin("Preview")
+    if p.visible {
         avail := im.GetContentRegionAvail()
 
         if avail.x > 0 && avail.y > 0 {
@@ -74,7 +75,7 @@ draw_preview :: proc(
             state.logged_collapsed = true
         }
     }
-    im.End()
+    panel_end(p)
 }
 
 screen_to_canvas :: proc(state: ^Preview_State, canvas_w, canvas_h: f32, p: [2]f32) -> [2]f32 {

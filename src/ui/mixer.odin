@@ -18,7 +18,8 @@ audio_src_label :: proc (o: scene.Source) -> cstring {
 }
 
 draw_mixer :: proc(state: ^Mixer_State, scenes: ^Scenes_State, doc: ^scene.Collection) {
-    if im.Begin("Audio Mixer") {
+    p := panel_begin("Audio Mixer")
+    if p.visible {
         sc := scene.find(doc, scenes.selected_id)
         if sc == nil {
             im.TextDisabled("No Scenes Selected")
@@ -45,5 +46,5 @@ draw_mixer :: proc(state: ^Mixer_State, scenes: ^Scenes_State, doc: ^scene.Colle
             if !any do im.TextDisabled("No audio sources in this scene")
         }
     }
-    im.End();
+    panel_end(p)
 }

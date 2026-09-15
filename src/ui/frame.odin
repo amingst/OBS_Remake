@@ -213,6 +213,47 @@ draw_status_bar :: proc(state: ^State, pos, size: im.Vec2) {
     im.PopStyleVar(2)
 }
 
+PANEL_GUTTER   :: 6  // dock-window padding; becomes the gap between cards
+PANEL_PADDING  :: 12 // inside the card
+PANEL_ROUNDING :: 12
+
+// A docked panel drawn as a rounded card. The dock window itself is painted in the
+// page background and holds only padding; the content goes in a rounded child, since
+// docked windows are always square-cornered and flush against each other.
+Panel :: struct {
+    open:    bool, // dock window open -- End() is required either way
+    visible: bool, // card is visible; draw content only when true
+}
+
+panel_begin :: proc(name: cstring) -> Panel {
+    scale := ui_scale()
+
+    im.PushStyleColorVec4(.WindowBg, rgba(BG))
+    im.PushStyleVarVec2(.WindowPadding, {PANEL_GUTTER * scale, PANEL_GUTTER * scale})
+
+    p: Panel
+    p.open = im.Begin(name)
+    im.PopStyleVar()
+
+    if p.open {
+        im.PushStyleColorVec4(.ChildBg, rgba(SURFACE))
+        im.PushStyleVar(.ChildRounding, PANEL_ROUNDING * scale)
+        im.PushStyleVarVec2(.WindowPadding, {PANEL_PADDING * scale, PANEL_PADDING * scale})
+        p.visible = im.BeginChild("##card", {0, 0}, {.Borders})
+        im.PopStyleVar(2)
+    }
+    return p
+}
+
+panel_end :: proc(p: Panel) {
+    if p.open {
+        im.EndChild()
+        im.PopStyleColor() // ChildBg
+    }
+    im.End()
+    im.PopStyleColor() // WindowBg
+}
+
 // Full-width button in explicit colors; height 0 means the default frame height.
 @(private="file")
 wide_button :: proc(label: cstring, bg, bg_hover: u32, height: f32) -> bool {

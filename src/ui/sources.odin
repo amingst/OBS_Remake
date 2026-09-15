@@ -277,7 +277,8 @@ draw_sources :: proc(
     canvas_w, canvas_h: f32,
     devices: []audio.Device_Info,
 ) {
-    if im.Begin("Sources") {
+    p := panel_begin("Sources")
+    if p.visible {
         sc := scene.find(doc, scenes.selected_id)
         if sc == nil {
             im.TextDisabled("No scene selected")
@@ -525,7 +526,7 @@ draw_sources :: proc(
         }
     }
 
-    im.End()
+    panel_end(p)
 }
 
 // Camera picker: stops the old reader and stores the new identity, but never
