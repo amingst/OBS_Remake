@@ -32,8 +32,7 @@ Incoming_Chunk_State :: struct {
 }
 
 // Writes msg into dst as one or more chunks. Returns bytes written, or -1 if
-// dst is too small -- in which case dst and states are left untouched, so a
-// short buffer can't desync the chunk state.
+// dst is too small (dst and states are left untouched in that case).
 encode_message :: proc(dst: []u8, msg: Message, chunk_size: u32, states: ^map[u32]Chunk_State) -> int {
 	state := states[msg.csid]
 
@@ -54,9 +53,7 @@ encode_message :: proc(dst: []u8, msg: Message, chunk_size: u32, states: ^map[u3
 		}
 	}
 
-	// Bounds check before writing anything, so a short buffer leaves both dst
-	// and the chunk state untouched. An encode that half-wrote and then
-	// advanced `states` would make every subsequent delta wrong.
+	// Bounds check before writing anything, so a short buffer can't desync the chunk state.
 	if required := encoded_size(msg, fmt_type, delta, chunk_size); required > len(dst) {
 		return -1
 	}
@@ -169,10 +166,7 @@ put_u24_be :: proc(dst: []u8, val: u32) {
 	dst[2] = u8(val & 0xFF)
 }
 
-// msg_fmt is the format chosen for the message as a whole; fmt_type is this
-// particular chunk's (3 for continuations). They differ because the extended
-// timestamp is decided by the message's own timestamp but must be repeated on
-// every chunk regardless of that chunk's header format.
+// msg_fmt is the message's own format; fmt_type is this chunk's (3 for continuations).
 @(private = "file")
 write_message_header :: proc(dst: []u8, fmt_type: u8, msg: Message, delta: u32, msg_fmt: u8) -> int {
 	time_val := msg_fmt == 0 ? msg.timestamp : delta

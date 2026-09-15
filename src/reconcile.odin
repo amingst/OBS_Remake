@@ -6,25 +6,18 @@ import "vendor:directx/d3d11"
 import "render"
 import "settings"
 
-// Deliberately a Video_Settings and not a Profile: this mirrors what has
-// actually been built on the device, and nothing in a Profile outside `video`
-// drives a resource -- id and name have no live counterpart to reconcile
-// against, so holding them here would only be a second copy to keep in sync.
+// Video settings currently built into live GPU resources.
 Applied :: struct {
 	video: settings.Video_Settings,
 }
 
+// Brings the render target in line with the desired profile's video settings.
 reconcile :: proc(applied: ^Applied, desired: ^settings.Profile, device: ^d3d11.IDevice, target: ^render.Target, output_active: bool) {
 	// Canvas resolution
 	if desired.video.canvas_width  != applied.video.canvas_width ||
 	   desired.video.canvas_height != applied.video.canvas_height {
 		if output_active {
-			// The encoder was configured with the applied dimensions; resizing
-			// the target out from under it mid-run would break any active
-			// output (recording or streaming). Revert desired rather than just
-			// skipping the block, so this check doesn't re-fire every frame
-			// for as long as the output continues -- same shape as the
-			// invalid-resolution case below.
+			// Can't resize the canvas while an output is active.
 			log.warnf("ignoring canvas resolution change %vx%v -> %vx%v while output is active, keeping %vx%v",
 				applied.video.canvas_width, applied.video.canvas_height,
 				desired.video.canvas_width, desired.video.canvas_height,

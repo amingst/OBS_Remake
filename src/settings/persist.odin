@@ -28,16 +28,7 @@ Settings_DTO :: struct {
     stream:  Stream_Settings_DTO,
 }
 
-// Version of the settings file, root/settings.json (Settings_DTO above).
-// Independent of config.CURRENT_VERSION, which versions app.json -- the two
-// files have separate schemas and separate migration histories, so bumping one
-// says nothing about the other.
-//
-// Stays at 1 across the id/name addition: a version bump exists to tell a
-// reader what an *existing* file on disk means, and nothing has shipped, so no
-// file with the old fieldless shape exists anywhere to be distinguished. Such a
-// file would in any case be caught by dto_is_valid's empty-id check and fall
-// back to defaults, which is the same outcome a version mismatch would produce.
+// Version of the settings file (Settings_DTO), independent of app.json's version.
 @(private)
 CURRENT_VERSION :: 1
 
@@ -49,9 +40,6 @@ save :: proc(cfg: ^Profile, path: string) -> bool {
         return false
     }
 
-    // write_entire_file creates the file if it is missing, so a config file
-    // deleted mid-session is simply recreated. A missing *directory* is not
-    // recovered here -- that is main's job at startup.
     if werr := os.write_entire_file(path, data); werr != nil {
         log.errorf("settings write failed: %v (%v)", path, werr)
         return false
@@ -64,9 +52,7 @@ save :: proc(cfg: ^Profile, path: string) -> bool {
 load :: proc(cfg: ^Profile, path: string) -> bool {
     data, rerr := os.read_entire_file(path, context.temp_allocator)
     if rerr != nil {
-        // No file is the normal first-run case and must stay quiet. Anything
-        // else (permissions, a directory where the file should be, a bad path)
-        // is worth a line, but is still non-fatal -- the caller keeps defaults.
+        // Missing file is the normal first-run case; anything else logs a warning.
         if rerr != os.General_Error.Not_Exist {
             log.warnf("settings read failed: %v (%v)", path, rerr)
         }
@@ -89,18 +75,8 @@ load :: proc(cfg: ^Profile, path: string) -> bool {
     return true
 }
 
-// A syntactically valid file can still hold nonsense -- a hand-edited
-// "canvas_width": 0, or a field omitted entirely, which unmarshals to zero.
-// Rejecting the whole file here means main never gets a chance to call
-// create_target with a degenerate size; the defaults create_default
-// established stand.
-//
-// Not every bad field is fatal, and the split is by what the field is *for*:
-// an id is how a profile is addressed and saved back, so a file without one
-// describes a profile that cannot be referred to -- there is nothing sensible
-// to invent. A name is a human label; a missing one costs nothing to
-// substitute, so it is repaired in place rather than throwing away an
-// otherwise good file.
+// Rejects a syntactically valid but nonsensical file (e.g. canvas_width: 0);
+// a missing id rejects the file, a missing name is repaired in place.
 @(private="file")
 dto_is_valid :: proc(dto: ^Settings_DTO, path: string) -> bool {
     if dto.id == "" {
@@ -121,17 +97,13 @@ dto_is_valid :: proc(dto: ^Settings_DTO, path: string) -> bool {
         return false
     }
 
-    // Unlike video, an empty/zero stream config is a legitimate "streaming
-    // not set up yet" state -- Start_Streaming is what rejects a blank host
-    // or stream_key, the same way paths.videos == "" is checked at
-    // recording-start rather than at settings-load. Nothing here to reject.
+    // An empty/zero stream config is a legitimate "not set up yet" state.
     return true
 }
 
+// Borrows cfg's strings; the DTO doesn't outlive the marshal call in save.
 @(private="file")
 to_dto :: proc(cfg: ^Profile) -> Settings_DTO {
-    // id and name are borrowed, not cloned: the DTO lives only until the
-    // json.marshal call in save returns, well inside the profile's lifetime.
     return Settings_DTO {
         version = CURRENT_VERSION,
         id = cfg.id,
@@ -154,11 +126,8 @@ to_dto :: proc(cfg: ^Profile) -> Settings_DTO {
     }
 }
 
-// The first from_dto that does more than copy scalars. Two things follow from
-// that: the DTO's strings point into the temp allocator json.unmarshal was
-// given and are gone at the end of the frame, so they must be cloned; and cfg
-// arrives already populated by create_default, so the strings being replaced
-// have to be freed first or every successful load leaks an id and a name.
+// Frees cfg's existing strings (already populated by create_default) and
+// clones the DTO's (temp-allocated, won't outlive this call).
 @(private="file")
 from_dto :: proc(dto: ^Settings_DTO, cfg: ^Profile) {
     delete(cfg.id)

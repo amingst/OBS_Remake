@@ -7,10 +7,7 @@ import "../config"
 import "../scene"
 import "../ui"
 
-// Dispatches a Scene Collection menu request raised by ui. Same one-shot
-// contract as handle_profile_request: the request and whatever owned strings
-// ui attached to it are always cleared, whether or not the action went
-// through.
+// Dispatches a Scene Collection menu request raised by ui; always clears the request.
 handle_collection_request :: proc(
 	req:     ui.Collection_Request,
 	state:   ^ui.Collection_State,
@@ -39,8 +36,7 @@ handle_collection_request :: proc(
 			return
 		}
 		if created, ok := scene.create(paths.collections, name); ok {
-			// Belt-and-braces, as with profiles: don't lose unsaved edits to
-			// the collection being left behind.
+			// Save the outgoing collection so its edits aren't lost.
 			scene.save_collection(doc, paths.collections)
 			scene.destroy_all(doc)
 			doc^ = created
@@ -67,11 +63,7 @@ handle_collection_request :: proc(
 	}
 }
 
-// Scenes and sources have no Apply button -- edits are immediate -- so
-// saving on every mutation would mean a disk write on every frame of a
-// DragFloat drag. Switch and exit are the two natural save points instead,
-// same trade-off profiles make around their own Apply button: anything
-// since the last switch or exit is lost on a crash.
+// Saves and switches the active scene collection.
 @(private = "file")
 switch_collection :: proc(id: string, doc: ^scene.Collection, app_cfg: ^config.App_Config, paths: ^config.Paths) -> bool {
 	if id == doc.id do return false
@@ -89,12 +81,7 @@ switch_collection :: proc(id: string, doc: ^scene.Collection, app_cfg: ^config.A
 		return false
 	}
 
-	// destroy_all releases any active display-capture COM objects for the
-	// outgoing collection. This has to run here, at the same point in the
-	// loop as the profile switch, and not from inside ui.draw or a frame
-	// later: the quads-building block later in the frame reads doc's sources
-	// and lazily (re)starts captures for whichever collection is current, so
-	// the swap must be complete before it runs.
+	// Releases the outgoing collection's active captures before the swap.
 	scene.destroy_all(doc)
 	doc^ = loaded
 	set_active_collection(app_cfg, paths, doc.id)
@@ -120,7 +107,6 @@ delete_active_collection :: proc(
 
 	survivor := pick_collection_survivor(infos^, doc.id)
 	if survivor == "" {
-		// registry.remove would refuse this too, but silently -- surface it.
 		state.denied = strings.clone("Can't delete the only remaining scene collection.")
 		return
 	}
@@ -131,11 +117,7 @@ delete_active_collection :: proc(
 		return
 	}
 
-	// Same ordering as delete_active_profile and for the same reason: doc
-	// has to move aside, releasing its COM objects, before its file is
-	// removed -- deleting first would leave doc pointing at a vanished file
-	// (which a later save would just recreate) with nothing downstream built
-	// to run a frame against no collection at all.
+	// Move the active collection aside (releasing its COM objects) before deleting its file.
 	prev_id := strings.clone(doc.id)
 	defer delete(prev_id)
 
@@ -152,8 +134,7 @@ delete_active_collection :: proc(
 	log.infof("deleted scene collection %v, switched to %v (%v)", prev_id, doc.name, doc.id)
 }
 
-// First by name, not enumeration order, tie-broken by id -- mirrors
-// pick_survivor for the same reasons.
+// Picks a replacement collection: first by name, tie-broken by id.
 @(private = "file")
 pick_collection_survivor :: proc(infos: []scene.Collection_Info, exclude_id: string) -> string {
 	best := -1
@@ -183,11 +164,7 @@ refresh_collection_infos :: proc(infos: ^[]scene.Collection_Info, paths: ^config
 	infos^ = paths.collections != "" ? scene.enumerate(paths.collections) : nil
 }
 
-// selected_id on both scenes and sources refers to ids owned by whichever
-// collection was active before a switch/create/delete; the new collection
-// doesn't have those ids, so both must be repointed. Mirrors what
-// ui.init_state seeds on first load: the new collection's first scene, or
-// nothing if it's empty.
+// Repoints scene/source selection at the new collection after a switch.
 @(private = "file")
 reset_collection_selection :: proc(scenes: ^ui.Scenes_State, sources: ^ui.Sources_State, doc: ^scene.Collection) {
 	sources.selected_id = 0

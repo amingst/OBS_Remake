@@ -14,9 +14,7 @@ Collection_Request :: enum {
     Delete,
 }
 
-// Requests are raised here and consumed/cleared by main -- same pattern as
-// Profile_State.request, and for the same reason: ui has no config path and
-// cannot touch the registry itself.
+// Requests are raised here and consumed/cleared by main, which owns the config path.
 Collection_State :: struct {
     request:      Collection_Request,
     switch_to:    string,  // owned clone of the target collection id; set only for .Switch
@@ -32,9 +30,7 @@ init_collections_state :: proc() -> Collection_State {
     return Collection_State{}
 }
 
-// infos is owned and refreshed by main (a directory scan per frame would be
-// wasteful); a collection added, renamed, or removed outside the app isn't
-// reflected here until main's next refresh.
+// infos is owned and refreshed by main, not rescanned every frame.
 draw_collection_menu :: proc(state: ^Collection_State, infos: []scene.Collection_Info, active_id, active_name: string) {
     if im.BeginMenu("Scene Collection") {
         for info in infos {
@@ -49,9 +45,7 @@ draw_collection_menu :: proc(state: ^Collection_State, infos: []scene.Collection
 
         im.Separator()
 
-        // These only raise a flag rather than calling im.OpenPopup directly --
-        // see the identical comment in draw_profile_menu for why calling
-        // OpenPopup from inside a nested menu doesn't work.
+        // Raise a flag rather than calling im.OpenPopup directly -- see draw_profile_menu.
         if im.MenuItem("New Collection...") {
             state.name_buf = {}
             state.want_new = true
@@ -69,11 +63,7 @@ draw_collection_menu :: proc(state: ^Collection_State, infos: []scene.Collection
     }
 }
 
-// Called every frame regardless of whether the Scene Collection menu is open
-// -- BeginPopupModal has to run every frame for ImGui to keep tracking an
-// already-open popup, same reason draw_settings is unconditional. OpenPopup
-// is called right here, next to its BeginPopupModal, so both see the same
-// (top-level) ID stack.
+// Called every frame regardless of menu state -- see draw_profile_popups.
 draw_collection_popups :: proc(state: ^Collection_State, active_name: string) {
     if state.want_new {
         im.OpenPopup("New Collection")

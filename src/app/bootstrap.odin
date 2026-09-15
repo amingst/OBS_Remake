@@ -12,10 +12,7 @@ import "../config"
 import "../scene"
 import "../settings"
 
-// One log file per run, named with the start timestamp, under the same
-// config root as everything else in Paths. Not fatal if it can't be opened
-// (no root, or the open itself fails) -- the app already has the ring buffer
-// and console, so it just says so once and moves on.
+// Opens one log file per run under paths.root, named with the start timestamp.
 open_log_file :: proc(sink: ^applog.Sink, paths: ^config.Paths) {
 	if paths.root == "" do return
 
@@ -30,13 +27,7 @@ open_log_file :: proc(sink: ^applog.Sink, paths: ^config.Paths) {
 	}
 }
 
-// One-shot migration of the pre-profile settings file (root/settings.json)
-// into profiles/<id>.json. A successful migration is detected by the *new*
-// file existing, not by the old one being gone -- so a run that migrates but
-// fails to delete settings.json does not fabricate a second profile from the
-// same content on the next launch. Safe to delete this proc, its call site,
-// and Paths.settings once existing installs have all been through it --
-// say, mid-2027.
+// One-shot migration of the pre-profile settings.json into profiles/<id>.json.
 @(private = "file")
 migrate_legacy_settings :: proc(paths: ^config.Paths) -> (id: string, migrated: bool) {
 	if paths.settings == "" || paths.profiles == "" do return
@@ -67,11 +58,8 @@ migrate_legacy_settings :: proc(paths: ^config.Paths) -> (id: string, migrated: 
 	return strings.clone(legacy.id), true
 }
 
-// Loads app.json, applies the one-shot legacy migration, and selects the
-// active profile: load-active / pick-first-by-name / create-Default. Whichever
-// branch fills cfg, app.json is written back if the resulting active profile
-// id doesn't already match it. Returns the selected profile and the Profile
-// menu's cached listing.
+// Loads app.json, migrates legacy settings if needed, and selects the active
+// profile (load-active / pick-first-by-name / create-Default).
 load_app_config_and_profile :: proc(paths: ^config.Paths) -> (app_cfg: config.App_Config, cfg: settings.Profile, profile_infos: []settings.Profile_Info) {
 	if paths.app_config != "" {
 		config.load_app_config(&app_cfg, paths.app_config)
@@ -82,10 +70,6 @@ load_app_config_and_profile :: proc(paths: ^config.Paths) -> (app_cfg: config.Ap
 		app_cfg.active_profile_id = migrated_id
 	}
 
-	// Profile owns two heap strings (id, name), so unlike the old plain-data
-	// Settings it needs a matching destroy. Whichever branch below ends up
-	// filling cfg, destroy_profile is called exactly once on whatever it
-	// replaces first, so nothing leaks.
 	cfg = settings.create_default()
 	selected := false
 
@@ -108,16 +92,13 @@ load_app_config_and_profile :: proc(paths: ^config.Paths) -> (app_cfg: config.Ap
 					selected = true
 				}
 			} else {
-				// Deleted outside the app. Fall through to the deterministic
-				// pick below rather than treating this as fatal.
 				log.warnf("active profile %v not found among %v profile(s) in %v; picking another",
 					app_cfg.active_profile_id, len(infos), paths.profiles)
 			}
 		}
 
 		if !selected && len(infos) > 0 {
-			// First by name, not directory order, so the pick is stable
-			// across runs. Tie-break on id in case two profiles share a name.
+			// First by name (stable across runs), tie-broken by id.
 			best := 0
 			for info, i in infos {
 				if info.name < infos[best].name ||
@@ -141,7 +122,7 @@ load_app_config_and_profile :: proc(paths: ^config.Paths) -> (app_cfg: config.Ap
 		}
 	}
 
-	// Whichever profile ended up active, keep app.json in sync with it.
+	// Keep app.json in sync with whichever profile ended up active.
 	if selected && paths.app_config != "" && app_cfg.active_profile_id != cfg.id {
 		delete(app_cfg.active_profile_id)
 		app_cfg.active_profile_id = strings.clone(cfg.id)
@@ -151,10 +132,7 @@ load_app_config_and_profile :: proc(paths: ^config.Paths) -> (app_cfg: config.Ap
 	log.infof("profile %v (%v) active (canvas %vx%v)",
 		cfg.name, cfg.id, cfg.video.canvas_width, cfg.video.canvas_height)
 
-	// The Profile menu's list. A directory scan plus one parse per profile
-	// isn't something to redo every frame, so it's cached here and only
-	// refreshed after a create/rename/delete goes through -- a profile added,
-	// renamed, or removed outside the app isn't noticed until then.
+	// Cached listing for the Profile menu; refreshed on create/rename/delete.
 	if paths.profiles != "" {
 		profile_infos = settings.enumerate(paths.profiles)
 	}
@@ -162,9 +140,7 @@ load_app_config_and_profile :: proc(paths: ^config.Paths) -> (app_cfg: config.Ap
 	return
 }
 
-// Same load-active / pick-first / create-Default shape as
-// load_app_config_and_profile, for scene collections. Unlike profiles there's
-// no migration branch, since collections have never been persisted before.
+// Same load-active / pick-first / create-Default shape for scene collections.
 load_scene_collection :: proc(paths: ^config.Paths, app_cfg: ^config.App_Config) -> (doc: scene.Collection, collection_infos: []scene.Collection_Info) {
 	doc = scene.create_default()
 	collection_selected := false
@@ -225,8 +201,7 @@ load_scene_collection :: proc(paths: ^config.Paths, app_cfg: ^config.App_Config)
 
 	log.infof("scene collection %v (%v) active (%v scene(s))", doc.name, doc.id, len(doc.scenes))
 
-	// The Scene Collection menu's list, cached and refreshed the same way as
-	// profile_infos in load_app_config_and_profile.
+	// Cached listing for the Scene Collection menu.
 	if paths.collections != "" {
 		collection_infos = scene.enumerate(paths.collections)
 	}

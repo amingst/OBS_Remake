@@ -32,17 +32,8 @@ maybe_release_encoder :: proc(output: ^Output_State) {
 	output.enc = nil
 }
 
-// Dispatches a Controls panel request raised by ui. Same one-shot contract as
-// handle_profile_request: the request is always cleared, whether or not the
-// action actually went through. Starting while already recording, or
-// stopping while not, is a no-op rather than a double call into encode.
-//
-// Encoder lifecycle: the first output start acquires the encoder; the last
-// output stop releases it. The encoder's internal refcount is at most 1 from
-// the caller's perspective (the second output reuses output.enc without a
-// second acquire). Video PTS is now computed on the encoder thread from a
-// timer tick count; only the audio block counter (blocks_emitted) is reset
-// here.
+// Dispatches a Controls panel request raised by ui; always clears the request.
+// First output start acquires the encoder, last output stop releases it.
 handle_controls_request :: proc(
 	req:               ui.Controls_Request,
 	state:             ^ui.Controls_State,
@@ -56,8 +47,7 @@ handle_controls_request :: proc(
 ) {
 	state.request = .None
 
-	// Shared helper: acquire encoder on the first output start. Returns false
-	// if the acquire fails, in which case the caller should bail.
+	// Acquires the encoder on the first output start.
 	ensure_encoder :: proc(
 		output: ^Output_State, target: ^render.Target, fps: i32,
 		stream_cfg: settings.Stream_Settings, log_sink: ^applog.Sink,

@@ -16,9 +16,7 @@ VIDEO_POOL_SLOTS :: 64
 AUDIO_POOL_SLOTS :: 64
 AUDIO_BUF_CAP :: 2048
 
-// Matches audio.BLOCK_SAMPLES / audio.BLOCK_LATENCY (src/audio/mixer.odin) --
-// this package can't import src/audio without a cycle, so the values are
-// mirrored here, same as src/rtmp/commands_test.odin already does.
+// Mirrors audio.BLOCK_SAMPLES (this package can't import src/audio -- cycle).
 AUDIO_BLOCK_SAMPLES :: 1024
 AUDIO_QUEUE_CAPACITY :: 4
 
@@ -54,8 +52,6 @@ Encoder :: struct {
 	init_ok: bool,
 
 	// video timer — created on the encoder thread, paces drain_video.
-	// Video PTS is tick_index * frame_duration; tick_index counts emitted
-	// groups, not timer ticks, so the timeline starts at zero.
 	timer_handle: win32.HANDLE,
 	tick_index: u64,
 	has_frame_ever: bool,
@@ -98,8 +94,7 @@ nalu_callback :: proc(ctx: rawptr, nalu: []u8) {
 encoder_acquire :: proc(
 	cfg: Encoder_Config,
 ) -> (^Encoder, bool) {
-	// Reject unusable configs before any MF work so the caller gets one
-	// clear message instead of cryptic HRESULTs from deep inside MFT setup.
+	// Reject unusable configs up front rather than failing deep inside MFT setup.
 	if cfg.width == 0  { log.errorf("encoder_acquire: width is 0");  return nil, false }
 	if cfg.height == 0 { log.errorf("encoder_acquire: height is 0"); return nil, false }
 	if cfg.fps == 0    { log.errorf("encoder_acquire: fps is 0");    return nil, false }
@@ -215,9 +210,7 @@ encoder_thread :: proc(t: ^thread.Thread) {
 		return
 	}
 
-	// High-resolution waitable timer — created here on the encoder thread,
-	// non-periodic (lPeriod = 0). Re-armed every tick from an accumulated
-	// absolute target so wake latency never integrates into drift.
+	// High-resolution waitable timer, re-armed each tick to avoid drift.
 	e.timer_handle = win32.CreateWaitableTimerExW(
 		nil, nil,
 		win32.CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -266,9 +259,7 @@ encoder_thread :: proc(t: ^thread.Thread) {
 		if is_timer_tick {
 			drain_video(e)
 
-			// Re-arm: advance next_due by one period, then check for
-			// late ticks. If we're behind by more than one whole period,
-			// skip ahead and log.
+			// Advance and skip ahead if we've fallen more than a period behind.
 			next_due += period_100ns
 			now_ft = filetime_now()
 			if now_ft > next_due {
@@ -385,9 +376,7 @@ drain_audio :: proc(e: ^Encoder) {
 	pts, ok := audio_queue_take(e.pcm_queue, e.audio_scratch)
 	if !ok do return
 
-	// AAC LC emits 1024 samples per frame regardless of input block size;
-	// AUDIO_BLOCK_SAMPLES happens to match that, so the same duration serves
-	// both as this PCM block's input duration and each output frame's duration.
+	// AAC LC always emits 1024-sample frames, matching AUDIO_BLOCK_SAMPLES.
 	aac_frame_duration := i64(AUDIO_BLOCK_SAMPLES) * 10_000_000 / i64(e.audio_sample_rate)
 
 	sink := Aac_Sink{e = e, block_pts = pts, frame_duration = aac_frame_duration}
@@ -402,10 +391,8 @@ drain_audio :: proc(e: ^Encoder) {
 
 @(private)
 drain_video :: proc(e: ^Encoder) {
-	// Try to pick up a new frame from the mailbox. On success, e.scratch is
-	// overwritten with the new BGRA data. On failure (no new frame from
-	// capture), e.scratch still holds the previous frame — re-encode it to
-	// keep CFR output on a static desktop.
+	// On no new frame, e.scratch still holds the previous one -- re-encode it
+	// to keep CFR output on a static desktop.
 	took := mailbox_take(e.raw_mailbox, e.scratch)
 	if took {
 		e.has_frame_ever = true
@@ -435,8 +422,7 @@ drain_video :: proc(e: ^Encoder) {
 		nalu_callback, &sink,
 	)
 	if !enc_ok || n == 0 {
-		// Nothing was published, so refcount is still 0 — recycle directly.
-		// group_release would decrement from 0 and trip the double-release assert.
+		// Not published, so refcount is still 0 -- recycle, don't release.
 		pool_recycle(vid_group)
 		return
 	}

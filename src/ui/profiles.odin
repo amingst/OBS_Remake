@@ -15,9 +15,7 @@ Profile_Request :: enum {
     Delete,
 }
 
-// Requests are raised here and consumed/cleared by main -- same pattern as
-// Settings_State.save_request, and for the same reason: ui has no config
-// path and cannot touch the registry itself.
+// Requests are raised here and consumed/cleared by main, which owns the config path.
 Profile_State :: struct {
     request:      Profile_Request,
     switch_to:    string,  // owned clone of the target profile id; set only for .Switch
@@ -33,9 +31,7 @@ init_profiles_state :: proc() -> Profile_State {
     return Profile_State{}
 }
 
-// infos is owned and refreshed by main (a directory scan per frame would be
-// wasteful); a profile added, renamed, or removed outside the app isn't
-// reflected here until main's next refresh.
+// infos is owned and refreshed by main, not rescanned every frame.
 draw_profile_menu :: proc(state: ^Profile_State, infos: []settings.Profile_Info, active_id, active_name: string) {
     if im.BeginMenu("Profile") {
         for info in infos {
@@ -50,12 +46,9 @@ draw_profile_menu :: proc(state: ^Profile_State, infos: []settings.Profile_Info,
 
         im.Separator()
 
-        // These only raise a flag rather than calling im.OpenPopup directly:
-        // popup IDs are relative to the ID stack at the point OpenPopup is
-        // called, and this is nested two menus deep (File > Profile) while
-        // the matching BeginPopupModal in draw_profile_popups is called at
-        // the top level. Calling OpenPopup here would compute a different ID
-        // than BeginPopupModal expects, and the popup would never open.
+        // Raise a flag rather than calling im.OpenPopup directly -- this is
+        // nested inside File > Profile, but the matching BeginPopupModal is
+        // at the top level, so OpenPopup must be called from there instead.
         if im.MenuItem("New Profile...") {
             state.name_buf = {}
             state.want_new = true
@@ -73,11 +66,8 @@ draw_profile_menu :: proc(state: ^Profile_State, infos: []settings.Profile_Info,
     }
 }
 
-// Called every frame regardless of whether the Profile menu is open --
-// BeginPopupModal has to run every frame for ImGui to keep tracking an
-// already-open popup, same reason draw_settings is unconditional. OpenPopup
-// is called right here, next to its BeginPopupModal, so both see the same
-// (top-level) ID stack -- see the comment in draw_profile_menu.
+// Called every frame regardless of menu state -- ImGui needs BeginPopupModal
+// to run every frame to keep tracking an already-open popup.
 draw_profile_popups :: proc(state: ^Profile_State, active_name: string) {
     if state.want_new {
         im.OpenPopup("New Profile")

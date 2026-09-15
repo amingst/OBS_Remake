@@ -62,14 +62,8 @@ sink_destroy :: proc(sink: ^Sink) {
 	free(sink)
 }
 
-// sink_open_file opens the sink's log file. The sink owns the resulting
-// handle from here on: sink_destroy is the only thing that closes it. This
-// is deliberately the opposite of core:log's create_file_logger /
-// destroy_file_logger, which closes a handle that was opened (and is owned)
-// by the caller -- that contract doesn't fit a sink that outlives its logger.
-//
-// Failure is non-fatal: the sink keeps working with just the ring buffer and
-// console, and the caller is told via the returned bool so it can say so once.
+// Opens the sink's log file; the sink owns the handle until sink_destroy.
+// Failure is non-fatal -- the sink keeps working with just the ring/console.
 sink_open_file :: proc(sink: ^Sink, path: string) -> bool {
 	f, err := os.open(path, os.O_WRONLY | os.O_CREATE | os.O_TRUNC)
 	if err != nil {
@@ -94,9 +88,7 @@ sink_push :: proc(sink: ^Sink, level: log.Level, tag: Tag, msg: string) {
 	entry.when_ = time.time_to_unix_nano(time.now())
 	sink.total += 1
 
-	// Written under the same lock as the ring push above, one formatted line
-	// per call, so lines from concurrent threads can't interleave mid-string.
-	// Console output (logger_proc, below) stays outside the lock.
+	// Written under the same lock as the ring push, so lines can't interleave.
 	if sink.file_ok {
 		t := time.Time{_nsec = entry.when_}
 		year, month, day := time.date(t)
@@ -111,9 +103,7 @@ sink_push :: proc(sink: ^Sink, level: log.Level, tag: Tag, msg: string) {
 		)
 		os.write(sink.file, transmute([]u8)line)
 
-		// Buffer normal writes -- flushing every line is a syscall on a
-		// real-time (audio) thread. Flush on Error/Fatal so the last lines
-		// before a crash are the ones guaranteed to survive it.
+		// Buffer normal writes; flush on Error/Fatal to survive a crash.
 		if level >= log.Level.Error {
 			os.flush(sink.file)
 		}

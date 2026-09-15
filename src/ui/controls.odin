@@ -10,26 +10,12 @@ Controls_Request :: enum {
     Stop_Streaming,
 }
 
-// Requests are raised here and consumed/cleared by main -- same pattern as
-// Profile_State.request: ui has no access to the encoder and shouldn't call
-// into it directly.
+// Requests are raised here and consumed/cleared by main, which owns the encoder.
 Controls_State :: struct {
     request:   Controls_Request,
-
-    // Mirrors main's actual encode.State.recording. ui can't query it
-    // directly -- the encoder's state is a private package singleton, and a
-    // UI panel reaching into a subsystem would invert the direction requests
-    // are supposed to flow -- so main writes this down each frame before
-    // ui.draw, and draw_controls only ever reads it back.
-    recording: bool,
-
-    // Mirrors main's rtmp streaming state, same reasoning as recording above.
-    streaming: bool,
-
-    // True while a previous recording's MP4 sink is draining and finalizing.
-    // Neither recording nor idle — the button shows "Finalizing..." and
-    // refuses a new recording start until the sink has been reaped.
-    finalizing: bool,
+    recording: bool, // mirrored from main each frame; ui can't query the encoder directly
+    streaming: bool, // mirrored from main each frame
+    finalizing: bool, // previous recording's MP4 sink still draining/finalizing
 }
 
 init_controls_state :: proc() -> Controls_State {

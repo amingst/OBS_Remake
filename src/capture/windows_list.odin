@@ -4,9 +4,7 @@ import "base:runtime"
 import "core:strings"
 import win32 "core:sys/windows"
 
-// Plain Win32 enumeration, hand-written, no COM -- same shape as
-// GetOpenFileNameW in image.odin's sibling file_dialog.odin. Windows.h
-// declares QueryFullProcessImageNameW but core:sys/windows doesn't bind it.
+// QueryFullProcessImageNameW isn't bound by core:sys/windows.
 foreign import kernel32_proc "system:kernel32.lib"
 @(default_calling_convention = "stdcall")
 foreign kernel32_proc {
@@ -21,12 +19,8 @@ Window_Info :: struct {
 	likely_game: bool,   // borderless or fullscreen-sized -- see is_likely_game
 }
 
-// enumerate_windows lists candidate capture targets. Every string in the
-// result comes from context.allocator; destroy_window_list frees the whole
-// thing. Meant to be called when a picker popup opens and destroyed when it
-// closes -- NOT every frame. EnumWindows itself is cheap, but the per-window
-// work (OpenProcess, DWM, string conversions) is not something to run at
-// 60 Hz.
+// Lists candidate capture-target windows. Call on picker-open, not per frame;
+// free the result with destroy_window_list.
 enumerate_windows :: proc() -> []Window_Info {
 	ectx: Enum_Ctx
 	ectx.list = make([dynamic]Window_Info)
@@ -47,12 +41,7 @@ destroy_window_list :: proc(list: []Window_Info) {
 @(private = "file")
 Enum_Ctx :: struct {
 	list: [dynamic]Window_Info,
-	ctx:  runtime.Context, // EnumWindows invokes the callback synchronously on
-	                       // this thread, but a "system"-convention callback
-	                       // gets no implicit context of its own -- captured
-	                       // here so allocations inside it use the caller's
-	                       // context.allocator (the tracking allocator under
-	                       // ODIN_DEBUG), not runtime.default_context()'s.
+	ctx:  runtime.Context, // captured so the "system"-convention callback uses the caller's context
 }
 
 @(private = "file")
@@ -62,9 +51,7 @@ enum_windows_proc :: proc "system" (hwnd: win32.HWND, lparam: win32.LPARAM) -> w
 
 	if !win32.IsWindowVisible(hwnd) do return true
 
-	// Non-empty title filter: not cosmetic. A prior session found a real
-	// visible window on this machine with an empty title that
-	// FindWindowW(nil, "") matched.
+	// Skip windows with no title -- FindWindowW(nil, "") can match one.
 	title_len := win32.GetWindowTextLengthW(hwnd)
 	if title_len <= 0 do return true
 
@@ -109,11 +96,7 @@ get_class_name :: proc(hwnd: win32.HWND, allocator: runtime.Allocator) -> string
 	return name
 }
 
-// get_exe_basename stays "" on any failure along this path -- OpenProcess
-// fails for elevated processes when we're not elevated, which is normal,
-// not an error. No per-failure log; the caller decides what an empty name
-// means for its purpose (enumerate_windows keeps the window in the list
-// anyway; resolve_window's class+exe rule just never matches on it).
+// Returns "" on any failure (e.g. an elevated process we can't query) -- not an error.
 @(private = "file")
 get_exe_basename :: proc(hwnd: win32.HWND, allocator: runtime.Allocator) -> string {
 	pid: win32.DWORD
@@ -138,23 +121,10 @@ get_exe_basename :: proc(hwnd: win32.HWND, allocator: runtime.Allocator) -> stri
 	return strings.clone(base, allocator)
 }
 
-// resolve_window turns a Window_Data's persisted identity back into a live
-// hwnd, in the priority order item 2 specifies. Used by both the initial
-// load and the retry path in main.odin -- there is exactly one resolution
-// mechanism, not one per caller.
-//
-//  1. Exact match on title, class, AND exe.
-//  2. Match on class + exe alone, ignoring title -- a document window's
-//     title changes when the file changes; this is the case that matters.
-//  3. No match: the caller treats it as unresolved (stays lost, keeps
-//     retrying on its existing timer -- this proc never gives up on its
-//     own).
-//
-// class_name == "" is the backward-compatibility path: a source persisted
-// before this change (or otherwise missing class/exe) has nothing to match
-// beyond its title, so this degrades to exactly the old FindWindowW(nil,
-// title) behaviour rather than a class+exe rule that could never match a
-// real window (no window has an empty class name).
+// Resolves a persisted window identity to a live hwnd: exact title+class+exe
+// match first, then class+exe alone (handles a title that changes with the
+// open file), else unresolved. Empty class_name falls back to title-only
+// FindWindowW for sources persisted before class/exe tracking existed.
 resolve_window :: proc(title, class_name, exe_name: string) -> (hwnd: win32.HWND, ok: bool) {
 	if class_name == "" {
 		h := win32.FindWindowW(nil, win32.utf8_to_wstring(title))
@@ -180,7 +150,7 @@ Resolve_Ctx :: struct {
 	class_name:      string,
 	exe_name:        string,
 	exact_match:     win32.HWND,
-	class_exe_match: win32.HWND, // first one found; kept even if a later, better (exact) match shows up, since exact_match wins regardless of ordering
+	class_exe_match: win32.HWND, // first found; exact_match still wins if one turns up later
 }
 
 @(private = "file")
@@ -230,11 +200,7 @@ resolve_enum_proc :: proc "system" (hwnd: win32.HWND, lparam: win32.LPARAM) -> w
 	return true
 }
 
-// is_likely_game is a coarse heuristic for the picker's default filter, not
-// a real game detector: borderless (no caption, no thick frame) or sized to
-// cover its monitor. Exclusive fullscreen and anti-cheat are out of scope --
-// this only steers which windows show up first, the unfiltered list is
-// always reachable.
+// Coarse heuristic for the picker's default filter: borderless or monitor-sized.
 @(private = "file")
 is_likely_game :: proc(hwnd: win32.HWND) -> bool {
 	style := win32.GetWindowLongPtrW(hwnd, win32.GWL_STYLE)

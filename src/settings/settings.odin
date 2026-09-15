@@ -9,11 +9,7 @@ Video_Settings :: struct {
     fps: i32
 }
 
-// Nothing enforces an upper bound on canvas_width/canvas_height today --
-// custom canvas input (menubar.odin) and monitor-output presets both accept
-// whatever the user picks. This is the ceiling fixed-size buffers sized off
-// "the canvas" (e.g. rtmp.Frame_Mailbox) are allowed to assume; it is not
-// itself an input-validation clamp.
+// Ceiling assumed by fixed-size buffers sized off the canvas; not itself enforced.
 MAX_CANVAS_WIDTH  :: 3840
 MAX_CANVAS_HEIGHT :: 2160
 
@@ -26,11 +22,7 @@ Stream_Settings :: struct {
     bitrate: i32,
 }
 
-// 2.5 Mbps — a conservative but usable 1080p default. Twitch recommends
-// 3000–6000 kbps for 1080p; YouTube recommends 4500–9000 kbps. 2500 kbps
-// sits below both ranges but produces watchable output and is safe for
-// most uplinks. Used as the floor in from_dto when loading a profile that
-// predates the bitrate field (JSON key absent → zero after unmarshal).
+// 2.5 Mbps -- conservative but watchable 1080p default; also the from_dto floor.
 DEFAULT_BITRATE :: 2_500_000
 
 Profile :: struct {

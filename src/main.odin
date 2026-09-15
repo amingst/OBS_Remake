@@ -1,7 +1,6 @@
 package obs_remake
 
-// @(require) keeps core:mem legal under -vet in non-debug builds, where the
-// `when ODIN_DEBUG` block below compiles away and nothing references it.
+// @(require) keeps core:mem legal under -vet in non-debug builds.
 import "core:fmt"
 import "core:log"
 @(require) import "core:mem"
@@ -33,13 +32,7 @@ import "applog"
 
 import "core:sys/windows"
 
-// The D3D11 debug layer (.DEBUG create flag, enabled under ODIN_DEBUG in
-// platform.odin) has been on since the device was created, but nothing ever
-// read ID3D11InfoQueue before now -- its output went nowhere. QI's the
-// device fresh each call rather than caching the interface: this runs once
-// per frame regardless of whether any window source exists this run, and
-// the QI itself is cheap next to everything else already happening at the
-// top of the loop.
+// Drains and logs the D3D11 debug layer's message queue.
 @(private = "file")
 drain_d3d11_debug_layer :: proc(device: ^d3d11.IDevice) {
 	info_queue: ^d3d11.IInfoQueue
@@ -72,9 +65,7 @@ drain_d3d11_debug_layer :: proc(device: ^d3d11.IDevice) {
 }
 
 main :: proc() {
-	// Wrap the heap allocator so we get a leak/bad-free report at exit.
-	// Registered first, so its `defer` runs last -- after every other `defer`
-	// below has had its chance to free.
+	// Leak/bad-free tracking allocator, debug builds only.
 	when ODIN_DEBUG {
 		track: mem.Tracking_Allocator
 		mem.tracking_allocator_init(&track, context.allocator)
@@ -103,27 +94,16 @@ main :: proc() {
 	main_log_ctx := applog.Log_Context{sink = log_sink, tag = {.Main, 0}}
 	context.logger = applog.make_logger(&main_log_ctx)
 
-	// The audio capture thread logs through this same sink -- set once here,
-	// before any stream is opened (streams are only acquired later, from the
-	// scene-source handling in the main loop below).
+	// Audio capture thread logs through this same sink.
 	audio.set_log_sink(log_sink)
 
-	// Config locations and persisted state. Done up here, before any device
-	// objects exist, because the loaded canvas resolution decides how big the
-	// preview target is created below -- see the create_target call.
-	//
-	// resolve_paths failing is non-fatal and already logged at .Warning: the app
-	// runs fine without a writable config directory, it just cannot persist. A
-	// zeroed Paths leaves every field "", which is the "no persistence" signal
-	// used below, and destroy_paths tolerates it.
+	// Config locations and persisted state.
 	paths, _ := config.resolve_paths()
 	defer config.destroy_paths(&paths)
 
 	app.open_log_file(log_sink, &paths)
 
-	// app.json, the one-shot legacy-settings migration, and the active
-	// profile selection (load-active / pick-first-by-name / create-Default)
-	// all live in the app package now -- see app/bootstrap.odin.
+	// app.json, legacy migration, and active profile selection -- see app/bootstrap.odin.
 	app_cfg, cfg, profile_infos := app.load_app_config_and_profile(&paths)
 	defer config.destroy_app_config(&app_cfg)
 	defer settings.destroy_profile(&cfg)
@@ -143,12 +123,7 @@ main :: proc() {
     defer platform.destroy_window(&win)
     win.msg_hook = imwin32.WndProcHandler
 
-	// Offscreen target the scene is composited into. Created after
-	// create_window because it needs win.device, and sized from cfg rather than
-	// a constant so a saved canvas resolution is honoured on the very first
-	// frame. The reconciliation step in the loop below would eventually catch a
-	// divergence, but only after rendering one frame at the wrong size and then
-	// tearing the target down again -- pointless when the size is already known.
+	// Offscreen target the scene is composited into, sized from the loaded profile.
 	preview_target, target_ok := render.create_target(
 		win.device, u32(cfg.video.canvas_width), u32(cfg.video.canvas_height))
 	if !target_ok {
@@ -157,8 +132,7 @@ main :: proc() {
 	}
 	defer render.destroy_target(&preview_target)
 
-	// The target that was just built *is* the applied state, so seed from the
-	// same cfg it was sized from. Any later divergence is a real request.
+	// Seed applied state from the cfg the target was just sized from.
 	applied := Applied{video = cfg.video}
 
 	pipeline, pok := render.create_pipeline(win.device)
@@ -196,18 +170,12 @@ main :: proc() {
 
 	// Setup scaling
 	style := im.GetStyle()
-	// Bake a fixed style scale. (until we have a solution for dynamic style
-	// scaling, changing this requires resetting Style + calling this again)
 	im.Style_ScaleAllSizes(style, main_scale)
-	// Set initial font scale. (in docking branch: using
-	// io.ConfigDpiScaleFonts=true automatically overrides this for every window
-	// depending on the current monitor)
 	style.FontScaleDpi = main_scale
 	io.ConfigDpiScaleFonts = true     // [Experimental]
 	io.ConfigDpiScaleViewports = true // [Experimental]
 
-	// When viewports are enabled we tweak WindowRounding/WindowBg so platform
-	// windows can look identical to regular ones.
+	// Match platform windows to regular ones when viewports are enabled.
 	if .ViewportsEnable in io.ConfigFlags {
 		style.WindowRounding = 0.0
 		style.Colors[im.Col.WindowBg].w = 1.0
@@ -226,11 +194,7 @@ main :: proc() {
 	defer imdx11.Shutdown()
 	log.info("ImGui backends initialised")
 
-	// Load Fonts
-	// - If fonts are not explicitly loaded, Dear ImGui will select an embedded
-	//   font: either AddFontDefaultVector() or AddFontDefaultBitmap().
-	// - You can load multiple fonts and use im.PushFont()/PopFont() to select them.
-	// - Read 'docs/FONTS.md' for more instructions and details.
+	// Fonts: none loaded explicitly, so ImGui uses its embedded default.
 	//style.FontSizeBase = 20.0
 	//io.Fonts->AddFontDefaultVector()
 	//io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf")
@@ -246,6 +210,7 @@ main :: proc() {
 		audio.log_device_format(dev)
 	}
 
+	// One-shot camera probe: start device 0 briefly to confirm capture works.
 	enum_attrs: ^mf.IMFAttributes
     hr := mf.MFCreateAttributes(&enum_attrs, 1)
     if hr < 0 {
@@ -264,9 +229,7 @@ main :: proc() {
             log.errorf("cam probe: MFEnumDeviceSources failed: 0x%08X", u32(hr))
         } else if count == 0 {
             log.info("cam probe: no video devices")
-            // activates is nil / nothing to free when count == 0
         } else {
-            // Release every activate and free the array, no matter what happens below.
             defer {
                 for i in 0..<count {
                     activates[i]->Release()
@@ -275,7 +238,7 @@ main :: proc() {
             }
 
             // Pull the symbolic link off device 0.
-            raw:     [^]u16     // CoTaskMemAlloc'd by GetAllocatedString — we free it
+            raw:     [^]u16
             raw_len: u32
             hr = activates[0]->GetAllocatedString(
                 &mf.MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
@@ -286,28 +249,18 @@ main :: proc() {
             } else {
                 defer windows.CoTaskMemFree(raw)
 
-                // raw_len is the count of UTF-16 code units, not counting the null.
                 symlink := raw[:raw_len]
 
                 log.infof("cam probe: device 0 symlink len=%d", raw_len)
 
-                cam := capture.camera_start(symlink, log_sink, 0)  // camera_start copies the symlink
+                cam := capture.camera_start(symlink, log_sink, 0)
                 time.sleep(500 * time.Millisecond)
-                capture.camera_stop(cam)                          // frees cam
+                capture.camera_stop(cam)
             }
         }
     }
 
-	// WinRT apartment setup. audio.get_enumerator() (line above) established
-	// this thread as an STA via CoInitializeEx(.APARTMENTTHREADED). Both
-	// wic.wic_init() (below) and WinRT activation depend on that apartment
-	// existing: wic_init's CoCreateInstance returns CO_E_NOTINITIALIZED
-	// without one, and RoInitialize needs the mode to match so the capture
-	// pool's free-threaded callback can marshal back correctly.
-	//
-	// Expected return: S_FALSE (0x00000001) — apartment already initialised.
-	// S_OK means the audio enumerator path didn't run, which is an ordering
-	// regression. RPC_E_CHANGED_MODE means somebody switched to MTA.
+	// WinRT apartment setup for window capture; expects S_FALSE (already STA).
 	{
 		hr = wgc.RoInitialize(wgc.RO_INIT_SINGLETHREADED)
 		if hr < 0 {
@@ -317,7 +270,7 @@ main :: proc() {
 			}
 			return
 		}
-		if hr == 0 { // S_OK — we established the apartment, meaning audio.get_enumerator didn't
+		if hr == 0 {
 			log.warnf("RoInitialize returned S_OK (0x%08X) — expected S_FALSE; check init ordering", u32(hr))
 		} else {
 			log.infof("RoInitialize: 0x%08X", u32(hr))
@@ -348,33 +301,17 @@ main :: proc() {
 	audio_diag_last_ps_attempted: u64
 	audio_diag_last_ps_dropped: u64
 
-	// Balances our RoInitialize above, not audio.get_enumerator's
-	// CoInitializeEx (which has no matching CoUninitialize — the apartment
-	// survives to process exit either way). Declared here so it fires after
-	// scene.destroy_all releases any WinRT capture objects but before
-	// wic_shutdown / platform.destroy_window release their COM objects.
-	// Today the main thread's COM refcount never reaches zero (2 inits,
-	// 1 uninit), so this is latent — but it documents intent, and if
-	// someone later adds CoUninitialize to audio.shutdown, the ordering
-	// comment here is what stops them getting the teardown wrong.
+	// Must run and tear down while the WinRT apartment is still alive -- see
+	// wgc_init below for the matching ordering constraint on the way out.
 	defer wgc.RoUninitialize()
 
-	// wgc_init creates the process-lifetime HSTRINGs RoGetActivationFactory
-	// needs for the two WinRT class names window.odin activates. Must run
-	// after RoInitialize, before anything in capture/window.odin. Its defer
-	// is registered after RoUninitialize's immediately above, so on the way
-	// out it runs first -- WinRT objects must be released while the
-	// apartment is still alive. scene.destroy_all's defer (below) is
-	// registered later still, for the same reason: Window_Data sources own
-	// WinRT capture objects now, and destroy_source must release them before
-	// wgc_shutdown/RoUninitialize run.
+	// wgc_init creates the process-lifetime HSTRINGs window capture needs.
 	if !wgc.wgc_init() {
 		log.error("wgc_init failed (cause logged above); window capture will not work")
 	}
 	defer wgc.wgc_shutdown()
 
-	// The active scene collection. Same load-active/pick-first/create-Default
-	// shape as the profile selection above -- see app/bootstrap.odin.
+	// Active scene collection -- same load-active/pick-first/create-Default shape as profiles.
 	doc, collection_infos := app.load_scene_collection(&paths, &app_cfg)
 	defer scene.destroy_all(&doc)
 	defer scene.destroy_infos(collection_infos)
@@ -426,10 +363,7 @@ main :: proc() {
 			platform.create_render_target(&win)
 		}
 
-		// Bring the live objects in line with what the settings modal published.
-		// Ordering constraints and the reasoning live in reconcile.odin; the
-		// only thing that matters here is that this runs well before
-		// im.NewFrame().
+		// Bring live objects in line with the settings modal -- see reconcile.odin.
 		reconcile(&applied, &cfg, win.device, &preview_target, output.recording || output.streaming || output.finalizing_sink != nil)
 
 		// Check each frame for resize after each reconcile call
@@ -439,18 +373,7 @@ main :: proc() {
 			frame_bytes = make([]u8, needed)
 		}
 
-		// Service a pending save. Deliberately placed *after* the reconciliation
-		// above rather than next to the ui.draw call that raises the request: the
-		// block above is the only place canvas dimensions are validated, and it
-		// may well have overwritten cfg.video with the live target's size. Writing
-		// first would put a rejected resolution on disk and then revert it in
-		// memory, leaving the file disagreeing with the running app until the next
-		// save. So a request raised during frame N is consumed here at the top of
-		// frame N+1, once cfg is settled -- one frame of latency, and what gets
-		// written is exactly what the app is actually running.
-		//
-		// The write itself lives here rather than in ui because ui has no idea
-		// where the config file is, and shouldn't.
+		// Service a pending save, one frame after the request so cfg is settled by reconcile first.
 		if trigger := ui_state.settings.save_request; trigger != .None {
 			ui_state.settings.save_request = .None
 			if paths.profiles != "" {
@@ -461,39 +384,24 @@ main :: proc() {
 			}
 		}
 
-		// Service a pending profile request, same latency contract as the
-		// save request just above. handle_profile_request owns everything it
-		// touches on ui_state.profiles (switch_to / pending_name), and clears
-		// the request whether or not it succeeded.
+		// Service a pending profile request.
 		if req := ui_state.profiles.request; req != .None {
 			app.handle_profile_request(req, &ui_state.profiles, &cfg, &app_cfg, &paths, &profile_infos)
 		}
 
-		// Service a pending scene collection request. This has to happen here
-		// and not, say, folded into ui.draw or deferred a frame: a switch
-		// tears down doc (releasing any active display-capture COM objects)
-		// and replaces it outright, and that must land before the
-		// quads-building block below touches doc's sources -- the same "not
-		// mid-frame" requirement that puts the profile switch here too.
+		// Service a pending scene collection request (before sources are touched below).
 		if req := ui_state.collections.request; req != .None {
 			app.handle_collection_request(req, &ui_state.collections, &ui_state.scenes, &ui_state.sources,
 				&doc, &app_cfg, &paths, &collection_infos)
 		}
 
-		// Service a pending recording request. Deliberately after reconcile,
-		// same as the requests above: a canvas resize landing between the
-		// output starting and the first pushed frame would hand the encoder
-		// a resolution that doesn't match what it was configured with.
+		// Service a pending recording/streaming request.
 		if req := ui_state.controls.request; req != .None {
-			// mixer.blocks_emitted feeds the audio PTS timeline. Video PTS is
-			// now computed on the encoder thread from its tick_index, so only
-			// the audio counter needs to track the encoder's lifetime here.
 			pre_blocks := mixer.blocks_emitted
 			app.handle_controls_request(req, &ui_state.controls, &output,
 				&paths, &preview_target, cfg.video.fps, cfg.stream, log_sink,
 				&mixer.blocks_emitted)
-			// ensure_encoder resets blocks_emitted to 0; reset the diag
-			// snapshots so the unsigned delta doesn't wrap.
+			// ensure_encoder resets blocks_emitted; reset diag snapshots to match.
 			if mixer.blocks_emitted < pre_blocks {
 				audio_diag_last_blocks = 0
 				audio_diag_last_aac_recv = 0
@@ -503,8 +411,7 @@ main :: proc() {
 			}
 		}
 
-		// Reap a finalizing MP4 sink once its feeder thread is done.  Also
-		// catches auto-stops (spillover ceiling breach) on the active sink.
+		// Reap a finalizing MP4 sink, and catch auto-stops on the active sink.
 		if output.mp4_sink != nil && mp4.mp4_sink_is_stopped(output.mp4_sink) {
 			log.warn("recording auto-stopped (spillover ceiling breach)")
 			mp4.mp4_sink_reap(output.mp4_sink)
@@ -519,23 +426,13 @@ main :: proc() {
 			log.info("recording finalized")
 		}
 
-		// Neutral fallback for "no scene selected" -- selected_id 0, or the
-		// selected scene was deleted. scene.find's pointer is invalidated by
-		// the next append to doc.scenes, so copy the colour straight out instead
-		// of holding the pointer. Reads last frame's selection, since this runs
-		// before ui.draw; one frame of latency is invisible here.
+		// Neutral fallback clear color when no scene is selected.
 		scene_clear := [4]f32{0.10, 0.10, 0.12, 1.0}
 		if sel := scene.find(&doc, ui_state.scenes.selected_id); sel != nil {
 			scene_clear = sel.color
 		}
 
-		// Composite the scene into the offscreen target before ImGui's frame
-		// starts. Render targets are global context state, and the code below
-		// rebinds the swap chain's RTV before RenderDrawData -- so doing this
-		// first means our binding here is harmlessly replaced rather than
-		// clobbering ImGui's. service_sources lazily (re)acquires each
-		// visible source's underlying capture and appends a quad / mix input
-		// for it -- see scene/scene_service.odin.
+		// Composite the scene into the offscreen target before ImGui's frame starts.
 		quads := make([dynamic]render.Quad, context.temp_allocator)
 		inputs := make([dynamic]audio.Mix_Input, context.temp_allocator)
 		scene.service_sources(&doc, ui_state.scenes.selected_id, win.device, win.device_context, log_sink, &quads, &inputs)
@@ -554,8 +451,7 @@ main :: proc() {
 				ps_attempted = output.mp4_sink.diag.audio_stats.attempted
 				ps_dropped = output.mp4_sink.diag.audio_stats.other_fail
 			} else {
-				// No active sink — reset snapshots so they don't underflow
-				// when a new sink starts with fresh counters.
+				// No active sink — reset snapshots so the next sink starts clean.
 				audio_diag_last_aac_recv = 0
 				audio_diag_last_ps_attempted = 0
 				audio_diag_last_ps_dropped = 0
@@ -576,23 +472,8 @@ main :: proc() {
 		}
 
 		// -- Video push ---------------------------------------------------
-		// Shared on recording || streaming: both consumers need the same GPU
-		// readback and PTS clock.
 		if output.recording || output.streaming {
-			// flip_vertical: MFVideoFormat_RGB32 is bottom-up by convention and
-			// MF ignores the MF_MT_DEFAULT_STRIDE hint that's supposed to
-			// override that, so the rows are flipped here instead. This is a
-			// workaround for that one encoder, not the default -- every other
-			// read_target caller wants top-down rows. The RTMP path was already
-			// fed these flipped rows whenever recording+streaming were both
-			// active, so extending this block to run for streaming-only
-			// doesn't change that.
-			//
-			// Video PTS is now computed on the encoder thread from a
-			// high-resolution timer tick count. The main thread just pushes
-			// the latest BGRA into the mailbox; the encoder picks it up on
-			// the next timer tick (or re-encodes the previous frame if the
-			// desktop is static).
+			// flip_vertical works around MF's RGB32 bottom-up convention.
 			read_ok := render.read_target(win.device_context, &preview_target, frame_bytes, flip_vertical = true)
 
 			if !read_ok {
@@ -603,6 +484,7 @@ main :: proc() {
 				encode.mailbox_put(output.enc.raw_mailbox, frame_bytes, preview_target.width, preview_target.height)
 			}
 		}
+		// One-shot startup readback, for debugging the render pipeline.
 		@static dumped := false
 		if !dumped {
 			buf := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
@@ -620,17 +502,10 @@ main :: proc() {
 		imwin32.NewFrame()
 		im.NewFrame()
 
-        // This ImGui version identifies textures by ImTextureRef, not a raw
-        // pointer. im.TextureID is a u64, so the SRV goes pointer -> uintptr ->
-        // u64; wrapping it in a TextureRef with _TexData left nil means "this
-        // is an already-uploaded backend texture, use _TexID directly".
-        // Rebuilt each frame so it stays correct if the target is recreated.
+        // Wrap the preview SRV as an already-uploaded backend texture.
         preview_tex := im.TextureRef{_TexID = im.TextureID(uintptr(preview_target.srv))}
 
-        // ui can't query the encoder directly -- its state is a private
-        // package singleton, and a UI panel reaching into a subsystem would
-        // be backwards -- so main writes down its own recording state here,
-        // every frame, for the Controls panel to read.
+        // Mirror output state into ui_state for the Controls panel to read.
         ui_state.controls.recording = output.recording
         ui_state.controls.streaming = output.streaming
         ui_state.controls.finalizing = output.finalizing_sink != nil
@@ -669,8 +544,6 @@ main :: proc() {
 	delete(frame_bytes)
 
 	// Finalize any still-active recording/stream before releasing the encoder.
-	// Both consumers must be fully stopped/joined before encoder_release, which
-	// joins the encoder thread and asserts no outstanding pool groups remain.
 	if output.recording {
 		log.info("signalling recording stop on exit")
 		mp4.mp4_sink_signal_stop(output.mp4_sink)
@@ -684,9 +557,7 @@ main :: proc() {
 		output.streaming = false
 	}
 
-	// Wait for the finalizing sink with a 10s timeout.  The feeder thread
-	// calls consumer_remove internally, so by the time it sets Stopped the
-	// consumer is already unregistered and encoder_release is safe.
+	// Wait for the finalizing sink with a 10s timeout.
 	if output.finalizing_sink != nil {
 		EXIT_TIMEOUT_MS :: 10_000
 		start_tick := time.tick_now()
@@ -703,10 +574,7 @@ main :: proc() {
 			win32.Sleep(50)
 		}
 		if output.finalizing_sink != nil {
-			// Timed out — the feeder thread is still running.  Releasing the
-			// encoder now would join its thread and assert no pool groups
-			// remain, but the feeder may still hold refs.  Let the process
-			// exit tear everything down instead.
+			// Timed out with the feeder thread still running -- let process exit tear it down.
 			return
 		}
 	}
@@ -716,9 +584,7 @@ main :: proc() {
 		output.enc = nil
 	}
 
-	// Persist on a clean shutdown. Everything that reaches here left the loop
-	// normally; the early `return`s above (device/backend init failure) skip it
-	// deliberately, since that state isn't worth writing out.
+	// Persist on a clean shutdown only.
 	if paths.profiles != "" {
 		log.info("save on exit")
 		settings.save_profile(&cfg, paths.profiles)

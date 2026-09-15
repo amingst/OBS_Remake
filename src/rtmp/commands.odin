@@ -343,10 +343,7 @@ media_buffer_size :: proc(payload_len: int, csid: u32, chunk_size: u32) -> int {
 
 	chunks := max(1, (payload_len + int(chunk_size) - 1) / int(chunk_size))
 
-	// Worst case: fmt 0 header (11 bytes) plus extended timestamp on every
-	// chunk. Mirrors encode_message's internal encoded_size, just without
-	// needing to know in advance which fmt_type it will actually pick --
-	// that decision stays inside encode_message, not duplicated here.
+	// Worst case: fmt 0 header plus extended timestamp on every chunk.
 	total := basic + 11 + 4 + min(payload_len, int(chunk_size))
 	total += (chunks - 1) * (basic + 4)
 	total += payload_len - min(payload_len, int(chunk_size))

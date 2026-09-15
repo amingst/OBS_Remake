@@ -19,7 +19,7 @@ App_Config :: struct {           // app.json
 Paths :: struct {
 	root:        string,
 	app_config:  string,   // root/app.json
-	settings:    string,   // root/settings.json  (migration-only: read by the one-shot legacy migration in main, nothing else should touch it)
+	settings:    string,   // root/settings.json (legacy, migration-only)
 	profiles:    string,   // root/profiles/
 	collections: string,   // root/collections/
 	videos:      string,   // recording output directory, e.g. %USERPROFILE%\Videos
@@ -75,11 +75,7 @@ resolve_paths :: proc() -> (paths: Paths, ok: bool) {
 	if !join_into(&paths.collections, paths.root, "collections") do return
 	if !make_dir(paths.collections)                              do return
 
-	// Recording output. Unlike the rest of Paths this isn't nested under
-	// paths.root -- it's the user's actual Videos folder, not app config --
-	// and its own resolution failure is non-fatal to the rest of Paths: a
-	// blank paths.videos just means recording can't start, logged where it's
-	// attempted, same "no persistence" contract as a blank paths.profiles.
+	// Recording output directory (the user's Videos folder, not under paths.root).
 	resolve_videos(&paths)
 
 	ok = true

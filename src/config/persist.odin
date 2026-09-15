@@ -5,8 +5,7 @@ import os "core:os"
 import log "core:log"
 import "core:strings"
 
-// app.json's on-disk shape. Same split as settings.Settings_DTO: this is what
-// gets marshalled, App_Config is what the rest of the app touches.
+// app.json's on-disk shape.
 App_Config_DTO :: struct {
     version:              int,
     active_profile_id:    string,
@@ -43,9 +42,7 @@ save_app_config :: proc(cfg: ^App_Config, path: string) -> bool {
 load_app_config :: proc(cfg: ^App_Config, path: string) -> bool {
     data, rerr := os.read_entire_file(path, context.temp_allocator)
     if rerr != nil {
-        // No file is the normal first-run case and must stay quiet. Anything
-        // else is worth a line, but the caller keeps a zero-valued config
-        // either way.
+        // Missing file is the normal first-run case; anything else logs a warning.
         if rerr != os.General_Error.Not_Exist {
             log.warnf("app config read failed: %v (%v)", path, rerr)
         }

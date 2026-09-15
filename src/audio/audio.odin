@@ -9,9 +9,7 @@ import "../applog"
 // Singleton Instance of audio device enumerator
 @(private) g_enumerator: ^wasapi.IMMDeviceEnumerator
 
-// Sink the capture thread logs into. Set once at startup via set_log_sink,
-// before any stream is opened -- open_stream is only ever called later, from
-// the main loop's per-frame source handling.
+// Sink the capture thread logs into; set once at startup via set_log_sink.
 @(private) g_log_sink: ^applog.Sink
 
 set_log_sink :: proc(sink: ^applog.Sink) {
@@ -62,11 +60,8 @@ shutdown :: proc() {
 @(private="file") DEVICE_STATE_ACTIVE :: u32(0x00000001)
 @(private="file") STGM_READ           :: u32(0)
 
-// core:sys/windows declares PROPVARIANT as an opaque 16-byte blob (a lone
-// DECIMAL, with a note that the fuller definition is ignored), which is enough
-// to pass to GetValue and PropVariantClear but gives no way to read the value
-// back. This is our own layout over the same bytes: a type tag, three reserved
-// words, and the union -- of which we only ever touch the pointer case.
+// core:sys/windows's PROPVARIANT is opaque; this is our own layout over the
+// same bytes so we can read the pointer case back out.
 @(private="file")
 Prop_Variant :: struct {
     vt:         u16,
@@ -79,10 +74,7 @@ Prop_Variant :: struct {
 
 @(private="file") VT_LPWSTR :: u16(31)
 
-// is_loopback distinguishes a render endpoint (speakers, captured by opening
-// the stream with AUDCLNT_STREAMFLAGS_LOOPBACK) from a capture endpoint (a mic,
-// opened normally). Both are inputs as far as this app is concerned, which is
-// why the flag names the mechanism rather than a direction.
+// is_loopback: a render endpoint (speakers) captured via loopback vs. a mic input.
 Device_Info :: struct {
     id:          string,   // owned; endpoint ID, stable across reboots
     name:        string,   // owned; friendly name
@@ -194,8 +186,6 @@ log_device_format :: proc(dev: Device_Info) {
     enumerator := get_enumerator()
     if enumerator == nil do return
 
-    // Temp-allocator memory: freed wholesale at the end of the frame, never
-    // individually.
     wid := windows.utf8_to_wstring(dev.id, context.temp_allocator)
 
     device: ^wasapi.IMMDevice
@@ -203,9 +193,6 @@ log_device_format :: proc(dev: Device_Info) {
         log.errorf("GetDevice(%v) failed: 0x%08X", dev.id, u32(hr))
         return
     }
-    // Deferred right after the acquire, so every path below releases it and no
-    // error branch has to remember. Safe here because this proc has no loops
-    // and returns once.
     defer device->Release()
 
     client: ^wasapi.IAudioClient

@@ -10,11 +10,8 @@ import "../applog"
 import "../capture"
 import "../render"
 
-// Walks the sources of the given scene once per frame, lazily
-// acquiring/retrying each source's underlying capture (display duplication,
-// window capture, camera reader, audio stream, decoded image) and appending a
-// render.Quad / audio.Mix_Input for each source that currently has something
-// to show or mix. Called from main's loop, before scene compositing.
+// Walks the scene's sources once per frame, lazily acquiring/retrying each
+// one's capture, and appends a render.Quad / audio.Mix_Input for each.
 service_sources :: proc(
 	c: ^Collection, selected_scene_id: u64,
 	device: ^d3d11.IDevice, device_context: ^d3d11.IDeviceContext,
@@ -84,13 +81,7 @@ service_sources :: proc(
 					desc: dxgi.OUTDUPL_DESC
 					d.dupl->GetDesc(&desc)
 
-					// The producer can restart at a different
-					// resolution than the texture it left behind
-					// (ACCESS_LOST only releases d.dupl, not
-					// d.texture/d.srv -- correct, that's what keeps
-					// the last frame drawing through the outage).
-					// Recreate on mismatch instead of reusing the old
-					// texture at its old size forever.
+					// Recreate the texture if the output's mode changed size.
 					if d.texture != nil {
 						tex_desc: d3d11.TEXTURE2D_DESC
 						d.texture->GetDesc(&tex_desc)
@@ -122,12 +113,7 @@ service_sources :: proc(
 					}
 					_ = ok
 
-					// Stall tracking: detect when the desktop stops
-					// producing new frames (e.g. display sleep) and log
-					// the transition. A static desktop is normal — the
-					// app correctly re-encodes the last frame — but the
-					// log should say so, since a frozen recording is
-					// otherwise indistinguishable from a bug.
+					// Log when the desktop stops/resumes producing new frames.
 					STALL_THRESHOLD :: 5 * time.Second
 					now := time.now()
 					if got_frame {
@@ -170,25 +156,11 @@ service_sources :: proc(
 						d.next_retry = time.time_add(time.now(), 2 * time.Second)
 					} else {
 						if wc, wc_ok := capture.start_window_capture(device, device_context, hwnd, log_sink); wc_ok {
-							// Apply the source's stored toggles before
-							// this capture is used for anything --
-							// see item 6: a source recovering from
-							// loss must come back with them intact,
-							// which is why they live on Window_Data
-							// and not only on the session. game_capture
-							// forces cursor capture off regardless of
-							// hide_cursor; it does not overwrite the
-							// user's separate hide_cursor preference.
+							// game_capture forces cursor capture off regardless of hide_cursor.
 							capture.window_capture_set_cursor_capture(wc, !d.hide_cursor && !d.game_capture)
 							capture.window_capture_set_border_required(wc, !d.hide_border)
 
-							// Swap in the new capture and only then
-							// release the old one -- its srv is what
-							// may have been drawn this frame already
-							// (or will be, below, using d.capture
-							// which is now the new one) and must
-							// never be released while a quad this
-							// frame could still reference it.
+							// Release the old capture only after the new one is in place.
 							old := d.capture
 							d.capture = wc
 							if old != nil {

@@ -2,9 +2,6 @@ package encode
 
 import "core:testing"
 
-// Pure struct logic -- no RTMP server needed, unlike the tests in
-// rtmp_test.odin.
-
 @(test)
 audio_queue_round_trip :: proc(t: ^testing.T) {
     STRIDE   :: 8

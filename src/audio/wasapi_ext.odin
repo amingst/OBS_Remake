@@ -96,8 +96,7 @@ open_stream  :: proc(s: ^Stream, device_id: string, is_loopback: bool) -> bool {
     }
     defer windows.CoTaskMemFree(wfx)
 
-    // Log the actual sample format so we know whether the f32 cast in
-    // drain_packets is valid for this device.
+    // Log the sample format to confirm the f32 cast in drain_packets is valid.
     if wfx.wFormatTag == .EXTENSIBLE && wfx.cbSize >= 22 {
         wfxe := (^wasapi.WAVEFORMATEXTENSIBLE)(wfx)
         sf := wfxe.SubFormat
@@ -222,8 +221,7 @@ drain_packets :: proc(s: ^Stream) {
 
         count := frames * u32(s.channels)
         if flags & 0x2 != 0 {
-            // AUDCLNT_BUFFERFLAGS_SILENT — write zeros so the ring
-            // advances at the device clock rate.
+            // AUDCLNT_BUFFERFLAGS_SILENT — write zeros to keep the ring advancing.
             silence: [4096]f32
             for written := u32(0); written < count; {
                 n := min(int(count - written), len(silence))
@@ -246,11 +244,7 @@ drain_packets :: proc(s: ^Stream) {
 stream_thread :: proc(t: ^thread.Thread) {
     s := (^Stream)(t.data)
 
-    // thread.create starts with a fresh default context -- context.logger is
-    // NOT inherited from the spawning thread, so every log call in this proc
-    // was silently discarded before this was added. audio_log_ctx is a local
-    // of this proc (not the spawning proc) so the pointer make_logger stashes
-    // in the Logger stays valid for the thread's whole lifetime.
+    // thread.create doesn't inherit the spawning thread's context.logger.
     audio_log_ctx := applog.Log_Context{sink = g_log_sink, tag = {.Audio, 0}}
     context.logger = applog.make_logger(&audio_log_ctx)
 
@@ -260,11 +254,7 @@ stream_thread :: proc(t: ^thread.Thread) {
     for intrinsics.atomic_load_explicit(&s.running, .Acquire) {
         if windows.WaitForSingleObject(s.event, 200) != windows.WAIT_OBJECT_0 do continue
         drain_packets(s)
-        // core:log's frontend formats via tprintf, allocating from the
-        // per-thread temp arena. drain_packets can log (ring-overflow
-        // warning) every iteration of this long-lived loop, so it must be
-        // cleared here or it grows without bound -- invisible to the
-        // tracking allocator since core:context.temp_allocator isn't it.
+        // Clear the per-thread temp arena core:log allocates into each iteration.
         free_all(context.temp_allocator)
     }
 

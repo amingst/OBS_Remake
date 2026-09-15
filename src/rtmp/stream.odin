@@ -38,9 +38,7 @@ rtmp_stream_start :: proc(
 	log_sink: ^applog.Sink,
 	stream_index: u8,
 ) -> (^Rtmp_Stream, bool) {
-	// ---- Allocate stream and register consumer BEFORE connect ----
-	// A full-consumer-array failure is cheap to back out of here; after
-	// connect() we'd have a socket to unwind too.
+	// Register the consumer before connect() -- cheaper to back out of here.
 	stream := new(Rtmp_Stream)
 	stream.enc = enc
 	stream.audio_channels = audio_channels
@@ -256,9 +254,6 @@ rtmp_stream_thread :: proc(t: ^thread.Thread) {
 
 		free_all(context.temp_allocator)
 	}
-
-	// No MFT teardown -- the encoder thread owns those.
-	// Losing the final frame or two on a live stream is acceptable.
 
 	if !send_fc_unpublish(stream) {
 		log.errorf("Failed to unpublish stream")

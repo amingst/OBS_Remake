@@ -10,22 +10,12 @@ import "base:intrinsics"
 import "../applog"
 import "../encode"
 
-// Deep enough to hold several seconds of encoded groups without spilling.
-// When the ring does fill (e.g. a Media Foundation stall), excess groups are
-// copied to a heap-backed spillover list rather than dropped, so no encoded
-// data is ever lost.  The ring is still the fast path; spillover is the
-// safety net.
-//
-// VIDEO_RING_DEPTH: 4s of buffering at a generous 60fps upper bound
-// (60*4=240), rounded up to 256.
-// AUDIO_RING_DEPTH: AAC LC always emits 1024-sample frames regardless of
-// input block size (see encode.odin's drain_audio), so at 48kHz that's
-// 48000/1024 ≈ 46.9 frames/sec; 4s ≈ 188, rounded up to 192.
+// ~4s of buffering each. When full, excess groups spill to a heap-backed list
+// instead of being dropped -- the ring is the fast path, spillover the safety net.
 VIDEO_RING_DEPTH :: 256
 AUDIO_RING_DEPTH :: 192
 
-// Total heap spillover across both video and audio rings.  If exceeded, the
-// feeder thread auto-stops recording and finalizes the file.
+// Total heap spillover across both rings before the feeder auto-stops recording.
 SPILLOVER_CEILING : u64 : 256 * 1024 * 1024
 
 Sink_State :: enum u32 {
@@ -34,9 +24,7 @@ Sink_State :: enum u32 {
 	Stopped,
 }
 
-// A heap copy of a video Frame_Group's encoded data, created when the video
-// ring is full.  The pool reference is released immediately after the copy;
-// the feeder thread reconstructs nalus from offsets when draining.
+// Heap copy of a video Frame_Group's encoded data, made when the ring is full.
 Video_Spill_Entry :: struct {
 	buf:      []u8,
 	offsets:  []encode.Nalu_Span,
@@ -44,7 +32,7 @@ Video_Spill_Entry :: struct {
 	duration: i64,
 }
 
-// A heap copy of an audio Frame_Group's encoded data, same purpose.
+// Heap copy of an audio Frame_Group's encoded data, same purpose.
 Audio_Spill_Entry :: struct {
 	buf:      []u8,
 	pts:      i64,
@@ -89,12 +77,9 @@ video_ring_destroy :: proc(r: ^Video_Ring) {
 	delete(r.spillover)
 }
 
-// put takes ownership of exactly one reference on every path: either the
-// group pointer is stored in the ring, or its encoded bytes are copied to
-// heap spillover and the pool reference is released immediately.  Runs on
-// the encoder thread with encode's consumers_mutex held: must not block,
-// log, or take any lock other than r.mutex.
-// Returns the number of spillover bytes added (0 when queued in the ring).
+// Queues g in the ring, or spills its encoded bytes to heap if full. Runs on
+// the encoder thread; must not block, log, or take any lock besides r.mutex.
+// Returns spillover bytes added (0 when queued in the ring).
 video_ring_put :: proc(r: ^Video_Ring, g: ^encode.Frame_Group) -> u64 {
 	sync.lock(&r.mutex)
 	defer sync.unlock(&r.mutex)
@@ -136,9 +121,7 @@ video_ring_take :: proc(r: ^Video_Ring) -> (^encode.Frame_Group, bool) {
 	return g, true
 }
 
-// Takes all spillover entries under the ring mutex and clears the ring's
-// list.  Caller owns the returned slice (temp-allocated) and the heap
-// buffers inside each entry.
+// Takes and clears all spillover entries under the ring mutex.
 @(private = "file")
 video_spill_take_all :: proc(r: ^Video_Ring) -> []Video_Spill_Entry {
 	sync.lock(&r.mutex)
@@ -215,10 +198,7 @@ audio_spill_take_all :: proc(r: ^Audio_Ring) -> []Audio_Spill_Entry {
 	return result
 }
 
-// Diagnostics only (recon instrumentation), touched exclusively by the
-// encoder thread (the put_video/put_audio fields) or the feeder thread (the
-// rest) -- never both at once, per the same happens-before guarantees the
-// rest of this file already relies on.
+// Diagnostics only; put_video/put_audio fields are encoder-thread-only, rest feeder-thread-only.
 Sink_Diag :: struct {
 	put_video_groups_received: u64,
 	put_video_groups_spilled:  u64,
@@ -245,29 +225,22 @@ Mp4_Sink :: struct {
 	log_sink:    ^applog.Sink,
 	diag:        Sink_Diag,
 
-	// Atomic running total of heap bytes across both spillover lists.
-	// Updated by put_video/put_audio on the encoder thread; read by the
-	// feeder thread to detect ceiling breaches.
+	// Running total of spillover bytes; written by put_video/put_audio, read by feeder.
 	spillover_bytes:  u64,  // atomic
 	spillover_breach: bool, // atomic
 
-	// PTS rebase state. enc's timeline is shared across every consumer and
-	// runs for the encoder's whole lifetime (see main.odin), so a group
-	// arriving here can carry an arbitrarily large PTS if this sink started
-	// long after the encoder did. This file needs its own timestamps to
-	// start near zero, so the feeder thread rebases every sample against a
-	// baseline captured from the first group it dequeues -- from either
-	// ring, whichever produces one first. Touched only by the feeder
-	// thread, never by put_video/put_audio.
+	// PTS rebase state so this file's timestamps start near zero regardless
+	// of when it joined the encoder's shared timeline. Feeder-thread-only.
 	pts_base:             i64,
 	pts_base_set:         bool,
 	negative_clamp_count: u64,
 }
 
-// Waits, per stream sink, for enough unrelated events that giving up means
-// something is actually wrong rather than ordinary startup latency.
+// Max unrelated events to wait through per stream sink before giving up.
 CLOCK_START_MAX_EVENTS :: 64
 
+// Starts an MP4 sink writing to path: opens the file, waits for the clock to
+// start, registers as an encoder consumer, and spawns the feeder thread.
 mp4_sink_start :: proc(enc: ^encode.Encoder, path: string) -> (^Mp4_Sink, bool) {
 	s := new(Mp4_Sink)
 	s.enc = enc
@@ -314,10 +287,7 @@ mp4_sink_start :: proc(enc: ^encode.Encoder, path: string) -> (^Mp4_Sink, bool) 
 		free(s)
 	}
 
-	// Wait for the actual OnClockStart notification (delivered to each
-	// stream sink as MEStreamSinkStarted) before feeding anything -- a group
-	// arriving before this has nowhere to go, and ProcessSample is rejected
-	// (or worse) until the sink has actually seen its clock start.
+	// Wait for MEStreamSinkStarted before feeding anything.
 	if !mf.mp4_sink_wait_started(s.handles.video_sink, CLOCK_START_MAX_EVENTS) {
 		log.error("timed out waiting for video MEStreamSinkStarted")
 		return {}, false
@@ -327,9 +297,7 @@ mp4_sink_start :: proc(enc: ^encode.Encoder, path: string) -> (^Mp4_Sink, bool) 
 		return {}, false
 	}
 
-	// Register the Consumer AFTER the sink is confirmed started -- unlike
-	// RTMP, there's no benefit to early registration here and a group
-	// arriving before OnClockStart has nowhere to go.
+	// Register the consumer only after the sink is confirmed started.
 	if !encode.consumer_add(enc, encode.Consumer{
 		put_video = put_video,
 		put_audio = put_audio,
@@ -354,11 +322,8 @@ mp4_sink_start :: proc(enc: ^encode.Encoder, path: string) -> (^Mp4_Sink, bool) 
 	return s, true
 }
 
-// Non-blocking: transitions the sink to Stopping and wakes the feeder
-// thread.  The feeder thread will drain remaining spillover and ring data,
-// finalize the file, release COM objects, and set the state to Stopped.
-// The caller should poll with mp4_sink_is_stopped, then call mp4_sink_reap
-// to join the thread and free the sink.
+// Non-blocking: signals the feeder thread to drain, finalize, and stop.
+// Caller polls mp4_sink_is_stopped, then calls mp4_sink_reap.
 mp4_sink_signal_stop :: proc(s: ^Mp4_Sink) {
 	intrinsics.atomic_store_explicit(&s.state, .Stopping, .Release)
 	windows.SetEvent(s.event)
@@ -368,11 +333,8 @@ mp4_sink_is_stopped :: proc(s: ^Mp4_Sink) -> bool {
 	return intrinsics.atomic_load_explicit(&s.state, .Acquire) == .Stopped
 }
 
-// Called from the main thread after mp4_sink_is_stopped returns true.
-// Joins the feeder thread, unregisters the consumer, releases any groups
-// that arrived after the feeder's final drain, frees spillover memory,
-// logs diagnostics, and frees the sink.  COM objects and the finalize
-// sequence have already been handled by the feeder thread.
+// Joins the feeder thread, unregisters the consumer, frees the rings, logs
+// diagnostics, and frees the sink. Call after mp4_sink_is_stopped is true.
 mp4_sink_reap :: proc(s: ^Mp4_Sink) {
 	if s.thread != nil {
 		thread.join(s.thread)
@@ -380,10 +342,6 @@ mp4_sink_reap :: proc(s: ^Mp4_Sink) {
 		s.thread = nil
 	}
 
-	// Once the thread is joined, no feeder code is touching the rings.
-	// Unregister the consumer so no further puts can arrive, then destroy
-	// both rings — releasing any straggler groups and freeing the spillover
-	// backing arrays.
 	encode.consumer_remove(s.enc, s)
 	video_ring_destroy(&s.video_ring)
 	audio_ring_destroy(&s.audio_ring)
@@ -432,11 +390,7 @@ put_video :: proc(ctx: rawptr, g: ^encode.Frame_Group) {
 	}
 }
 
-// Rebases pts against s.pts_base, capturing the base from the first group
-// this sink ever dequeues (whichever ring -- video or audio -- produces one
-// first). Feeder-thread-only; must never be called from put_video/put_audio.
-// duration is never passed here -- it's a span, not a point in time, and
-// rebasing it would be wrong.
+// Rebases pts against s.pts_base, set from the first group dequeued. Feeder-thread-only.
 @(private = "file")
 rebase_pts :: proc(s: ^Mp4_Sink, pts: i64) -> i64 {
 	if !s.pts_base_set {
@@ -474,9 +428,7 @@ put_audio :: proc(ctx: rawptr, g: ^encode.Frame_Group) {
 	}
 }
 
-// Feeds all spillover entries then all ring entries for one stream to MF.
-// Spillover is drained first because those entries are older (they were
-// produced when the ring was full) and PTS ordering must be preserved.
+// Feeds spillover then ring entries to MF, oldest first to preserve PTS order.
 @(private = "file")
 drain_audio :: proc(s: ^Mp4_Sink) {
 	for entry in audio_spill_take_all(&s.audio_ring) {
@@ -550,8 +502,7 @@ feeder_thread :: proc(t: ^thread.Thread) {
 	for intrinsics.atomic_load_explicit(&s.state, .Acquire) == .Running {
 		if windows.WaitForSingleObject(s.event, 200) != windows.WAIT_OBJECT_0 do continue
 
-		// Drain audio fully before video on each wake, same order as RTMP.
-		// Within each stream: spillover first, then ring, to preserve PTS order.
+		// Audio before video on each wake, same order as RTMP.
 		drain_audio(s)
 		drain_video(s)
 
@@ -564,19 +515,14 @@ feeder_thread :: proc(t: ^thread.Thread) {
 		free_all(context.temp_allocator)
 	}
 
-	// Final drain: everything remaining in spillover and ring.  The sink is
-	// still a registered consumer (consumer_remove happens during reap on
-	// the main thread), so groups may keep arriving — put_video/put_audio
-	// will release them immediately because state is no longer Running.
+	// Final drain of everything remaining.
 	drain_audio(s)
 	drain_video(s)
 
-	// Finalize: BeginFinalize -> wait -> EndFinalize -> Shutdown.
 	if !mf.mp4_sink_finalize(s.handles.media_sink) {
 		log.error("mp4_sink_finalize failed -- output file may be unplayable")
 	}
 
-	// Release COM objects, close handles.
 	s.handles.video_sink.Release(s.handles.video_sink)
 	s.handles.audio_sink.Release(s.handles.audio_sink)
 	s.handles.media_sink.Release(s.handles.media_sink)

@@ -7,10 +7,7 @@ import "../config"
 import "../settings"
 import "../ui"
 
-// Dispatches a Profile menu request raised by ui. Always clears the request
-// and whatever owned strings ui attached to it (switch_to / pending_name),
-// whether or not the action actually went through -- a request is
-// one-shot regardless of outcome.
+// Dispatches a Profile menu request raised by ui; always clears the request.
 handle_profile_request :: proc(
 	req:    ui.Profile_Request,
 	state:  ^ui.Profile_State,
@@ -35,8 +32,7 @@ handle_profile_request :: proc(
 			return
 		}
 		if created, ok := settings.create(paths.profiles, name); ok {
-			// Belt-and-braces, as with Switch: don't lose unsaved edits to
-			// the profile being left behind.
+			// Save the outgoing profile so its edits aren't lost.
 			settings.save_profile(cfg, paths.profiles)
 			settings.destroy_profile(cfg)
 			cfg^ = created
@@ -70,8 +66,7 @@ switch_profile :: proc(id: string, cfg: ^settings.Profile, app_cfg: ^config.App_
 		return
 	}
 
-	// Apply already persists, but a profile edited and not applied
-	// shouldn't silently lose changes just because the user switched away.
+	// Save the outgoing profile so unapplied edits aren't lost.
 	settings.save_profile(cfg, paths.profiles)
 
 	loaded, ok := settings.load_by_id(paths.profiles, id)
@@ -104,7 +99,6 @@ delete_active_profile :: proc(
 
 	survivor := pick_survivor(infos^, cfg.id)
 	if survivor == "" {
-		// registry.remove would refuse this too, but silently -- surface it.
 		state.denied = strings.clone("Can't delete the only remaining profile.")
 		return
 	}
@@ -115,11 +109,7 @@ delete_active_profile :: proc(
 		return
 	}
 
-	// The active profile has to move aside *before* its file is removed:
-	// deleting first would either leave cfg pointing at a file that no
-	// longer exists (and resurrect it on the next save) or require running
-	// with no valid profile at all, which nothing downstream is built to
-	// handle mid-frame.
+	// Move the active profile aside before deleting its file.
 	prev_id := strings.clone(cfg.id)
 	defer delete(prev_id)
 
@@ -135,9 +125,7 @@ delete_active_profile :: proc(
 	log.infof("deleted profile %v, switched to %v (%v)", prev_id, cfg.name, cfg.id)
 }
 
-// First by name, not enumeration order, so repeated deletes behave
-// predictably; tie-broken by id in case two profiles share a name. Mirrors
-// the pick made at startup when no active profile is recorded.
+// Picks a replacement profile: first by name, tie-broken by id.
 @(private = "file")
 pick_survivor :: proc(infos: []settings.Profile_Info, exclude_id: string) -> string {
 	best := -1

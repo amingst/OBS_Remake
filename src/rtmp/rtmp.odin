@@ -22,12 +22,7 @@ connect :: proc(host: string, port: int) -> (Connection, bool) {
 		log.warnf("Failed to establish RTMP Connection to host %v, error: %v", host, err)
 		return {}, false
 	}
-	// Heap-allocated (context.allocator), not context.temp_allocator: these
-	// maps live for the whole streaming session and are written to from the
-	// RTMP worker thread on every frame, long past the main thread's
-	// per-frame free_all(context.temp_allocator) -- a temp-allocator map here
-	// was silently corrupt across that lifetime/thread mismatch. delete(...)
-	// in close() matches this allocator.
+	// Heap-allocated: these maps outlive the main thread's per-frame temp arena.
 	state := make(map[u32]Chunk_State)
 	incoming_chunks := make(map[u32]Incoming_Chunk_State)
 
@@ -89,12 +84,8 @@ handshake :: proc(c: ^Connection) -> bool {
 close :: proc(c: ^Connection) {
 	net.set_option(c.socket, .Receive_Timeout, time.Second * 2)
 
-	// Graceful half-close: tell the peer we're done sending, then drain
-	// whatever it sends back (or its own FIN) before tearing down. Without
-	// this, closesocket() on Windows sends RST instead of FIN whenever
-	// unread bytes are still sitting in the receive buffer -- which is what
-	// was showing up as ffmpeg's "Error during demuxing: I/O error" even
-	// after FCUnpublish/deleteStream were added upstream of this point.
+	// Graceful half-close: without draining first, Windows sends RST instead
+	// of FIN, which showed up as ffmpeg's "Error during demuxing" downstream.
 	net.shutdown(c.socket, .Send)
 
 	drain: [256]u8

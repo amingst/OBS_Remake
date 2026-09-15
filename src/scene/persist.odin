@@ -24,21 +24,12 @@ Source_DTO :: struct {
 
     path: string,
 
-    // Window identity: title alone is the backward-compatible case (a
-    // collection saved before class_name/exe_name existed has them absent
-    // from the JSON, which json.unmarshal leaves at "" -- resolve_window
-    // treats class_name == "" as "no class recorded" and falls back to
-    // title-only FindWindowW, exactly the old behaviour). With class_name
-    // present, resolution prefers class+exe over title -- see
-    // capture.resolve_window.
+    // Window identity; empty class_name means "no class recorded" (older
+    // files) and falls back to title-only matching -- see resolve_window.
     title:      string,
     class_name: string,
     exe_name:   string,
 
-    // Session toggles, stored inverted (false = WGC default) for the same
-    // backward-compatibility reason: absent from an older file, they
-    // unmarshal to false, which means "no opinion" here, not "explicitly
-    // disabled".
     game_capture: bool,
     hide_cursor:  bool,
     hide_border:  bool,

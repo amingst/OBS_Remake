@@ -20,12 +20,8 @@ Settings_State :: struct {
     was_open:     bool,         // last frame's show_settings, so we can seed on the opening edge
     save_request: Save_Trigger, // raised here, consumed and cleared by main
 
-    // Stream (Output tab) fields. Stream_Settings holds owned strings, so
-    // unlike `pending` above these aren't edited as a struct copy -- ImGui
-    // text inputs need a fixed-size byte buffer (same InputText-into-buffer
-    // shape as profiles.odin's name_buf), seeded/read via seed_name_buf and
-    // read_stream_field below, and only turned back into owned strings on
-    // Apply/OK.
+    // Stream (Output tab) fields, edited via fixed byte buffers and only
+    // turned back into owned strings on Apply/OK.
     stream_host_buf:  [128]u8,
     stream_app_buf:   [128]u8,
     stream_tcurl_buf: [256]u8,
@@ -145,10 +141,7 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.
     }
     s.was_open = state.show_settings
 
-    // The trailing ###Settings keeps the popup's ID stable (matching the bare
-    // "Settings" passed to OpenPopup above -- ImGui hashes only the part
-    // after ### when it's present) while the visible title tracks whichever
-    // profile is currently active.
+    // ###Settings keeps the popup ID stable while the title shows the active profile.
     title := fmt.ctprintf("Settings — %s###Settings", cfg.name)
     if im.BeginPopupModal(title, &state.show_settings) {
         if im.BeginTabBar("SettingsTabs") {
@@ -181,15 +174,7 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.
                 im.EndTabItem()
             }
             if im.BeginTabItem("Output") {
-                // Streaming reads Profile.stream (host/app/tc_url/stream_key)
-                // once, at Start_Streaming, into a fixed-size rtmp connection --
-                // there's no live-reconcile path for it the way canvas
-                // resolution has (reconcile.odin), so editing mid-stream would
-                // silently do nothing until the next stream restart. Same
-                // reasoning as guarding a second recording start; no existing
-                // "disable while busy" precedent elsewhere in the UI, so this
-                // uses ImGui's own BeginDisabled/EndDisabled rather than
-                // inventing a new one.
+                // No live-reconcile for stream settings, so disable editing mid-stream.
                 if streaming {
                     im.TextColored({1, 0.7, 0, 1}, "Stop the stream to edit these settings.")
                 }
@@ -239,9 +224,7 @@ draw_settings :: proc(state: ^State, cfg: ^settings.Profile, outputs: []capture.
     }
 }
 
-// Mirrors from_dto's owned-string replacement in settings/persist.odin:
-// delete the profile's current stream strings before cloning the edited
-// buffer contents over them, so applying settings repeatedly doesn't leak.
+// Frees the profile's current stream strings before cloning the edited buffers over them.
 @(private="file")
 apply_stream_settings :: proc(s: ^Settings_State, cfg: ^settings.Profile) {
     delete(cfg.stream.host)
@@ -259,9 +242,7 @@ apply_stream_settings :: proc(s: ^Settings_State, cfg: ^settings.Profile) {
     }
 }
 
-// Unlike read_name_buf (profiles.odin), an empty stream field is valid --
-// dto_is_valid (settings/persist.odin) treats a blank stream config as
-// "not set up yet" rather than rejecting it, so this doesn't reject empty.
+// Unlike read_name_buf (profiles.odin), an empty stream field is valid.
 @(private="file")
 read_stream_field :: proc(buf: []u8) -> string {
     n := strings.index_byte(string(buf), 0)

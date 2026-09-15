@@ -10,8 +10,7 @@ import "../scene"
 import "../audio"
 import "../platform"
 
-// Audio input and output are separate choices here but construct the same
-// Audio_Data variant -- they differ only in the loopback flag.
+// The kinds selectable in the Add Source popup.
 Source_Kind_Choice :: enum i32 {
     Color,
     Display,
@@ -29,16 +28,11 @@ Sources_State :: struct {
     output_choice: int, // index into the enumerated outputs, for the Add popup
     audio_choice:  int, // index into the *filtered* device list, for the Add popup
 
-    // Window picker. enumerate_windows is called exactly once, when the
-    // popup opens (the button below), and destroy_window_list exactly once,
-    // when it closes (pick, cancel, or app shutdown via destroy_sources_state)
-    // -- never per frame.
+    // Window picker popup state; list is enumerated on open, freed on close.
     window_picker_list:     []capture.Window_Info,
     window_picker_show_all: bool, // bypasses the game-capture default filter
 
-    // Camera picker. enumerate_cameras is called exactly once, when the
-    // popup opens, and destroy_camera_list exactly once, when it closes
-    // (pick, cancel, or app shutdown via destroy_sources_state).
+    // Camera picker popup state; list is enumerated on open, freed on close.
     camera_picker_list: []capture.Camera_Info,
 }
 
@@ -46,9 +40,7 @@ init_sources_state :: proc() -> Sources_State {
     return Sources_State{}
 }
 
-// Only needed for the edge case of exiting with the window picker popup left
-// open -- draw_window_picker's own Cancel/pick paths already destroy the
-// list in the ordinary case.
+// Frees any picker list left allocated (e.g. exiting with a popup still open).
 destroy_sources_state :: proc(state: ^Sources_State) {
     if state.window_picker_list != nil {
         capture.destroy_window_list(state.window_picker_list)
@@ -60,8 +52,7 @@ destroy_sources_state :: proc(state: ^Sources_State) {
     }
 }
 
-// "\\.\DISPLAY1 (2560x1600)". Temp-allocated, so it lives until the end of the
-// frame -- long enough for ImGui to copy it.
+// Formats an output as e.g. "\\.\DISPLAY1 (2560x1600)".
 @(private="file")
 output_label :: proc(o: capture.Output_Info) -> cstring {
     return fmt.ctprintf("%v (%vx%v)", o.device_name, o.width, o.height)
@@ -72,8 +63,7 @@ audio_label :: proc(d: audio.Device_Info) -> cstring {
     return fmt.ctprintf("%v", d.name)
 }
 
-// Index of the output a display source is currently pointed at, or -1 if the
-// indices don't match anything we enumerated (e.g. a monitor was unplugged).
+// Index of the output a display source is pointed at, or -1 if not found.
 @(private="file")
 find_output :: proc(outputs: []capture.Output_Info, adapter_index, output_index: i32) -> int {
     for o, i in outputs {
@@ -84,9 +74,7 @@ find_output :: proc(outputs: []capture.Output_Info, adapter_index, output_index:
     return -1
 }
 
-// The devices matching a source's direction. Temp-allocated and rebuilt each
-// frame; the Device_Info strings are borrowed from the caller's slice, so the
-// result must not outlive the frame.
+// Devices matching a source's direction (input/loopback). Temp-allocated.
 @(private="file")
 audio_devices_for :: proc(devices: []audio.Device_Info, is_loopback: bool) -> []audio.Device_Info {
     out := make([dynamic]audio.Device_Info, 0, len(devices), context.temp_allocator)
@@ -96,10 +84,8 @@ audio_devices_for :: proc(devices: []audio.Device_Info, is_loopback: bool) -> []
     return out[:]
 }
 
-// Sizes a source to fill the canvas while preserving its native aspect ratio,
-// centred -- letterboxed or pillarboxed depending on which axis binds. Same
-// width-first-then-correct shape as the preview panel fit in preview.odin.
-// Colour sources have no native aspect, so they just take the canvas'.
+// Sizes and centers a source to fill the canvas at its native aspect ratio
+// (letterboxed/pillarboxed as needed). Colour sources use the canvas aspect.
 @(private="file")
 fit_to_canvas :: proc(src: ^scene.Source, outputs: []capture.Output_Info, canvas_w, canvas_h: f32) {
     aspect := canvas_w / canvas_h
@@ -113,13 +99,7 @@ fit_to_canvas :: proc(src: ^scene.Source, outputs: []capture.Output_Info, canvas
             aspect = f32(d.width) / f32(d.height)
         }
     case scene.Window_Data:
-        // Same shape as Image_Data: no native size until capture starts, so
-        // fall through to the canvas aspect until then.
-        //
-        // This does not re-run when a captured window resizes -- the source
-        // keeps its canvas rectangle and the content changes resolution
-        // inside it. That matches display's behaviour and is the intended
-        // default for this step, not a bug.
+        // No native size until capture starts; doesn't re-fit on later resize.
         if d.capture != nil && d.capture.width > 0 && d.capture.height > 0 {
             aspect = f32(d.capture.width) / f32(d.capture.height)
         }
@@ -142,8 +122,7 @@ fit_to_canvas :: proc(src: ^scene.Source, outputs: []capture.Output_Info, canvas
     src.y = (canvas_h - size.y) * 0.5
 }
 
-// Combo listing every enumerated output. Picking a different one rewrites the
-// source's indices and tears the capture down, so the frame loop restarts it.
+// Combo of enumerated outputs; picking a new one tears down the old capture.
 @(private="file")
 draw_output_picker :: proc(d: ^scene.Display_Data, outputs: []capture.Output_Info) {
     if len(outputs) == 0 {
@@ -168,9 +147,7 @@ draw_output_picker :: proc(d: ^scene.Display_Data, outputs: []capture.Output_Inf
     }
 }
 
-// Device combo plus the mixer params. A device that's been unplugged since the
-// source was saved won't be in the list -- shown as unavailable rather than
-// silently repointed at something else.
+// Device combo plus volume/mute. An unplugged device shows as unavailable.
 @(private="file")
 draw_audio_picker :: proc(d: ^scene.Audio_Data, devices: []audio.Device_Info) {
     matching := audio_devices_for(devices, d.is_loopback)
@@ -203,19 +180,12 @@ draw_audio_picker :: proc(d: ^scene.Audio_Data, devices: []audio.Device_Info) {
         }
     }
 
-    // volume/muted come from the embedded Audio_Params, so they're reachable
-    // without going through d.params.
     im.SliderFloat("Volume", &d.volume, 0, 1)
     im.Checkbox("Muted", &d.muted)
 }
 
-// Picking a window frees the old identity and stores the new one, stops any
-// existing capture, and arms an immediate retry -- but never calls
-// start_window_capture. THE UI NEVER CALLS A CAPTURE PROC: stopping the old
-// capture here is a teardown, not an acquisition, so it's fine on this side
-// of that rule; the main loop starts the new one next frame the same way it
-// starts any other (re)resolved window source. That keeps exactly one
-// acquisition path (main.odin's retry block) instead of two.
+// Window picker: stops the old capture and stores the new identity, but never
+// starts a capture itself -- the main loop's retry path does that next frame.
 @(private="file")
 draw_window_picker :: proc(d: ^scene.Window_Data, state: ^Sources_State) {
     if d.title != "" {
@@ -235,9 +205,6 @@ draw_window_picker :: proc(d: ^scene.Window_Data, state: ^Sources_State) {
         im.TextDisabled("Lost -- retrying")
     }
 
-    // Changes only the picker's default filter (below) and, applied by the
-    // main loop on (re)start -- not here, the UI never calls a capture proc
-    // -- forces cursor capture off regardless of hide_cursor.
     im.Checkbox("Game Capture", &d.game_capture)
     im.Checkbox("Hide cursor", &d.hide_cursor)
     im.Checkbox("Hide capture border", &d.hide_border)
@@ -400,8 +367,7 @@ draw_sources :: proc(
                             }
                             data = d
                         case .Audio_Input, .Audio_Output:
-                            // volume defaults to 1.0 explicitly -- the zero
-                            // value would make a new source silent.
+                            // volume defaults to 1.0 -- zero would be silent.
                             a := scene.Audio_Data{
                                 is_loopback = state.kind_choice == .Audio_Output,
                                 params      = {volume = 1.0},
@@ -414,9 +380,7 @@ draw_sources :: proc(
                         case .Image:
                             data = scene.Image_Data{}
                         case .Window:
-                            // Empty title: unresolvable until step 7's picker
-                            // can supply one. The main loop will log once and
-                            // mark it lost on the first frame it's visible.
+                            // Empty title until the picker supplies one.
                             data = scene.Window_Data{}
                         case .Camera:
                             data = scene.Camera_Data{}
@@ -424,8 +388,7 @@ draw_sources :: proc(
 
                         state.selected_id = scene.create_source(doc, sc, name, data)
 
-                        // A display capture at the default 400x300 is badly
-                        // squashed, so start it at its native aspect instead.
+                        // Start a display source at its native aspect, not the default 400x300.
                         if state.kind_choice == .Display {
                             if src := scene.find_source(sc, state.selected_id); src != nil {
                                 fit_to_canvas(src, outputs, canvas_w, canvas_h)
@@ -480,8 +443,7 @@ draw_sources :: proc(
             if src := scene.find_source(sc, state.selected_id); src != nil {
                 im.Separator()
 
-                // Geometry is meaningless for audio -- it has no position on
-                // the canvas -- so those controls are visual-sources-only.
+                // Geometry controls are visual-sources-only; audio has no canvas position.
                 _, is_audio := src.data.(scene.Audio_Data)
 
                 if !is_audio {
@@ -491,9 +453,7 @@ draw_sources :: proc(
                     im.DragFloat("H", &src.h)
                 }
 
-                // src.color is only read for colour quads -- the display quad
-                // hardcodes white -- so the swatch is only shown where it does
-                // something, and the pickers take its place otherwise.
+                // The colour swatch only applies to Color_Data quads.
                 switch &d in src.data {
                 case scene.Color_Data:
                     im.ColorEdit4("Color", &src.color)
@@ -560,13 +520,8 @@ draw_sources :: proc(
     im.End()
 }
 
-// Picking a camera frees the old identity and stores the new one, stops any
-// existing reader, and drops the old texture (a different device means a
-// different frame size) -- but never calls camera_start. THE UI NEVER CALLS
-// A CAPTURE PROC: stopping the old reader here is a teardown, not an
-// acquisition, so it's fine on this side of that rule; the main loop starts
-// the new one next frame via its lazy-start check (cam == nil && symlink !=
-// ""), same as draw_window_picker's identity swap for window sources.
+// Camera picker: stops the old reader and stores the new identity, but never
+// starts a reader itself -- the main loop's lazy-start check does that.
 @(private="file")
 draw_camera_picker :: proc(d: ^scene.Camera_Data, state: ^Sources_State) {
     if d.friendly_name != "" {
