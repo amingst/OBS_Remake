@@ -17,7 +17,7 @@ send_connect :: proc(
 	amf_write_key(&payload, "app")
 	amf_write_string(&payload, app)
 	amf_write_key(&payload, "flashVer")
-	amf_write_string(&payload, "FMLE/3.0 (compatible; OBSRemake)")
+	amf_write_string(&payload, "FMLE/3.0 (compatible; StreamSmith)")
 	amf_write_key(&payload, "tcUrl")
 	amf_write_string(&payload, tc_url)
 	amf_write_key(&payload, "fpad")

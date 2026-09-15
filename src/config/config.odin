@@ -63,7 +63,7 @@ resolve_paths :: proc() -> (paths: Paths, ok: bool) {
 	}
 	defer if !ok do destroy_paths(&paths)
 
-	if !join_into(&paths.root, roaming, "OBSRemake")   do return
+	if !join_into(&paths.root, roaming, "StreamSmith")   do return
 	if !make_dir(paths.root)                           do return
 
 	if !join_into(&paths.app_config,  paths.root, "app.json")      do return

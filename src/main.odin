@@ -1,4 +1,4 @@
-package obs_remake
+package streamsmith
 
 // @(require) keeps core:mem legal under -vet in non-debug builds.
 import "core:fmt"
@@ -115,7 +115,7 @@ main :: proc() {
 		win32.MonitorFromPoint(win32.POINT{0, 0}, .MONITOR_DEFAULTTOPRIMARY))
 
     win: platform.Window
-    window_title := fmt.tprintf("OBS Remake %s", APP_VERSION)
+    window_title := fmt.tprintf("StreamSmith %s", APP_VERSION)
     if (!platform.create_window(&win, window_title, 1280, 800)) {
         log.fatal("window/device creation failed, exiting")
         return

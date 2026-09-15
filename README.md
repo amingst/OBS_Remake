@@ -1,8 +1,8 @@
 ## Quick Start
 
 ```
-git clone --recurse-submodules https://github.com/amingst/OBS_Remake.git
-cd OBS_Remake
+git clone --recurse-submodules https://github.com/amingst/streamsmith.git
+cd streamsmith
 setup.bat
 build.bat
 ```
@@ -61,7 +61,7 @@ setup.bat --force
 Compiles the project with the Odin compiler:
 
 ```
-odin build src -out:build/app.exe -collection:libs=libs -vet -vet-shadowing -debug
+odin build src -out:build/StreamSmith.exe -collection:libs=libs -vet -vet-shadowing -debug
 ```
 
 ## Packages

@@ -1,4 +1,4 @@
-package obs_remake
+package streamsmith
 
 import "core:log"
 import "vendor:directx/d3d11"

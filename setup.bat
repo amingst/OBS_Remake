@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 :: ============================================================
-:: setup.bat — One-command build setup for OBS_Remake
+:: setup.bat — One-command build setup for StreamSmith
 :: Usage: setup.bat [--force | --rebuild]
 :: ============================================================
 

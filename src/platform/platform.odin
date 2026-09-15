@@ -8,7 +8,7 @@ import "vendor:directx/dxgi"
 
 @(private) g_window: ^Window
 @(private) g_ctx: runtime.Context
-@(private) CLASS_NAME := win32.L("OBSRemakeWindow")
+@(private) CLASS_NAME := win32.L("StreamSmithWindow")
 Window :: struct {
     hwnd: win32.HWND,
     device: ^d3d11.IDevice,
