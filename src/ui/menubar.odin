@@ -70,21 +70,26 @@ match_preset :: proc(presets: []Canvas_Preset, w, h: i32) -> int {
     return len(presets)
 }
 
-draw_menubar :: proc(
+// Menu entries only -- the caller supplies the menu bar (see draw_top_bar).
+draw_menus :: proc(
+    state: ^State,
+    cfg: ^settings.Profile,
+    doc: ^scene.Collection,
+    profiles: []settings.Profile_Info,
+    collections: []scene.Collection_Info,
+) {
+    draw_file_menu(state, cfg, doc, profiles, collections)
+    draw_view_menu(state)
+}
+
+// Modals owned by the menus; drawn at top level, after the chrome.
+draw_modals :: proc(
     state: ^State,
     cfg: ^settings.Profile,
     doc: ^scene.Collection,
     outputs: []capture.Output_Info,
-    profiles: []settings.Profile_Info,
-    collections: []scene.Collection_Info,
     streaming: bool,
 ) {
-    if im.BeginMainMenuBar() {
-        draw_file_menu(state, cfg, doc, profiles, collections)
-        draw_view_menu(state)
-        im.EndMainMenuBar()
-    }
-
     if state.show_settings && !im.IsPopupOpen("Settings") {
         im.OpenPopup("Settings")
     }

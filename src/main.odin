@@ -311,7 +311,7 @@ main :: proc() {
 	defer scene.destroy_all(&doc)
 	defer scene.destroy_infos(collection_infos)
 
-    ui_state := ui.init_state(&doc)
+    ui_state := ui.init_state(&doc, APP_VERSION)
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
     defer ui.destroy(&ui_state)
 

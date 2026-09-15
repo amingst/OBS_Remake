@@ -12,6 +12,7 @@ import "../audio"
 DEFAULT_LAYOUT :: #load("default_layout.ini", string)
 
 State :: struct {
+    version: string, // shown in the status bar; supplied by main
     show_demo: bool,
     show_settings: bool,
     scenes: Scenes_State,
@@ -36,19 +37,21 @@ draw :: proc(
     canvas_w, canvas_h: f32,
     audio_devices: []audio.Device_Info
 ) {
+    // Chrome first: it shrinks the viewport work area the dockspace then fills.
+    draw_chrome(state, cfg, doc, profiles, collections)
     im.DockSpaceOverViewport(0, im.GetMainViewport(), {.PassthruCentralNode}, nil)
-
-    draw_menubar(state, cfg, doc, outputs, profiles, collections, state.controls.streaming);
 
     draw_preview(&state.preview, &state.sources, &state.scenes, doc, preview_tex, canvas_w, canvas_h)
     draw_scenes(&state.scenes, doc)
     draw_sources(&state.sources, &state.scenes, doc, outputs, canvas_w, canvas_h, audio_devices)
     draw_mixer(&state.mixer, &state.scenes, doc)
-    draw_controls(&state.controls)
+
+    draw_modals(state, cfg, doc, outputs, state.controls.streaming)
 }
 
-init_state :: proc(doc: ^scene.Collection) -> State {
+init_state :: proc(doc: ^scene.Collection, version: string) -> State {
     state := State{
+        version = version,
         show_demo = false,
         show_settings = false,
         scenes = init_scenes_state(),
