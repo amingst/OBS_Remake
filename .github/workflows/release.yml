@@ -39,6 +39,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist
           Compress-Archive -Path build/StreamSmith.exe -DestinationPath "dist/StreamSmith-${{ github.ref_name }}-win64.zip"
 
+      - name: Remove any existing release for this tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ github.ref_name }}" --yes --cleanup-tag=false
+          if ($LASTEXITCODE -ne 0) { Write-Host "No existing release to delete (ok)" }
+          exit 0
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
