@@ -144,7 +144,9 @@ service_sources :: proc(
 					d.lost = true
 					d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
 				}
-				if (d.capture == nil || d.lost) && time.now()._nsec >= d.next_retry._nsec {
+				// Nothing to capture until the picker supplies an identity.
+				has_identity := d.title != "" || d.class_name != "" || d.exe_name != ""
+				if has_identity && (d.capture == nil || d.lost) && time.now()._nsec >= d.next_retry._nsec {
 					hwnd, resolved := capture.resolve_window(d.title, d.class_name, d.exe_name)
 					if !resolved {
 						if !d.lost {
