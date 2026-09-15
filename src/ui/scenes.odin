@@ -16,9 +16,12 @@ init_scenes_state :: proc() -> Scenes_State {
 }
 
 draw_scenes :: proc(state: ^Scenes_State, doc: ^scene.Collection) {
-    p := panel_begin("Scenes")
+    p := panel_begin("Scenes", "SCENES")
     if p.visible {
-        if im.Button("+") {
+        add_scene := panel_header_button("+", "Add scene")
+        panel_header_end()
+
+        if add_scene {
             im.OpenPopup("Create Scene")
         }
 

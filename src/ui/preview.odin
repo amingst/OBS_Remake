@@ -34,12 +34,14 @@ draw_preview :: proc(
     state:    ^Preview_State,
     sources:  ^Sources_State,
     scenes:   ^Scenes_State,
+    controls: ^Controls_State,
     doc:      ^scene.Collection,
     tex:      im.TextureRef,
     canvas_w, canvas_h: f32,
 ) {
-    p := panel_begin("Preview")
+    p := panel_begin("Preview", "PROGRAM PREVIEW")
     if p.visible {
+        panel_header_end()
         avail := im.GetContentRegionAvail()
 
         if avail.x > 0 && avail.y > 0 {
@@ -70,12 +72,45 @@ draw_preview :: proc(
             }
             apply_drag(state, scenes, doc, canvas_w, canvas_h)
             draw_overlay(state, sources, scenes, doc, canvas_w, canvas_h)
+            draw_rec_badge(state, controls)
         } else if !state.logged_collapsed {
             log.warn("preview panel collapsed or too small to render")
             state.logged_collapsed = true
         }
     }
     panel_end(p)
+}
+
+// Recording/streaming badge, pinned to the bottom-right of the preview image.
+@(private="file")
+draw_rec_badge :: proc(state: ^Preview_State, controls: ^Controls_State) {
+    label: cstring
+    switch {
+    case controls.streaming && controls.recording: label = "● LIVE + REC"
+    case controls.streaming:                       label = "● LIVE"
+    case controls.recording:                       label = "● REC"
+    case:                                          return
+    }
+
+    scale := ui_scale()
+    pad   := 8 * scale
+    im.PushFontFloat(fonts.mono, FONT_SIZE_TELEMETRY)
+    text_size := im.CalcTextSize(label)
+
+    br := im.Vec2{
+        state.image_min.x + state.image_size.x - pad,
+        state.image_min.y + state.image_size.y - pad,
+    }
+    tl := im.Vec2{br.x - text_size.x - pad * 2, br.y - text_size.y - pad}
+
+    dl := im.GetWindowDrawList()
+    im.DrawList_AddRectFilled(dl, tl, br, col32(SURFACE_LOWEST, 0.85), 6 * scale)
+
+    im.SetCursorScreenPos({tl.x + pad, tl.y + pad * 0.5})
+    im.PushStyleColorVec4(.Text, rgba(DANGER))
+    im.TextUnformatted(label)
+    im.PopStyleColor()
+    im.PopFont()
 }
 
 screen_to_canvas :: proc(state: ^Preview_State, canvas_w, canvas_h: f32, p: [2]f32) -> [2]f32 {

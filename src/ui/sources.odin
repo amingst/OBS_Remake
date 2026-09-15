@@ -52,6 +52,20 @@ destroy_sources_state :: proc(state: ^Sources_State) {
     }
 }
 
+// Icon for a source's kind, shown at the head of its row.
+@(private="file")
+source_icon :: proc(data: scene.Source_Data) -> string {
+    switch _ in data {
+    case scene.Color_Data:   return ICON_PALETTE
+    case scene.Display_Data: return ICON_DISPLAY
+    case scene.Audio_Data:   return ICON_MICROPHONE
+    case scene.Image_Data:   return ICON_IMAGE
+    case scene.Window_Data:  return ICON_WINDOW
+    case scene.Camera_Data:  return ICON_CAMERA
+    }
+    return ICON_LAYER_GROUP
+}
+
 // Formats an output as e.g. "\\.\DISPLAY1 (2560x1600)".
 @(private="file")
 output_label :: proc(o: capture.Output_Info) -> cstring {
@@ -277,17 +291,22 @@ draw_sources :: proc(
     canvas_w, canvas_h: f32,
     devices: []audio.Device_Info,
 ) {
-    p := panel_begin("Sources")
+    p := panel_begin("Sources", "SOURCES")
     if p.visible {
+        // Header buttons are laid out right-to-left.
+        move_down := panel_header_button(ICON_CHEVRON_DOWN, "Move down")
+        move_up   := panel_header_button(ICON_CHEVRON_UP, "Move up")
+        add_source := panel_header_button("+", "Add source")
+        panel_header_end()
+
         sc := scene.find(doc, scenes.selected_id)
         if sc == nil {
             im.TextDisabled("No scene selected")
         } else {
-            if im.Button("+") {
+            if add_source {
                 im.OpenPopup("Add Source")
             }
-            im.SameLine()
-            if im.ArrowButton("##up", .Up) {
+            if move_up {
                 for i in 0..<len(sc.sources) {
                     if sc.sources[i].id == state.selected_id && i > 0 {
                         sc.sources[i], sc.sources[i - 1] = sc.sources[i - 1], sc.sources[i]
@@ -295,8 +314,7 @@ draw_sources :: proc(
                     }
                 }
             }
-            im.SameLine()
-            if im.ArrowButton("##down", .Down) {
+            if move_down {
                 for i in 0..<len(sc.sources) {
                     if sc.sources[i].id == state.selected_id && i < len(sc.sources) - 1 {
                         sc.sources[i], sc.sources[i + 1] = sc.sources[i + 1], sc.sources[i]
@@ -431,12 +449,17 @@ draw_sources :: proc(
             for &src, i in sc.sources {
                 im.PushIDInt(i32(src.id))
 
-                im.Checkbox("##visible", &src.visible)
-                im.SameLine()
-
-                label := strings.clone_to_cstring(src.name, context.temp_allocator)
-                if im.Selectable(label, state.selected_id == src.id) {
+                // Kind icon + name fill the row; the eye toggle overlays its right end.
+                right_x := im.GetCursorPosX() + im.GetContentRegionAvail().x
+                label := fmt.ctprintf("%s  %s", source_icon(src.data), src.name)
+                if !src.visible {
+                    im.PushStyleColorVec4(.Text, rgba(OUTLINE))
+                }
+                if im.Selectable(label, state.selected_id == src.id, {.AllowOverlap}) {
                     state.selected_id = src.id
+                }
+                if !src.visible {
+                    im.PopStyleColor()
                 }
 
                 if im.BeginPopupContextItem() {
@@ -445,6 +468,18 @@ draw_sources :: proc(
                     }
                     im.EndPopup()
                 }
+
+                eye := im.GetFrameHeight()
+                im.SameLine()
+                im.SetCursorPosX(right_x - eye)
+                im.PushStyleColorVec4(.Button, rgba(0, 0))
+                im.PushStyleColorVec4(.ButtonHovered, rgba(SURFACE_HIGHEST))
+                im.PushStyleColorVec4(.ButtonActive, rgba(OUTLINE_VARIANT))
+                im.PushStyleColorVec4(.Text, rgba(src.visible ? TEXT_VARIANT : OUTLINE))
+                if im.Button(src.visible ? ICON_EYE : ICON_EYE_SLASH, {eye, eye}) {
+                    src.visible = !src.visible
+                }
+                im.PopStyleColor(4)
 
                 im.PopID()
             }

@@ -225,7 +225,12 @@ Panel :: struct {
     visible: bool, // card is visible; draw content only when true
 }
 
-panel_begin :: proc(name: cstring) -> Panel {
+// Right edge of the header row, in window-local coords. Header buttons are laid
+// out right-to-left from here; panels are never nested, so one cursor is enough.
+@(private="file")
+header_x: f32
+
+panel_begin :: proc(name: cstring, title: cstring) -> Panel {
     scale := ui_scale()
 
     im.PushStyleColorVec4(.WindowBg, rgba(BG))
@@ -242,7 +247,47 @@ panel_begin :: proc(name: cstring) -> Panel {
         p.visible = im.BeginChild("##card", {0, 0}, {.Borders})
         im.PopStyleVar(2)
     }
+
+    if p.visible {
+        header_x = im.GetCursorPosX() + im.GetContentRegionAvail().x
+
+        // Header buttons are frame-height, so centre the title against them.
+        im.AlignTextToFramePadding()
+        im.PushFontFloat(fonts.medium, FONT_SIZE_LABEL)
+        im.PushStyleColorVec4(.Text, rgba(TEXT_VARIANT))
+        im.TextUnformatted(title)
+        im.PopStyleColor()
+        im.PopFont()
+    }
     return p
+}
+
+// Header action button, placed right-to-left. Call between panel_begin and
+// panel_header_end; returns true when clicked.
+panel_header_button :: proc(icon: cstring, tooltip: cstring = nil) -> bool {
+    size := im.GetFrameHeight()
+    header_x -= size
+
+    im.SameLine()
+    im.SetCursorPosX(header_x)
+
+    im.PushStyleColorVec4(.Button, rgba(0, 0))
+    im.PushStyleColorVec4(.ButtonHovered, rgba(SURFACE_HIGHEST))
+    im.PushStyleColorVec4(.ButtonActive, rgba(OUTLINE_VARIANT))
+    im.PushStyleColorVec4(.Text, rgba(TEXT_VARIANT))
+    clicked := im.Button(icon, {size, size})
+    im.PopStyleColor(4)
+
+    if tooltip != nil && im.IsItemHovered() {
+        im.SetTooltip(tooltip)
+    }
+    return clicked
+}
+
+// Closes the header row: divider, then content starts below.
+panel_header_end :: proc() {
+    im.Separator()
+    im.Spacing()
 }
 
 panel_end :: proc(p: Panel) {
