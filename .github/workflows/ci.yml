@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: nightly
+
+      - name: Install premake5
+        run: choco install premake5 -y
+
+      - name: Build imgui lib
+        run: setup.bat
+        shell: cmd
+
+      - name: Build
+        run: build.bat
+        shell: cmd
+
+      - name: Test
+        run: test.bat
+        shell: cmd

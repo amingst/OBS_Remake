@@ -2,6 +2,7 @@
 package audio
 
 import "core:testing"
+import "core:time"
 
 // A Stream with nothing but a ring -- mix_block only touches inp.stream.ring,
 // so no COM objects or threads are needed to exercise the arithmetic.
@@ -95,6 +96,12 @@ mix_skips_empty_source :: proc(t: ^testing.T) {
     ready := fake_stream(65536); defer destroy_fake(ready)
     empty := fake_stream(65536); defer destroy_fake(empty)
     fill(ready, 0.25, BLOCK)
+
+    // mix_block only mixes without a starved input once it's been short for
+    // >100ms (the starvation escape in mixer.odin) -- back-date empty's
+    // starved_since so this call lands past that grace period, same as a
+    // real caller would see after a few frames of silence from `empty`.
+    empty.starved_since = time.time_add(time.now(), -150 * time.Millisecond)
 
     inputs := []Mix_Input{
         {stream = ready, volume = 1.0},

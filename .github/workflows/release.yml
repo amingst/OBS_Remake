@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: nightly
+
+      - name: Install premake5
+        run: choco install premake5 -y
+
+      - name: Build imgui lib
+        run: setup.bat
+        shell: cmd
+
+      - name: Build release binary
+        run: build-release.bat
+        shell: cmd
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Compress-Archive -Path build/OBS_Remake.exe -DestinationPath "dist/OBS_Remake-${{ github.ref_name }}-win64.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          prerelease: true
+          generate_release_notes: true

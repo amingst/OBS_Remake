@@ -1,8 +1,8 @@
 package obs_remake
 
-// @(require) keeps these imports legal under -vet in non-debug builds, where the
-// `when ODIN_DEBUG` block below compiles away and nothing references them.
-@(require) import "core:fmt"
+// @(require) keeps core:mem legal under -vet in non-debug builds, where the
+// `when ODIN_DEBUG` block below compiles away and nothing references it.
+import "core:fmt"
 import "core:log"
 @(require) import "core:mem"
 import win32 "core:sys/windows"
@@ -135,7 +135,8 @@ main :: proc() {
 		win32.MonitorFromPoint(win32.POINT{0, 0}, .MONITOR_DEFAULTTOPRIMARY))
 
     win: platform.Window
-    if (!platform.create_window(&win, "OBS Remake", 1280, 800)) {
+    window_title := fmt.tprintf("OBS Remake %s", APP_VERSION)
+    if (!platform.create_window(&win, window_title, 1280, 800)) {
         log.fatal("window/device creation failed, exiting")
         return
     }
