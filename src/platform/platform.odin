@@ -81,14 +81,6 @@ pump_messages :: proc(win: ^Window) -> (should_quit: bool) {
     return
 }
 
-begin_frame :: proc(win: ^Window, clear: [4]f32) {
-
-}
-
-present :: proc(win: ^Window) {
-
-}
-
 // ID3D11Multithread — not in vendor bindings; hand-written from d3d11_4.h
 ID3D11Multithread_VTable :: struct {
 	// IUnknown

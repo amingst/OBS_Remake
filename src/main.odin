@@ -15,11 +15,9 @@ import mf      "libs:mf"
 import "libs:wic"
 import "libs:wgc"
 import time "core:time"
-import "core:os"
-import "core:strings"
-import "core:path/filepath"
 
 // Import from platform module
+import "app"
 import "config"
 import "settings"
 import "platform"
@@ -34,15 +32,6 @@ import "mp4"
 import "applog"
 
 import "core:sys/windows"
-
-Output_State :: struct {
-	recording:		bool,
-	streaming:		bool,
-	rtmp_stream:	^rtmp.Rtmp_Stream,
-	mp4_sink:		^mp4.Mp4_Sink,
-	finalizing_sink:	^mp4.Mp4_Sink,
-	enc:			^encode.Encoder,
-}
 
 // The D3D11 debug layer (.DEBUG create flag, enabled under ODIN_DEBUG in
 // platform.odin) has been on since the device was created, but nothing ever
@@ -130,118 +119,14 @@ main :: proc() {
 	paths, _ := config.resolve_paths()
 	defer config.destroy_paths(&paths)
 
-	// One log file per run, named with the start timestamp, under the same
-	// config root as everything else in Paths. Not fatal if it can't be
-	// opened (no root, or the open itself fails) -- the app already has the
-	// ring buffer and console, so it just says so once and moves on.
-	if paths.root != "" {
-		year, month, day := time.date(time.now())
-		hour, min, sec := time.clock(time.now())
-		log_file_name := fmt.tprintf("log-%4d-%02d-%02d_%02d-%02d-%02d.txt",
-			year, int(month), day, hour, min, sec)
-		if log_path, jerr := filepath.join({paths.root, log_file_name}, context.temp_allocator); jerr == nil {
-			if !applog.sink_open_file(log_sink, log_path) {
-				fmt.eprintfln("applog: could not open log file %v -- continuing with ring buffer and console only", log_path)
-			}
-		}
-	}
+	app.open_log_file(log_sink, &paths)
 
-	// app.json: which profile is active. Loaded before any profile is, since
-	// deciding which profile to load depends on it. A missing or unreadable
-	// file just means a zero-valued config -- non-fatal, same contract as
-	// resolve_paths above.
-	app_cfg: config.App_Config
+	// app.json, the one-shot legacy-settings migration, and the active
+	// profile selection (load-active / pick-first-by-name / create-Default)
+	// all live in the app package now -- see app/bootstrap.odin.
+	app_cfg, cfg, profile_infos := app.load_app_config_and_profile(&paths)
 	defer config.destroy_app_config(&app_cfg)
-	if paths.app_config != "" {
-		config.load_app_config(&app_cfg, paths.app_config)
-	}
-
-	// One-shot migration of the pre-profile settings file (root/settings.json)
-	// into profiles/<id>.json. If it fires, the migrated profile becomes the
-	// active one.
-	if migrated_id, migrated := migrate_legacy_settings(&paths); migrated {
-		delete(app_cfg.active_profile_id)
-		app_cfg.active_profile_id = migrated_id
-	}
-
-	// Profile owns two heap strings (id, name), so unlike the old plain-data
-	// Settings it needs a matching destroy. Whichever branch below ends up
-	// filling cfg, destroy_profile is called exactly once on whatever it
-	// replaces first, so nothing leaks.
-	cfg := settings.create_default()
 	defer settings.destroy_profile(&cfg)
-	selected := false
-
-	if paths.profiles != "" {
-		infos := settings.enumerate(paths.profiles)
-		defer settings.destroy_infos(infos)
-
-		if app_cfg.active_profile_id != "" {
-			found := false
-			for info in infos {
-				if info.id == app_cfg.active_profile_id {
-					found = true
-					break
-				}
-			}
-			if found {
-				if loaded, ok := settings.load_by_id(paths.profiles, app_cfg.active_profile_id); ok {
-					settings.destroy_profile(&cfg)
-					cfg = loaded
-					selected = true
-				}
-			} else {
-				// Deleted outside the app. Fall through to the deterministic
-				// pick below rather than treating this as fatal.
-				log.warnf("active profile %v not found among %v profile(s) in %v; picking another",
-					app_cfg.active_profile_id, len(infos), paths.profiles)
-			}
-		}
-
-		if !selected && len(infos) > 0 {
-			// First by name, not directory order, so the pick is stable
-			// across runs. Tie-break on id in case two profiles share a name.
-			best := 0
-			for info, i in infos {
-				if info.name < infos[best].name ||
-				   (info.name == infos[best].name && info.id < infos[best].id) {
-					best = i
-				}
-			}
-			if loaded, ok := settings.load_by_id(paths.profiles, infos[best].id); ok {
-				settings.destroy_profile(&cfg)
-				cfg = loaded
-				selected = true
-			}
-		}
-
-		if !selected {
-			if created, ok := settings.create(paths.profiles, "Default"); ok {
-				settings.destroy_profile(&cfg)
-				cfg = created
-				selected = true
-			}
-		}
-	}
-
-	// Whichever profile ended up active, keep app.json in sync with it.
-	if selected && paths.app_config != "" && app_cfg.active_profile_id != cfg.id {
-		delete(app_cfg.active_profile_id)
-		app_cfg.active_profile_id = strings.clone(cfg.id)
-		config.save_app_config(&app_cfg, paths.app_config)
-	}
-
-	log.infof("profile %v (%v) active (canvas %vx%v)",
-		cfg.name, cfg.id, cfg.video.canvas_width, cfg.video.canvas_height)
-
-	// The Profile menu's list. A directory scan plus one parse per profile
-	// isn't something to redo every frame, so it's cached here and only
-	// refreshed after a create/rename/delete goes through below -- a profile
-	// added, renamed, or removed outside the app isn't noticed until then.
-	profile_infos: []settings.Profile_Info
-	if paths.profiles != "" {
-		profile_infos = settings.enumerate(paths.profiles)
-	}
 	defer settings.destroy_infos(profile_infos)
 
 	// Make process DPI aware and obtain main monitor scale
@@ -451,11 +336,9 @@ main :: proc() {
 	defer mf.MFShutdown()
 
 	// Mixer state — allocated once, freed at exit.
-	CHANNELS :: 2
-	mix_buf := make([]f32, audio.BLOCK_SAMPLES * CHANNELS)
-	defer delete(mix_buf)
-	blocks_emitted: u64
-	mixer_started := false
+	mixer: audio.Mixer
+	audio.mixer_state_init(&mixer)
+	defer audio.mixer_state_destroy(&mixer)
 
 	// Per-second audio instrumentation — diffs against previous snapshot.
 	audio_diag_last_tick := time.tick_now()
@@ -490,74 +373,9 @@ main :: proc() {
 	defer wgc.wgc_shutdown()
 
 	// The active scene collection. Same load-active/pick-first/create-Default
-	// shape as the profile selection above; unlike profiles there's no
-	// migration branch, since collections have never been persisted before.
-	doc := scene.create_default()
+	// shape as the profile selection above -- see app/bootstrap.odin.
+	doc, collection_infos := app.load_scene_collection(&paths, &app_cfg)
 	defer scene.destroy_all(&doc)
-	collection_selected := false
-
-	if paths.collections != "" {
-		infos := scene.enumerate(paths.collections)
-		defer scene.destroy_infos(infos)
-
-		if app_cfg.active_collection_id != "" {
-			found := false
-			for info in infos {
-				if info.id == app_cfg.active_collection_id {
-					found = true
-					break
-				}
-			}
-			if found {
-				if loaded, ok := scene.load_by_id(paths.collections, app_cfg.active_collection_id); ok {
-					scene.destroy_all(&doc)
-					doc = loaded
-					collection_selected = true
-				}
-			} else {
-				log.warnf("active scene collection %v not found among %v collection(s) in %v; picking another",
-					app_cfg.active_collection_id, len(infos), paths.collections)
-			}
-		}
-
-		if !collection_selected && len(infos) > 0 {
-			best := 0
-			for info, i in infos {
-				if info.name < infos[best].name ||
-				   (info.name == infos[best].name && info.id < infos[best].id) {
-					best = i
-				}
-			}
-			if loaded, ok := scene.load_by_id(paths.collections, infos[best].id); ok {
-				scene.destroy_all(&doc)
-				doc = loaded
-				collection_selected = true
-			}
-		}
-
-		if !collection_selected {
-			if created, ok := scene.create(paths.collections, "Default"); ok {
-				scene.destroy_all(&doc)
-				doc = created
-				collection_selected = true
-			}
-		}
-	}
-
-	if collection_selected && paths.app_config != "" && app_cfg.active_collection_id != doc.id {
-		delete(app_cfg.active_collection_id)
-		app_cfg.active_collection_id = strings.clone(doc.id)
-		config.save_app_config(&app_cfg, paths.app_config)
-	}
-
-	log.infof("scene collection %v (%v) active (%v scene(s))", doc.name, doc.id, len(doc.scenes))
-
-	// The Scene Collection menu's list, cached and refreshed the same way as
-	// profile_infos above.
-	collection_infos: []scene.Collection_Info
-	if paths.collections != "" {
-		collection_infos = scene.enumerate(paths.collections)
-	}
 	defer scene.destroy_infos(collection_infos)
 
     ui_state := ui.init_state(&doc)
@@ -567,7 +385,7 @@ main :: proc() {
     done := false
 	was_occluded := false
 
-	output: Output_State
+	output: app.Output_State
 
 	frame_bytes := make([]u8, int(preview_target.width) * int(preview_target.height) * 4)
 
@@ -647,7 +465,7 @@ main :: proc() {
 		// touches on ui_state.profiles (switch_to / pending_name), and clears
 		// the request whether or not it succeeded.
 		if req := ui_state.profiles.request; req != .None {
-			handle_profile_request(req, &ui_state.profiles, &cfg, &app_cfg, &paths, &profile_infos)
+			app.handle_profile_request(req, &ui_state.profiles, &cfg, &app_cfg, &paths, &profile_infos)
 		}
 
 		// Service a pending scene collection request. This has to happen here
@@ -657,7 +475,7 @@ main :: proc() {
 		// quads-building block below touches doc's sources -- the same "not
 		// mid-frame" requirement that puts the profile switch here too.
 		if req := ui_state.collections.request; req != .None {
-			handle_collection_request(req, &ui_state.collections, &ui_state.scenes, &ui_state.sources,
+			app.handle_collection_request(req, &ui_state.collections, &ui_state.scenes, &ui_state.sources,
 				&doc, &app_cfg, &paths, &collection_infos)
 		}
 
@@ -666,16 +484,16 @@ main :: proc() {
 		// output starting and the first pushed frame would hand the encoder
 		// a resolution that doesn't match what it was configured with.
 		if req := ui_state.controls.request; req != .None {
-			// blocks_emitted feeds the audio PTS timeline. Video PTS is now
-			// computed on the encoder thread from its tick_index, so only the
-			// audio counter needs to track the encoder's lifetime here.
-			pre_blocks := blocks_emitted
-			handle_controls_request(req, &ui_state.controls, &output,
+			// mixer.blocks_emitted feeds the audio PTS timeline. Video PTS is
+			// now computed on the encoder thread from its tick_index, so only
+			// the audio counter needs to track the encoder's lifetime here.
+			pre_blocks := mixer.blocks_emitted
+			app.handle_controls_request(req, &ui_state.controls, &output,
 				&paths, &preview_target, cfg.video.fps, cfg.stream, log_sink,
-				&blocks_emitted)
+				&mixer.blocks_emitted)
 			// ensure_encoder resets blocks_emitted to 0; reset the diag
 			// snapshots so the unsigned delta doesn't wrap.
-			if blocks_emitted < pre_blocks {
+			if mixer.blocks_emitted < pre_blocks {
 				audio_diag_last_blocks = 0
 				audio_diag_last_aac_recv = 0
 				audio_diag_last_ps_attempted = 0
@@ -691,12 +509,12 @@ main :: proc() {
 			mp4.mp4_sink_reap(output.mp4_sink)
 			output.mp4_sink = nil
 			output.recording = false
-			maybe_release_encoder(&output)
+			app.maybe_release_encoder(&output)
 		}
 		if output.finalizing_sink != nil && mp4.mp4_sink_is_stopped(output.finalizing_sink) {
 			mp4.mp4_sink_reap(output.finalizing_sink)
 			output.finalizing_sink = nil
-			maybe_release_encoder(&output)
+			app.maybe_release_encoder(&output)
 			log.info("recording finalized")
 		}
 
@@ -714,264 +532,16 @@ main :: proc() {
 		// starts. Render targets are global context state, and the code below
 		// rebinds the swap chain's RTV before RenderDrawData -- so doing this
 		// first means our binding here is harmlessly replaced rather than
-		// clobbering ImGui's.quads := make([dynamic]render.Quad, context.temp_allocator)
+		// clobbering ImGui's. service_sources lazily (re)acquires each
+		// visible source's underlying capture and appends a quad / mix input
+		// for it -- see scene/scene_service.odin.
 		quads := make([dynamic]render.Quad, context.temp_allocator)
 		inputs := make([dynamic]audio.Mix_Input, context.temp_allocator)
-		if sel := scene.find(&doc, ui_state.scenes.selected_id); sel != nil {
-			for &src in sel.sources {
-				if !src.visible do continue
-				switch &d in src.data {
-					case scene.Audio_Data:
-						if d.stream == nil && d.device_id != "" && time.now()._nsec >= d.next_retry._nsec {
-							if s := audio.acquire_stream(d.device_id, d.is_loopback); s != nil {
-								d.stream = s
-								if s.sample_rate != 48000 {
-									log.warnf("audio stream %v reports %v Hz, expected 48000 — recording may be pitch-shifted", d.device_id, s.sample_rate)
-								}
-							} else {
-								d.next_retry = time.time_add(time.now(),2 * time.Second)
-							}
-						}
-						if d.stream != nil {
-							append(&inputs, audio.Mix_Input{
-								stream = d.stream,
-								volume = d.volume,
-								muted  = d.muted,
-							})
-						}
-					case scene.Color_Data:
-						append(&quads, render.Quad{
-							x = src.x, y = src.y, w = src.w, h = src.h,
-							color = src.color,
-						})
-					case scene.Image_Data:
-						if d.texture == nil && !d.lost {
-							tex, srv, w, h, img_ok := capture.load_image(win.device, d.path)
-							if img_ok {
-								d.texture = tex
-								d.srv = srv
-								d.width = w
-								d.height = h
-								log.infof("image loaded: %v (%vx%v)", d.path, w, h)
-							} else {
-								d.lost = true
-								log.errorf("image decode failed, will not retry: %v", d.path)
-							}
-						}
-						if d.srv != nil {
-							append(&quads, render.Quad{
-								x = src.x, y = src.y, w = src.w, h = src.h,
-								color = {1, 1, 1, 1},
-								texture = d.srv,
-							})
-						}
-					case scene.Display_Data:
-						if d.dupl == nil && time.now()._nsec >= d.next_retry._nsec {
-							if dupl, ok := capture.start_duplication(win.device, u32(d.adapter_index), u32(d.output_index)); ok {
-								d.dupl = dupl
-							} else {
-								d.next_retry = time.time_add(time.now(), 2 * time.Second)
-							}
-						}
-
-						if d.dupl != nil {
-							desc: dxgi.OUTDUPL_DESC
-							d.dupl->GetDesc(&desc)
-
-							// The producer can restart at a different
-							// resolution than the texture it left behind
-							// (ACCESS_LOST only releases d.dupl, not
-							// d.texture/d.srv -- correct, that's what keeps
-							// the last frame drawing through the outage).
-							// Recreate on mismatch instead of reusing the old
-							// texture at its old size forever.
-							if d.texture != nil {
-								tex_desc: d3d11.TEXTURE2D_DESC
-								d.texture->GetDesc(&tex_desc)
-								if tex_desc.Width != desc.ModeDesc.Width || tex_desc.Height != desc.ModeDesc.Height {
-									log.infof("display source: output %v/%v resized %vx%v -> %vx%v, recreating texture",
-										d.adapter_index, d.output_index, tex_desc.Width, tex_desc.Height,
-										desc.ModeDesc.Width, desc.ModeDesc.Height)
-									if d.srv != nil     { d.srv->Release();     d.srv = nil }
-									if d.texture != nil { d.texture->Release(); d.texture = nil }
-								}
-							}
-
-							if d.texture == nil {
-								tex, srv, ok := capture.create_capture_texture(
-									win.device, desc.ModeDesc.Width, desc.ModeDesc.Height)
-								if ok {
-									d.texture = tex
-									d.srv = srv
-								}
-							}
-						}
-						if d.dupl != nil && d.texture != nil {
-							ok, lost, got_frame := capture.acquire_frame(win.device_context, d.dupl, d.texture)
-							if lost {
-								log.warn("duplication access lost, will restart")
-								capture.stop_duplication(d.dupl)
-								d.dupl = nil
-								d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
-							}
-							_ = ok
-
-							// Stall tracking: detect when the desktop stops
-							// producing new frames (e.g. display sleep) and log
-							// the transition. A static desktop is normal — the
-							// app correctly re-encodes the last frame — but the
-							// log should say so, since a frozen recording is
-							// otherwise indistinguishable from a bug.
-							STALL_THRESHOLD :: 5 * time.Second
-							now := time.now()
-							if got_frame {
-								if d.stalled {
-									elapsed := time.diff(d.last_frame_time, now)
-									log.infof("display capture resumed after %v with no new desktop frames (adapter %v output %v)",
-										elapsed, d.adapter_index, d.output_index)
-								}
-								d.last_frame_time = now
-								d.stalled = false
-							} else if d.last_frame_time._nsec != 0 && !d.stalled {
-								if time.diff(d.last_frame_time, now) > STALL_THRESHOLD {
-									log.infof("display capture: no new desktop frames for >5s — desktop is likely static or display is asleep (adapter %v output %v); encoding last frame",
-										d.adapter_index, d.output_index)
-									d.stalled = true
-								}
-							}
-						}
-
-						append(&quads, render.Quad{
-							x = src.x, y = src.y, w = src.w, h = src.h,
-							color = {1, 1, 1, 1},
-							texture = d.srv,
-						})
-					case scene.Window_Data:
-						if d.capture != nil && capture.window_capture_lost(d.capture) && !d.lost {
-							log.warnf("window source: %q lost", d.title)
-							d.lost = true
-							d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
-						}
-						if (d.capture == nil || d.lost) && time.now()._nsec >= d.next_retry._nsec {
-							hwnd, resolved := capture.resolve_window(d.title, d.class_name, d.exe_name)
-							if !resolved {
-								if !d.lost {
-									log.warnf("window source: window %q not found", d.title)
-									d.lost = true
-								} else {
-									log.debugf("window source: retry: %q still not found", d.title)
-								}
-								d.next_retry = time.time_add(time.now(), 2 * time.Second)
-							} else {
-								if wc, wc_ok := capture.start_window_capture(win.device, win.device_context, hwnd, log_sink); wc_ok {
-									// Apply the source's stored toggles before
-									// this capture is used for anything --
-									// see item 6: a source recovering from
-									// loss must come back with them intact,
-									// which is why they live on Window_Data
-									// and not only on the session. game_capture
-									// forces cursor capture off regardless of
-									// hide_cursor; it does not overwrite the
-									// user's separate hide_cursor preference.
-									capture.window_capture_set_cursor_capture(wc, !d.hide_cursor && !d.game_capture)
-									capture.window_capture_set_border_required(wc, !d.hide_border)
-
-									// Swap in the new capture and only then
-									// release the old one -- its srv is what
-									// may have been drawn this frame already
-									// (or will be, below, using d.capture
-									// which is now the new one) and must
-									// never be released while a quad this
-									// frame could still reference it.
-									old := d.capture
-									d.capture = wc
-									if old != nil {
-										capture.stop_window_capture(old)
-									}
-									if d.lost {
-										log.infof("window source: %q recovered (%vx%v)", d.title, wc.width, wc.height)
-									} else {
-										log.infof("window source: capture started for %q (%vx%v)", d.title, wc.width, wc.height)
-									}
-									d.lost = false
-								} else {
-									if !d.lost {
-										log.errorf("window source: start_window_capture failed for %q", d.title)
-										d.lost = true
-									} else {
-										log.debugf("window source: retry: start_window_capture failed again for %q", d.title)
-									}
-									d.next_retry = time.time_add(time.now(), 2 * time.Second)
-								}
-							}
-						}
-						if d.capture != nil && !d.lost {
-							if !capture.window_capture_service_resize(d.capture, win.device) {
-								log.errorf("window source: %q resize failed, treating as lost", d.title)
-								capture.stop_window_capture(d.capture)
-								d.capture = nil
-								d.lost = true
-								d.next_retry = time.time_add(time.now(), 500 * time.Millisecond)
-							}
-						}
-
-
-						if d.capture != nil && d.capture.srv != nil {
-							append(&quads, render.Quad{
-								x = src.x, y = src.y, w = src.w, h = src.h,
-								color = {1, 1, 1, 1},
-								texture = d.capture.srv,
-							})
-						}
-					case scene.Camera_Data:
-						// Lazy start: first visible frame with a device set spawns the reader.
-						if d.cam == nil && d.symlink != "" {
-							wide := windows.utf8_to_utf16(d.symlink, context.temp_allocator)
-							d.cam = capture.camera_start(wide, log_sink, capture.next_camera_tag_index(src.id))
-						}
-						// Per-frame upload: pull the latest CPU frame onto the dynamic texture.
-						if d.cam != nil {
-							capture.camera_upload(d.cam, win.device, &d.texture, &d.srv, &d.width, &d.height)
-						}
-						if d.srv != nil {
-							append(&quads, render.Quad{
-								x = src.x, y = src.y, w = src.w, h = src.h,
-								color = {1, 1, 1, 1},
-								texture = d.srv,
-							})
-						}
-					}
-
-			}
-		}
+		scene.service_sources(&doc, ui_state.scenes.selected_id, win.device, win.device_context, log_sink, &quads, &inputs)
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 
 		// -- Audio mixer --------------------------------------------------
-		// Reset the startup gate when all audio sources disappear so that a
-		// newly added source after a gap starts buffered.
-		if len(inputs) == 0 {
-			mixer_started = false
-		}
-
-		if !mixer_started && audio.mixer_ready(inputs[:], CHANNELS) {
-			mixer_started = true
-			log.debug("mixer_started -> true")
-		}
-
-		if mixer_started {
-			for audio.mix_block(inputs[:], mix_buf, CHANNELS) {
-				pts_100ns := i64(blocks_emitted) * audio.BLOCK_SAMPLES * 10_000_000 / 48000
-				pcm_buf := f32_to_pcm16(mix_buf)
-
-				if output.enc != nil {
-					if encode.audio_queue_put(output.enc.pcm_queue, pcm_buf, pts_100ns) {
-						win32.SetEvent(output.enc.audio_event)
-					}
-				}
-
-				blocks_emitted += 1
-			}
-		}
+		audio.mix_and_push(&mixer, inputs[:], output.enc)
 
 		// Per-second audio instrumentation.
 		if time.duration_seconds(time.tick_since(audio_diag_last_tick)) >= 1.0 {
@@ -989,7 +559,7 @@ main :: proc() {
 				audio_diag_last_ps_attempted = 0
 				audio_diag_last_ps_dropped = 0
 			}
-			d_blocks := blocks_emitted - audio_diag_last_blocks
+			d_blocks := mixer.blocks_emitted - audio_diag_last_blocks
 			d_aac := aac_recv - audio_diag_last_aac_recv
 			d_attempts := ps_attempted - audio_diag_last_ps_attempted
 			d_drops := ps_dropped - audio_diag_last_ps_dropped
@@ -997,7 +567,7 @@ main :: proc() {
 				log.infof("audio/sec: mixed_blocks=%v aac_to_sink=%v ps_attempts=%v ps_drops=%v",
 					d_blocks, d_aac, d_attempts, d_drops)
 			}
-			audio_diag_last_blocks = blocks_emitted
+			audio_diag_last_blocks = mixer.blocks_emitted
 			audio_diag_last_aac_recv = aac_recv
 			audio_diag_last_ps_attempted = ps_attempted
 			audio_diag_last_ps_dropped = ps_dropped
@@ -1155,564 +725,4 @@ main :: proc() {
 	if paths.collections != "" {
 		scene.save_collection(&doc, paths.collections)
 	}
-}
-
-// One-shot migration of the pre-profile settings file (root/settings.json)
-// into profiles/<id>.json. A successful migration is detected by the *new*
-// file existing, not by the old one being gone -- so a run that migrates but
-// fails to delete settings.json does not fabricate a second profile from the
-// same content on the next launch. Safe to delete this proc, its call site in
-// main, and Paths.settings once existing installs have all been through it --
-// say, mid-2027.
-@(private = "file")
-migrate_legacy_settings :: proc(paths: ^config.Paths) -> (id: string, migrated: bool) {
-	if paths.settings == "" || paths.profiles == "" do return
-	if !os.exists(paths.settings) do return
-
-	legacy := settings.create_default()
-	defer settings.destroy_profile(&legacy)
-	if !settings.load(&legacy, paths.settings) {
-		log.warnf("legacy settings %v did not load cleanly; leaving it in place for inspection", paths.settings)
-		return
-	}
-
-	if existing, already := settings.load_by_id(paths.profiles, legacy.id); already {
-		settings.destroy_profile(&existing)
-		return
-	}
-
-	if !settings.save_profile(&legacy, paths.profiles) {
-		log.warnf("could not migrate legacy settings %v into %v; will retry next launch", paths.settings, paths.profiles)
-		return
-	}
-
-	if rerr := os.remove(paths.settings); rerr != nil {
-		log.warnf("migrated %v but could not delete it: %v", paths.settings, rerr)
-	}
-
-	log.infof("migrated legacy settings %v -> %v/%v.json", paths.settings, paths.profiles, legacy.id)
-	return strings.clone(legacy.id), true
-}
-
-// Dispatches a Profile menu request raised by ui. Always clears the request
-// and whatever owned strings ui attached to it (switch_to / pending_name),
-// whether or not the action actually went through -- a request is
-// one-shot regardless of outcome.
-@(private = "file")
-handle_profile_request :: proc(
-	req:    ui.Profile_Request,
-	state:  ^ui.Profile_State,
-	cfg:    ^settings.Profile,
-	app_cfg: ^config.App_Config,
-	paths:  ^config.Paths,
-	infos:  ^[]settings.Profile_Info,
-) {
-	state.request = .None
-
-	#partial switch req {
-	case .Switch:
-		id := state.switch_to
-		defer { delete(id); state.switch_to = "" }
-		switch_profile(id, cfg, app_cfg, paths)
-
-	case .New:
-		name := state.pending_name
-		defer { delete(name); state.pending_name = "" }
-		if paths.profiles == "" {
-			log.warn("new profile requested, but no config path is available")
-			return
-		}
-		if created, ok := settings.create(paths.profiles, name); ok {
-			// Belt-and-braces, as with Switch: don't lose unsaved edits to
-			// the profile being left behind.
-			settings.save_profile(cfg, paths.profiles)
-			settings.destroy_profile(cfg)
-			cfg^ = created
-			set_active_profile(app_cfg, paths, cfg.id)
-			refresh_profile_infos(infos, paths)
-			log.infof("created and switched to profile %v (%v)", cfg.name, cfg.id)
-		} else {
-			log.warnf("could not create profile %q", name)
-		}
-
-	case .Rename:
-		name := state.pending_name
-		defer { delete(name); state.pending_name = "" }
-		delete(cfg.name)
-		cfg.name = strings.clone(name)
-		if paths.profiles != "" {
-			settings.save_profile(cfg, paths.profiles)
-			refresh_profile_infos(infos, paths)
-		}
-
-	case .Delete:
-		delete_active_profile(cfg, app_cfg, paths, infos, state)
-	}
-}
-
-// Release encoder when the last output stops.  A finalizing sink still
-// has its consumer registered (the feeder thread is still running), so
-// the encoder must stay alive until the sink is reaped.
-@(private = "file")
-maybe_release_encoder :: proc(output: ^Output_State) {
-	if output.recording || output.streaming || output.finalizing_sink != nil do return
-	encode.encoder_release()
-	output.enc = nil
-}
-
-// Dispatches a Controls panel request raised by ui. Same one-shot contract as
-// handle_profile_request: the request is always cleared, whether or not the
-// action actually went through. Starting while already recording, or
-// stopping while not, is a no-op rather than a double call into encode.
-//
-// Encoder lifecycle: the first output start acquires the encoder; the last
-// output stop releases it. The encoder's internal refcount is at most 1 from
-// main's perspective (the second output reuses output.enc without a second
-// acquire). Video PTS is now computed on the encoder thread from a timer tick
-// count; only the audio block counter (blocks_emitted) is reset here.
-@(private = "file")
-handle_controls_request :: proc(
-	req:               ui.Controls_Request,
-	state:             ^ui.Controls_State,
-	output:            ^Output_State,
-	paths:             ^config.Paths,
-	target:            ^render.Target,
-	fps:               i32,
-	stream_cfg:        settings.Stream_Settings,
-	log_sink:          ^applog.Sink,
-	blocks_emitted:    ^u64,
-) {
-	state.request = .None
-
-	// Shared helper: acquire encoder on the first output start. Returns false
-	// if the acquire fails, in which case the caller should bail.
-	ensure_encoder :: proc(
-		output: ^Output_State, target: ^render.Target, fps: i32,
-		stream_cfg: settings.Stream_Settings, log_sink: ^applog.Sink,
-		blocks_emitted: ^u64,
-	) -> bool {
-		if output.enc != nil do return true
-		if fps <= 0 {
-			log.errorf("ensure_encoder: fps is %v, cannot compute frame_duration", fps)
-			return false
-		}
-		encoder_cfg := encode.Encoder_Config{
-			width              = target.width,
-			height             = target.height,
-			fps                = u32(fps),
-			bitrate            = u32(stream_cfg.bitrate),
-			audio_sample_rate  = 48000,
-			audio_channels     = 2,
-			audio_bitrate      = 16000,
-			frame_duration     = i64(10_000_000) / i64(fps),
-			log_sink           = log_sink,
-		}
-		enc, enc_ok := encode.encoder_acquire(encoder_cfg)
-		if !enc_ok do return false
-		output.enc = enc
-		blocks_emitted^ = 0
-		return true
-	}
-
-	#partial switch req {
-	case .Start_Recording:
-		if output.recording do return
-		if output.finalizing_sink != nil {
-			log.warn("recording requested while previous recording is still finalizing")
-			return
-		}
-		if paths.videos == "" {
-			log.warn("recording requested, but no videos directory is available")
-			return
-		}
-
-		if !ensure_encoder(output, target, fps, stream_cfg, log_sink,
-			blocks_emitted) {
-			log.warn("recording requested, but encoder_acquire failed")
-			return
-		}
-
-		year, month, day := time.date(time.now())
-		hour, min, sec := time.clock(time.now())
-		filename := fmt.aprintf("recording_%4d-%02d-%02d_%02d-%02d-%02d.mp4",
-			year, int(month), day, hour, min, sec)
-		defer delete(filename)
-
-		out_path, jerr := filepath.join({paths.videos, filename})
-		if jerr != nil {
-			log.warnf("could not build recording output path: %v", jerr)
-			maybe_release_encoder(output)
-			return
-		}
-		// mp4_sink_start (via mf.begin_mp4_sink -> MFCreateFile) converts this
-		// to a wide string synchronously and doesn't retain the Odin string,
-		// so it's safe to free right after the call returns.
-		defer delete(out_path)
-
-		sink, sink_ok := mp4.mp4_sink_start(output.enc, out_path)
-		if sink_ok {
-			output.mp4_sink = sink
-			output.recording = true
-			log.infof("recording started (video+audio) -> %v", out_path)
-		} else {
-			log.warn("failed to start recording (cause logged above)")
-			maybe_release_encoder(output)
-		}
-
-	case .Stop_Recording:
-		if !output.recording do return
-		mp4.mp4_sink_signal_stop(output.mp4_sink)
-		output.finalizing_sink = output.mp4_sink
-		output.mp4_sink = nil
-		output.recording = false
-		log.info("recording stop signalled, finalizing")
-
-	case .Start_Streaming:
-		if output.streaming do return
-		if stream_cfg.host == "" || stream_cfg.stream_key == "" {
-			log.warn("streaming requested, but no stream destination is configured")
-			return
-		}
-
-		if !ensure_encoder(output, target, fps, stream_cfg, log_sink,
-			blocks_emitted) {
-			log.warn("streaming requested, but encoder_acquire failed")
-			return
-		}
-
-		STREAM_AUDIO_CHANNELS :: 2
-
-		// stream_index 0: a single stream is all this build supports today.
-		// A real id generator/registry belongs with fan-out, not here.
-		stream, stream_ok := rtmp.rtmp_stream_start(
-			output.enc, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
-			stream_cfg.stream_key, STREAM_AUDIO_CHANNELS,
-			log_sink, 0)
-		if stream_ok {
-			output.rtmp_stream = stream
-			output.streaming = true
-			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
-		} else {
-			log.warn("failed to start streaming (cause logged above)")
-			maybe_release_encoder(output)
-		}
-
-	case .Stop_Streaming:
-		if !output.streaming do return
-		rtmp.rtmp_stream_close(output.rtmp_stream)
-		output.rtmp_stream = nil
-		output.streaming = false
-		maybe_release_encoder(output)
-		log.info("streaming stopped")
-	}
-}
-
-@(private = "file")
-switch_profile :: proc(id: string, cfg: ^settings.Profile, app_cfg: ^config.App_Config, paths: ^config.Paths) {
-	if id == cfg.id do return
-	if paths.profiles == "" {
-		log.warn("profile switch requested, but no config path is available")
-		return
-	}
-
-	// Apply already persists, but a profile edited and not applied
-	// shouldn't silently lose changes just because the user switched away.
-	settings.save_profile(cfg, paths.profiles)
-
-	loaded, ok := settings.load_by_id(paths.profiles, id)
-	if !ok {
-		// Don't touch cfg -- a failed load must not leave it half-destroyed.
-		log.warnf("could not load profile %v; staying on %v", id, cfg.id)
-		return
-	}
-
-	settings.destroy_profile(cfg)
-	cfg^ = loaded
-	set_active_profile(app_cfg, paths, cfg.id)
-
-	log.infof("switched to profile %v (%v, canvas %vx%v)",
-		cfg.name, cfg.id, cfg.video.canvas_width, cfg.video.canvas_height)
-}
-
-@(private = "file")
-delete_active_profile :: proc(
-	cfg:     ^settings.Profile,
-	app_cfg: ^config.App_Config,
-	paths:   ^config.Paths,
-	infos:   ^[]settings.Profile_Info,
-	state:   ^ui.Profile_State,
-) {
-	if paths.profiles == "" {
-		log.warn("profile delete requested, but no config path is available")
-		return
-	}
-
-	survivor := pick_survivor(infos^, cfg.id)
-	if survivor == "" {
-		// registry.remove would refuse this too, but silently -- surface it.
-		state.denied = strings.clone("Can't delete the only remaining profile.")
-		return
-	}
-
-	loaded, ok := settings.load_by_id(paths.profiles, survivor)
-	if !ok {
-		log.warnf("could not switch away from %v to delete it; leaving it in place", cfg.id)
-		return
-	}
-
-	// The active profile has to move aside *before* its file is removed:
-	// deleting first would either leave cfg pointing at a file that no
-	// longer exists (and resurrect it on the next save) or require running
-	// with no valid profile at all, which nothing downstream is built to
-	// handle mid-frame.
-	prev_id := strings.clone(cfg.id)
-	defer delete(prev_id)
-
-	settings.destroy_profile(cfg)
-	cfg^ = loaded
-	set_active_profile(app_cfg, paths, cfg.id)
-
-	if !settings.remove(paths.profiles, prev_id) {
-		log.warnf("switched away from profile %v but could not delete its file", prev_id)
-	}
-
-	refresh_profile_infos(infos, paths)
-	log.infof("deleted profile %v, switched to %v (%v)", prev_id, cfg.name, cfg.id)
-}
-
-// First by name, not enumeration order, so repeated deletes behave
-// predictably; tie-broken by id in case two profiles share a name. Mirrors
-// the pick made at startup when no active profile is recorded.
-@(private = "file")
-pick_survivor :: proc(infos: []settings.Profile_Info, exclude_id: string) -> string {
-	best := -1
-	for info, i in infos {
-		if info.id == exclude_id do continue
-		if best < 0 ||
-		   info.name < infos[best].name ||
-		   (info.name == infos[best].name && info.id < infos[best].id) {
-			best = i
-		}
-	}
-	if best < 0 do return ""
-	return infos[best].id
-}
-
-@(private = "file")
-set_active_profile :: proc(app_cfg: ^config.App_Config, paths: ^config.Paths, id: string) {
-	if paths.app_config == "" || app_cfg.active_profile_id == id do return
-	delete(app_cfg.active_profile_id)
-	app_cfg.active_profile_id = strings.clone(id)
-	config.save_app_config(app_cfg, paths.app_config)
-}
-
-@(private = "file")
-refresh_profile_infos :: proc(infos: ^[]settings.Profile_Info, paths: ^config.Paths) {
-	settings.destroy_infos(infos^)
-	infos^ = paths.profiles != "" ? settings.enumerate(paths.profiles) : nil
-}
-
-// Dispatches a Scene Collection menu request raised by ui. Same one-shot
-// contract as handle_profile_request: the request and whatever owned strings
-// ui attached to it are always cleared, whether or not the action went
-// through.
-@(private = "file")
-handle_collection_request :: proc(
-	req:     ui.Collection_Request,
-	state:   ^ui.Collection_State,
-	scenes:  ^ui.Scenes_State,
-	sources: ^ui.Sources_State,
-	doc:     ^scene.Collection,
-	app_cfg: ^config.App_Config,
-	paths:   ^config.Paths,
-	infos:   ^[]scene.Collection_Info,
-) {
-	state.request = .None
-
-	#partial switch req {
-	case .Switch:
-		id := state.switch_to
-		defer { delete(id); state.switch_to = "" }
-		if switch_collection(id, doc, app_cfg, paths) {
-			reset_collection_selection(scenes, sources, doc)
-		}
-
-	case .New:
-		name := state.pending_name
-		defer { delete(name); state.pending_name = "" }
-		if paths.collections == "" {
-			log.warn("new scene collection requested, but no config path is available")
-			return
-		}
-		if created, ok := scene.create(paths.collections, name); ok {
-			// Belt-and-braces, as with profiles: don't lose unsaved edits to
-			// the collection being left behind.
-			scene.save_collection(doc, paths.collections)
-			scene.destroy_all(doc)
-			doc^ = created
-			set_active_collection(app_cfg, paths, doc.id)
-			refresh_collection_infos(infos, paths)
-			reset_collection_selection(scenes, sources, doc)
-			log.infof("created and switched to scene collection %v (%v)", doc.name, doc.id)
-		} else {
-			log.warnf("could not create scene collection %q", name)
-		}
-
-	case .Rename:
-		name := state.pending_name
-		defer { delete(name); state.pending_name = "" }
-		delete(doc.name)
-		doc.name = strings.clone(name)
-		if paths.collections != "" {
-			scene.save_collection(doc, paths.collections)
-			refresh_collection_infos(infos, paths)
-		}
-
-	case .Delete:
-		delete_active_collection(doc, app_cfg, paths, infos, state, scenes, sources)
-	}
-}
-
-// Scenes and sources have no Apply button -- edits are immediate -- so
-// saving on every mutation would mean a disk write on every frame of a
-// DragFloat drag. Switch and exit are the two natural save points instead,
-// same trade-off profiles make around their own Apply button: anything
-// since the last switch or exit is lost on a crash.
-@(private = "file")
-switch_collection :: proc(id: string, doc: ^scene.Collection, app_cfg: ^config.App_Config, paths: ^config.Paths) -> bool {
-	if id == doc.id do return false
-	if paths.collections == "" {
-		log.warn("scene collection switch requested, but no config path is available")
-		return false
-	}
-
-	scene.save_collection(doc, paths.collections)
-
-	loaded, ok := scene.load_by_id(paths.collections, id)
-	if !ok {
-		// Don't touch doc -- a failed load must not leave it half-destroyed.
-		log.warnf("could not load scene collection %v; staying on %v", id, doc.id)
-		return false
-	}
-
-	// destroy_all releases any active display-capture COM objects for the
-	// outgoing collection. This has to run here, at the same point in the
-	// loop as the profile switch, and not from inside ui.draw or a frame
-	// later: the quads-building block further down this same frame reads
-	// doc's sources and lazily (re)starts captures for whichever collection
-	// is current, so the swap must be complete before it runs.
-	scene.destroy_all(doc)
-	doc^ = loaded
-	set_active_collection(app_cfg, paths, doc.id)
-
-	log.infof("switched to scene collection %v (%v, %v scene(s))", doc.name, doc.id, len(doc.scenes))
-	return true
-}
-
-@(private = "file")
-delete_active_collection :: proc(
-	doc:     ^scene.Collection,
-	app_cfg: ^config.App_Config,
-	paths:   ^config.Paths,
-	infos:   ^[]scene.Collection_Info,
-	state:   ^ui.Collection_State,
-	scenes:  ^ui.Scenes_State,
-	sources: ^ui.Sources_State,
-) {
-	if paths.collections == "" {
-		log.warn("scene collection delete requested, but no config path is available")
-		return
-	}
-
-	survivor := pick_collection_survivor(infos^, doc.id)
-	if survivor == "" {
-		// registry.remove would refuse this too, but silently -- surface it.
-		state.denied = strings.clone("Can't delete the only remaining scene collection.")
-		return
-	}
-
-	loaded, ok := scene.load_by_id(paths.collections, survivor)
-	if !ok {
-		log.warnf("could not switch away from %v to delete it; leaving it in place", doc.id)
-		return
-	}
-
-	// Same ordering as delete_active_profile and for the same reason: doc
-	// has to move aside, releasing its COM objects, before its file is
-	// removed -- deleting first would leave doc pointing at a vanished file
-	// (which a later save would just recreate) with nothing downstream built
-	// to run a frame against no collection at all.
-	prev_id := strings.clone(doc.id)
-	defer delete(prev_id)
-
-	scene.destroy_all(doc)
-	doc^ = loaded
-	set_active_collection(app_cfg, paths, doc.id)
-	reset_collection_selection(scenes, sources, doc)
-
-	if !scene.remove(paths.collections, prev_id) {
-		log.warnf("switched away from scene collection %v but could not delete its file", prev_id)
-	}
-
-	refresh_collection_infos(infos, paths)
-	log.infof("deleted scene collection %v, switched to %v (%v)", prev_id, doc.name, doc.id)
-}
-
-// First by name, not enumeration order, tie-broken by id -- mirrors
-// pick_survivor for the same reasons.
-@(private = "file")
-pick_collection_survivor :: proc(infos: []scene.Collection_Info, exclude_id: string) -> string {
-	best := -1
-	for info, i in infos {
-		if info.id == exclude_id do continue
-		if best < 0 ||
-		   info.name < infos[best].name ||
-		   (info.name == infos[best].name && info.id < infos[best].id) {
-			best = i
-		}
-	}
-	if best < 0 do return ""
-	return infos[best].id
-}
-
-@(private = "file")
-set_active_collection :: proc(app_cfg: ^config.App_Config, paths: ^config.Paths, id: string) {
-	if paths.app_config == "" || app_cfg.active_collection_id == id do return
-	delete(app_cfg.active_collection_id)
-	app_cfg.active_collection_id = strings.clone(id)
-	config.save_app_config(app_cfg, paths.app_config)
-}
-
-@(private = "file")
-refresh_collection_infos :: proc(infos: ^[]scene.Collection_Info, paths: ^config.Paths) {
-	scene.destroy_infos(infos^)
-	infos^ = paths.collections != "" ? scene.enumerate(paths.collections) : nil
-}
-
-// selected_id on both scenes and sources refers to ids owned by whichever
-// collection was active before a switch/create/delete; the new collection
-// doesn't have those ids, so both must be repointed. Mirrors what
-// ui.init_state seeds on first load: the new collection's first scene, or
-// nothing if it's empty.
-@(private = "file")
-reset_collection_selection :: proc(scenes: ^ui.Scenes_State, sources: ^ui.Sources_State, doc: ^scene.Collection) {
-	sources.selected_id = 0
-	scenes.selected_id = 0
-	if len(doc.scenes) > 0 {
-		scenes.selected_id = doc.scenes[0].id
-	}
-}
-
-// Convert interleaved f32 samples (range [-1,1]) to interleaved 16-bit PCM
-// packed as a byte slice. Uses the temp allocator — freed at end of frame.
-@(private = "file")
-f32_to_pcm16 :: proc(src: []f32) -> []u8 {
-	out := make([]u8, len(src) * 2, context.temp_allocator)
-	for s, i in src {
-		clamped := clamp(s, -1, 1)
-		sample := i16(clamped * 32767)
-		out[i * 2 + 0] = u8(sample & 0xFF)
-		out[i * 2 + 1] = u8((sample >> 8) & 0xFF)
-	}
-	return out
 }
