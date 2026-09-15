@@ -164,9 +164,9 @@ main :: proc() {
 	// io.ConfigDockingAlwaysTabBar = true
 	// io.ConfigDockingTransparentPayload = true
 
-	// Setup Dear ImGui style
-	im.StyleColorsDark()
-	// im.StyleColorsLight()
+	// Setup Dear ImGui style and fonts (unscaled; DPI scaling is applied below)
+	ui.apply_theme()
+	ui.load_fonts()
 
 	// Setup scaling
 	style := im.GetStyle()
@@ -193,11 +193,6 @@ main :: proc() {
 	}
 	defer imdx11.Shutdown()
 	log.info("ImGui backends initialised")
-
-	// Fonts: none loaded explicitly, so ImGui uses its embedded default.
-	//style.FontSizeBase = 20.0
-	//io.Fonts->AddFontDefaultVector()
-	//io.Fonts->AddFontFromFileTTF("c:\\Windows\\Fonts\\segoeui.ttf")
 
 	outputs := capture.enumerate_outputs(win.device)
 	defer capture.destroy_outputs(outputs)
