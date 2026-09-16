@@ -25,11 +25,16 @@ Window :: struct {
 create_window :: proc(win: ^Window, title: string, w, h: i32) -> bool {
 	g_window = win
 	g_ctx = context // captured so wnd_proc inherits the caller's logger
+	hinstance := win32.HINSTANCE(win32.GetModuleHandleW(nil))
+	// Icon resource 1 is embedded by assets/icons/streamsmith.rc (see build.bat -resource).
+	icon := win32.LoadIconW(hinstance, cstring16(win32.MAKEINTRESOURCEW(1)))
 	wc := win32.WNDCLASSEXW{
 		cbSize        = size_of(win32.WNDCLASSEXW),
 		style         = win32.CS_HREDRAW | win32.CS_VREDRAW | win32.CS_OWNDC,
 		lpfnWndProc   = wnd_proc,
-		hInstance     = win32.HINSTANCE(win32.GetModuleHandleW(nil)),
+		hInstance     = hinstance,
+		hIcon         = icon,
+		hIconSm       = icon,
 		hCursor       = win32.LoadCursorW(nil, nil),
 		lpszClassName = win32.L("MyWindowClass"),
 	}

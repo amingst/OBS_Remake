@@ -7,4 +7,4 @@ if not exist "libs\odin-imgui\imgui_windows_x64.lib" (
 
 if not exist "build" mkdir build
 
-odin build src -out:build/StreamSmith.exe -collection:libs=libs -vet -vet-shadowing -o:speed
+odin build src -out:build/StreamSmith.exe -collection:libs=libs -vet -vet-shadowing -o:speed -resource:assets/icons/streamsmith.rc

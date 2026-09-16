@@ -1,0 +1,3 @@
+// Application icon, embedded into StreamSmith.exe via `odin build -resource:`.
+// Resource ID 1 is also loaded at runtime for the window class (see platform.odin).
+1 ICON "streamsmith.ico"
