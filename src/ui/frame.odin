@@ -4,8 +4,6 @@ import "core:fmt"
 import "core:time"
 import im "libs:odin-imgui"
 
-import "../scene"
-import "../settings"
 import "../show"
 
 // Fixed chrome around the dockspace: top bar, left sidebar, bottom status bar.
@@ -32,11 +30,7 @@ ui_scale :: proc() -> f32 {
 // Draws the chrome and shrinks the viewport work area to the remaining region.
 draw_chrome :: proc(
     state: ^State,
-    cfg: ^settings.Profile,
-    doc: ^scene.Collection,
     show_cfg: ^show.Show,
-    profiles: []settings.Profile_Info,
-    collections: []scene.Collection_Info,
     shows: []show.Show_Info,
 ) {
     track_output_times(&state.controls)
@@ -50,7 +44,7 @@ draw_chrome :: proc(
     side_w   := SIDEBAR_WIDTH * scale
     body_h   := size.y - top_h - status_h
 
-    draw_top_bar(state, cfg, doc, show_cfg, profiles, collections, shows, origin, {size.x, top_h})
+    draw_top_bar(state, show_cfg, shows, origin, {size.x, top_h})
     draw_sidebar(state, {origin.x, origin.y + top_h}, {side_w, body_h})
     draw_status_bar(state, {origin.x, origin.y + size.y - status_h}, {size.x, status_h})
 
@@ -62,11 +56,7 @@ draw_chrome :: proc(
 @(private="file")
 draw_top_bar :: proc(
     state: ^State,
-    cfg: ^settings.Profile,
-    doc: ^scene.Collection,
     show_cfg: ^show.Show,
-    profiles: []settings.Profile_Info,
-    collections: []scene.Collection_Info,
     shows: []show.Show_Info,
     pos, size: im.Vec2,
 ) {
@@ -85,7 +75,7 @@ draw_top_bar :: proc(
             im.PopFont()
 
             im.Dummy({16 * ui_scale(), 0})
-            draw_menus(state, cfg, doc, show_cfg, profiles, collections, shows)
+            draw_menus(state, show_cfg, shows)
 
             // Right-aligned: live/recording pill, then the settings button.
             gear := fmt.ctprintf("%s", ICON_GEAR)

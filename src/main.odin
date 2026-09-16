@@ -18,10 +18,8 @@ import time "core:time"
 // Import from platform module
 import "app"
 import "config"
-import "settings"
 import "platform"
 import "render"
-import "scene"
 import "show"
 import "ui"
 import "capture"
@@ -104,11 +102,16 @@ main :: proc() {
 
 	app.open_log_file(log_sink, &paths)
 
-	// app.json, legacy migration, and active profile selection -- see app/bootstrap.odin.
-	app_cfg, cfg, profile_infos := app.load_app_config_and_profile(&paths)
+	app_cfg := app.load_app_config(&paths)
 	defer config.destroy_app_config(&app_cfg)
-	defer settings.destroy_profile(&cfg)
-	defer settings.destroy_infos(profile_infos)
+
+	// Active show -- same load-active/pick-first/create-Default shape as the
+	// old profiles/collections had, but no migration from either (there isn't
+	// a legacy concept to migrate from anymore). Loaded early since the
+	// preview target below needs its canvas dimensions.
+	show_cfg, show_infos := app.load_show(&paths, &app_cfg)
+	defer show.destroy_show(&show_cfg)
+	defer show.destroy_infos(show_infos)
 
 	// Make process DPI aware and obtain main monitor scale
 	imwin32.EnableDpiAwareness()
@@ -124,17 +127,17 @@ main :: proc() {
     defer platform.destroy_window(&win)
     win.msg_hook = imwin32.WndProcHandler
 
-	// Offscreen target the scene is composited into, sized from the loaded profile.
+	// Offscreen target the scene is composited into, sized from the loaded show.
 	preview_target, target_ok := render.create_target(
-		win.device, u32(cfg.video.canvas_width), u32(cfg.video.canvas_height))
+		win.device, u32(show_cfg.video.canvas_width), u32(show_cfg.video.canvas_height))
 	if !target_ok {
 		log.fatal("preview target creation failed, exiting (cause logged above)")
 		return
 	}
 	defer render.destroy_target(&preview_target)
 
-	// Seed applied state from the cfg the target was just sized from.
-	applied := Applied{video = cfg.video}
+	// Seed applied state from the show the target was just sized from.
+	applied := Applied{video = show_cfg.video}
 
 	pipeline, pok := render.create_pipeline(win.device)
 	if !pok do return
@@ -307,19 +310,6 @@ main :: proc() {
 	}
 	defer wgc.wgc_shutdown()
 
-	// Active scene collection -- same load-active/pick-first/create-Default shape as profiles.
-	doc, collection_infos := app.load_scene_collection(&paths, &app_cfg)
-	defer scene.destroy_all(&doc)
-	defer scene.destroy_infos(collection_infos)
-
-	// Active show -- same load-active/pick-first/create-Default shape, but a
-	// parallel, independent system: no migration from profiles/doc into it.
-	// It now drives the live preview/scenes/sources/mixer panels; doc/cfg stay
-	// loaded for the legacy Profile/Collection menus only.
-	show_cfg, show_infos := app.load_show(&paths, &app_cfg)
-	defer show.destroy_show(&show_cfg)
-	defer show.destroy_infos(show_infos)
-
     ui_state := ui.init_state(&show_cfg, APP_VERSION)
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
     defer ui.destroy(&ui_state)
@@ -368,7 +358,7 @@ main :: proc() {
 		}
 
 		// Bring live objects in line with the settings modal -- see reconcile.odin.
-		reconcile(&applied, &cfg, win.device, &preview_target, output.recording || output.streaming || output.finalizing_sink != nil)
+		reconcile(&applied, &show_cfg, win.device, &preview_target, output.recording || output.streaming || output.finalizing_sink != nil)
 
 		// Check each frame for resize after each reconcile call
 		needed := int(preview_target.width) * int(preview_target.height) * 4
@@ -377,27 +367,15 @@ main :: proc() {
 			frame_bytes = make([]u8, needed)
 		}
 
-		// Service a pending save, one frame after the request so cfg is settled by reconcile first.
+		// Service a pending save, one frame after the request so show_cfg is settled by reconcile first.
 		if trigger := ui_state.settings.save_request; trigger != .None {
 			ui_state.settings.save_request = .None
-			if paths.profiles != "" {
+			if paths.shows != "" {
 				log.infof("save requested (%v)", trigger)
-				settings.save_profile(&cfg, paths.profiles)
+				show.save_show(paths.shows, &show_cfg)
 			} else {
 				log.warnf("save requested (%v), but no config path is available", trigger)
 			}
-		}
-
-		// Service a pending profile request.
-		if req := ui_state.profiles.request; req != .None {
-			app.handle_profile_request(req, &ui_state.profiles, &cfg, &app_cfg, &paths, &profile_infos)
-		}
-
-		// Service a pending scene collection request. doc stays loaded for the
-		// legacy Collection menu only -- it no longer drives any UI panel, so
-		// this doesn't touch scene/source selection state.
-		if req := ui_state.collections.request; req != .None {
-			app.handle_collection_request(req, &ui_state.collections, &doc, &app_cfg, &paths, &collection_infos)
 		}
 
 		// Service a pending show request.
@@ -409,7 +387,7 @@ main :: proc() {
 		if req := ui_state.controls.request; req != .None {
 			pre_blocks := mixer.blocks_emitted
 			app.handle_controls_request(req, &ui_state.controls, &output,
-				&paths, &preview_target, cfg.video.fps, cfg.stream, log_sink,
+				&paths, &preview_target, show_cfg.video.fps, show.ensure_output(&show_cfg)^, log_sink,
 				&mixer.blocks_emitted)
 			// ensure_encoder resets blocks_emitted; reset diag snapshots to match.
 			if mixer.blocks_emitted < pre_blocks {
@@ -518,7 +496,7 @@ main :: proc() {
         ui_state.controls.streaming = output.streaming
         ui_state.controls.finalizing = output.finalizing_sink != nil
 
-        ui.draw(&ui_state, &cfg, &doc, &show_cfg, &clear_color, preview_tex, outputs, profile_infos, collection_infos, show_infos,
+        ui.draw(&ui_state, &show_cfg, &clear_color, preview_tex, outputs, show_infos,
             f32(preview_target.width), f32(preview_target.height), audio_devices)
 
 		// Rendering
@@ -593,11 +571,8 @@ main :: proc() {
 	}
 
 	// Persist on a clean shutdown only.
-	if paths.profiles != "" {
+	if paths.shows != "" {
 		log.info("save on exit")
-		settings.save_profile(&cfg, paths.profiles)
-	}
-	if paths.collections != "" {
-		scene.save_collection(&doc, paths.collections)
+		show.save_show(paths.shows, &show_cfg)
 	}
 }

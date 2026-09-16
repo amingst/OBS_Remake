@@ -1,6 +1,7 @@
 package ui
 
 import "core:fmt"
+import "core:log"
 import "core:strings"
 import im "libs:odin-imgui"
 
@@ -27,6 +28,29 @@ Show_State :: struct {
 
 init_show_state :: proc() -> Show_State {
 	return Show_State{}
+}
+
+// Shared with menubar.odin's Settings Output tab: both use the same
+// InputText-into-fixed-buffer shape.
+@(private)
+seed_name_buf :: proc(buf: []u8, name: string) {
+	n := min(len(name), len(buf) - 1)
+	copy(buf[:n], name[:n])
+}
+
+@(private)
+read_name_buf :: proc(buf: []u8) -> (name: string, ok: bool) {
+	n := strings.index_byte(string(buf), 0)
+	if n < 0 {
+		log.warn("name truncated at 128 bytes (no NUL found)")
+		n = len(buf)
+	}
+	name = string(buf[:n])
+	if len(name) == 0 {
+		log.debug("empty name rejected")
+		return "", false
+	}
+	return name, true
 }
 
 // infos is owned and refreshed by main, not rescanned every frame.

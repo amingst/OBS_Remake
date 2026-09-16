@@ -7,22 +7,19 @@ import "core:strings"
 
 // app.json's on-disk shape.
 App_Config_DTO :: struct {
-    version:              int,
-    active_profile_id:    string,
-    active_collection_id: string,
+    version:        int,
+    active_show_id: string,
 }
 
 destroy_app_config :: proc(cfg: ^App_Config) {
-    delete(cfg.active_profile_id)
-    delete(cfg.active_collection_id)
+    delete(cfg.active_show_id)
     cfg^ = {}
 }
 
 save_app_config :: proc(cfg: ^App_Config, path: string) -> bool {
     dto := App_Config_DTO{
-        version              = CURRENT_VERSION,
-        active_profile_id    = cfg.active_profile_id,
-        active_collection_id = cfg.active_collection_id,
+        version        = CURRENT_VERSION,
+        active_show_id = cfg.active_show_id,
     }
     data, merr := json.marshal(dto, {pretty = true}, context.temp_allocator)
     if merr != nil {
@@ -60,9 +57,7 @@ load_app_config :: proc(cfg: ^App_Config, path: string) -> bool {
         return false
     }
 
-    delete(cfg.active_profile_id)
-    delete(cfg.active_collection_id)
-    cfg.active_profile_id    = strings.clone(dto.active_profile_id)
-    cfg.active_collection_id = strings.clone(dto.active_collection_id)
+    delete(cfg.active_show_id)
+    cfg.active_show_id = strings.clone(dto.active_show_id)
     return true
 }

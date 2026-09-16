@@ -4,15 +4,15 @@ import "core:log"
 import "vendor:directx/d3d11"
 
 import "render"
-import "settings"
+import "show"
 
 // Video settings currently built into live GPU resources.
 Applied :: struct {
-	video: settings.Video_Settings,
+	video: show.Show_Video_Settings,
 }
 
-// Brings the render target in line with the desired profile's video settings.
-reconcile :: proc(applied: ^Applied, desired: ^settings.Profile, device: ^d3d11.IDevice, target: ^render.Target, output_active: bool) {
+// Brings the render target in line with the desired show's video settings.
+reconcile :: proc(applied: ^Applied, desired: ^show.Show, device: ^d3d11.IDevice, target: ^render.Target, output_active: bool) {
 	// Canvas resolution
 	if desired.video.canvas_width  != applied.video.canvas_width ||
 	   desired.video.canvas_height != applied.video.canvas_height {

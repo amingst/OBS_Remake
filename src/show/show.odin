@@ -14,8 +14,12 @@ Show :: struct {
 	recording: Show_Stream_Recording_Destination,
 }
 
+// 2500 kbps -- conservative but watchable 1080p default; matches the old
+// Profile's DEFAULT_BITRATE (2_500_000 bps).
+DEFAULT_BITRATE_KBPS :: 2500
+
 create_default :: proc() -> Show {
-	return Show{
+	s := Show{
 		id      = new_id(),
 		name    = strings.clone("Default"),
 		version = CURRENT_VERSION,
@@ -27,6 +31,10 @@ create_default :: proc() -> Show {
 			fps           = 60,
 		},
 	}
+	// A show always has exactly one output to edit, same as a Profile always
+	// had exactly one Stream_Settings -- multi-output management is future work.
+	ensure_output(&s)
+	return s
 }
 
 destroy_show :: proc(s: ^Show) {

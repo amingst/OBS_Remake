@@ -11,7 +11,7 @@ import "../encode"
 import "../mp4"
 import "../render"
 import "../rtmp"
-import "../settings"
+import "../show"
 import "../ui"
 
 Output_State :: struct {
@@ -34,6 +34,9 @@ maybe_release_encoder :: proc(output: ^Output_State) {
 
 // Dispatches a Controls panel request raised by ui; always clears the request.
 // First output start acquires the encoder, last output stop releases it.
+// stream_output is the show's single output (multi-output fan-out is future
+// work -- see the show file spec) and feeds both recording and streaming,
+// since there's one encode shared across everything, not one per output.
 handle_controls_request :: proc(
 	req:               ui.Controls_Request,
 	state:             ^ui.Controls_State,
@@ -41,7 +44,7 @@ handle_controls_request :: proc(
 	paths:             ^config.Paths,
 	target:            ^render.Target,
 	fps:               i32,
-	stream_cfg:        settings.Stream_Settings,
+	stream_output:     show.Show_Stream_Output,
 	log_sink:          ^applog.Sink,
 	blocks_emitted:    ^u64,
 ) {
@@ -50,7 +53,7 @@ handle_controls_request :: proc(
 	// Acquires the encoder on the first output start.
 	ensure_encoder :: proc(
 		output: ^Output_State, target: ^render.Target, fps: i32,
-		stream_cfg: settings.Stream_Settings, log_sink: ^applog.Sink,
+		bitrate_kbps: int, log_sink: ^applog.Sink,
 		blocks_emitted: ^u64,
 	) -> bool {
 		if output.enc != nil do return true
@@ -62,7 +65,7 @@ handle_controls_request :: proc(
 			width              = target.width,
 			height             = target.height,
 			fps                = u32(fps),
-			bitrate            = u32(stream_cfg.bitrate),
+			bitrate            = u32(bitrate_kbps) * 1000,
 			audio_sample_rate  = 48000,
 			audio_channels     = 2,
 			audio_bitrate      = 16000,
@@ -88,7 +91,7 @@ handle_controls_request :: proc(
 			return
 		}
 
-		if !ensure_encoder(output, target, fps, stream_cfg, log_sink,
+		if !ensure_encoder(output, target, fps, stream_output.bitrate_kbps, log_sink,
 			blocks_emitted) {
 			log.warn("recording requested, but encoder_acquire failed")
 			return
@@ -131,12 +134,19 @@ handle_controls_request :: proc(
 
 	case .Start_Streaming:
 		if output.streaming do return
-		if stream_cfg.host == "" || stream_cfg.stream_key == "" {
+
+		rtmp_data, is_rtmp := stream_output.data.(show.RTMP_Output_Data)
+		if !stream_output.enabled || !is_rtmp || rtmp_data.url == "" || rtmp_data.key == "" {
 			log.warn("streaming requested, but no stream destination is configured")
 			return
 		}
+		host, app, tc_url, port, parse_ok := rtmp.parse_url(rtmp_data.url, context.temp_allocator)
+		if !parse_ok {
+			log.warnf("streaming requested, but the server URL %q could not be parsed (expected rtmp://host[:port]/app)", rtmp_data.url)
+			return
+		}
 
-		if !ensure_encoder(output, target, fps, stream_cfg, log_sink,
+		if !ensure_encoder(output, target, fps, stream_output.bitrate_kbps, log_sink,
 			blocks_emitted) {
 			log.warn("streaming requested, but encoder_acquire failed")
 			return
@@ -147,13 +157,13 @@ handle_controls_request :: proc(
 		// stream_index 0: a single stream is all this build supports today.
 		// A real id generator/registry belongs with fan-out, not here.
 		stream, stream_ok := rtmp.rtmp_stream_start(
-			output.enc, stream_cfg.app, stream_cfg.host, int(stream_cfg.port), stream_cfg.tc_url,
-			stream_cfg.stream_key, STREAM_AUDIO_CHANNELS,
+			output.enc, app, host, port, tc_url,
+			rtmp_data.key, STREAM_AUDIO_CHANNELS,
 			log_sink, 0)
 		if stream_ok {
 			output.rtmp_stream = stream
 			output.streaming = true
-			log.infof("streaming started -> %v:%v/%v", stream_cfg.host, stream_cfg.port, stream_cfg.app)
+			log.infof("streaming started -> %v:%v/%v", host, port, app)
 		} else {
 			log.warn("failed to start streaming (cause logged above)")
 			maybe_release_encoder(output)

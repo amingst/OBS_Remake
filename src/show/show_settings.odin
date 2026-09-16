@@ -1,5 +1,7 @@
 package show
 
+import "core:strings"
+
 Bitrate_Mode :: enum {
 	Manual,
 	Auto,
@@ -22,6 +24,27 @@ Show_Stream_Output :: struct {
 	bitrate_kbps: int, // bitrate in kilobits per second
 	bitrate_mode: Bitrate_Mode, // bitrate mode (manual or auto)
 	data: Show_Stream_Output_Data,
+}
+
+// Returns the show's single output, creating a default one first if it has
+// none (e.g. a show.json saved before outputs existed). A show always has
+// exactly one to edit, same as a Profile always had exactly one Stream_Settings.
+ensure_output :: proc(s: ^Show) -> ^Show_Stream_Output {
+	if len(s.outputs) == 0 {
+		append(&s.outputs, Show_Stream_Output{
+			id           = new_id(),
+			label        = strings.clone("Default"),
+			enabled      = true,
+			platform     = strings.clone("custom"),
+			bitrate_kbps = DEFAULT_BITRATE_KBPS,
+			bitrate_mode = .Manual,
+			data         = RTMP_Output_Data{
+				url = strings.clone(""),
+				key = strings.clone(""),
+			},
+		})
+	}
+	return &s.outputs[0]
 }
 
 destroy_output :: proc(o: ^Show_Stream_Output) {

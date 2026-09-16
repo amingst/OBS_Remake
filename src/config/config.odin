@@ -10,32 +10,24 @@ import win32 "core:sys/windows"
 CURRENT_VERSION :: 1
 
 App_Config :: struct {           // app.json
-    version:              int,
-    active_profile_id:    string,
-    active_collection_id: string,
-    active_show_id:       string,
+    version:        int,
+    active_show_id: string,
 }
 
 // Every field is an owned string; release with destroy_paths.
 Paths :: struct {
-	root:        string,
-	app_config:  string,   // root/app.json
-	settings:    string,   // root/settings.json (legacy, migration-only)
-	profiles:    string,   // root/profiles/
-	collections: string,   // root/collections/
-	videos:      string,   // recording output directory, e.g. %USERPROFILE%\Videos
-	shows:       string,   // root/shows/
+	root:       string,
+	app_config: string, // root/app.json
+	videos:     string, // recording output directory, e.g. %USERPROFILE%\Videos
+	shows:      string, // root/shows/
 }
 
 destroy_paths :: proc(p: ^Paths) {
 	if p == nil { return }
-	if p.root        != "" do delete(p.root)
-	if p.app_config  != "" do delete(p.app_config)
-	if p.settings    != "" do delete(p.settings)
-	if p.profiles    != "" do delete(p.profiles)
-	if p.collections != "" do delete(p.collections)
-	if p.videos      != "" do delete(p.videos)
-	if p.shows       != "" do delete(p.shows)
+	if p.root       != "" do delete(p.root)
+	if p.app_config != "" do delete(p.app_config)
+	if p.videos     != "" do delete(p.videos)
+	if p.shows      != "" do delete(p.shows)
 	p^ = {}
 }
 
@@ -69,14 +61,7 @@ resolve_paths :: proc() -> (paths: Paths, ok: bool) {
 	if !join_into(&paths.root, roaming, "StreamSmith")   do return
 	if !make_dir(paths.root)                           do return
 
-	if !join_into(&paths.app_config,  paths.root, "app.json")      do return
-	if !join_into(&paths.settings,    paths.root, "settings.json") do return
-
-	if !join_into(&paths.profiles,    paths.root, "profiles")    do return
-	if !make_dir(paths.profiles)                                 do return
-
-	if !join_into(&paths.collections, paths.root, "collections") do return
-	if !make_dir(paths.collections)                              do return
+	if !join_into(&paths.app_config, paths.root, "app.json") do return
 
 	if !join_into(&paths.shows, paths.root, "shows") do return
 	if !make_dir(paths.shows)                        do return
