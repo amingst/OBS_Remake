@@ -4,10 +4,10 @@ import "core:log"
 import "core:strings"
 import im "libs:odin-imgui"
 
-import "../scene"
+import "../show"
 
 Scenes_State :: struct {
-    selected_id: u64, // 0 == nothing selected; ids start at 1
+    selected_id: string, // "" == nothing selected
     name_buf:    [128]u8,
 }
 
@@ -15,7 +15,7 @@ init_scenes_state :: proc() -> Scenes_State {
     return Scenes_State{}
 }
 
-draw_scenes :: proc(state: ^Scenes_State, doc: ^scene.Collection) {
+draw_scenes :: proc(state: ^Scenes_State, s: ^show.Show) {
     p := panel_begin("Scenes", "SCENES")
     if p.visible {
         add_scene := panel_header_button("+", "Add scene")
@@ -38,7 +38,7 @@ draw_scenes :: proc(state: ^Scenes_State, doc: ^scene.Collection) {
                 if len(name) == 0 {
                     log.debug("empty scene name rejected")
                 } else {
-                    state.selected_id = scene.create_scene(doc, name)
+                    state.selected_id = show.create_scene(s, name)
                     state.name_buf = {}
                     im.CloseCurrentPopup()
                 }
@@ -53,7 +53,7 @@ draw_scenes :: proc(state: ^Scenes_State, doc: ^scene.Collection) {
 
         to_delete := -1
 
-        for &sc, i in doc.scenes {
+        for &sc, i in s.scenes {
             label := strings.clone_to_cstring(sc.name, context.temp_allocator)
             if im.Selectable(label, state.selected_id == sc.id) {
                 state.selected_id = sc.id
@@ -68,15 +68,15 @@ draw_scenes :: proc(state: ^Scenes_State, doc: ^scene.Collection) {
         }
 
         if to_delete >= 0 {
-            removed_id := scene.remove_scene(doc, to_delete)
+            removed_id := show.remove_scene(s, to_delete)
 
             // Selection is by id, so it only needs repair when the removed scene
             // was the selected one. Prefer whatever slid into the vacated slot,
             // else the new last scene, else nothing.
             if state.selected_id == removed_id {
-                state.selected_id = 0
-                if len(doc.scenes) > 0 {
-                    state.selected_id = doc.scenes[min(to_delete, len(doc.scenes) - 1)].id
+                state.selected_id = ""
+                if len(s.scenes) > 0 {
+                    state.selected_id = s.scenes[min(to_delete, len(s.scenes) - 1)].id
                 }
             }
         }

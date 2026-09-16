@@ -8,9 +8,9 @@ Show :: struct {
 	name: string, // display name for folders
 	version: int, // Current version of the show file
 	video: Show_Video_Settings,
-	sources: []Show_Source,
-	scenes: []Show_Scene,
-	outputs: []Show_Stream_Output,
+	sources: [dynamic]Show_Source,
+	scenes: [dynamic]Show_Scene,
+	outputs: [dynamic]Show_Stream_Output,
 	recording: Show_Stream_Recording_Destination,
 }
 
@@ -53,7 +53,7 @@ destroy_show :: proc(s: ^Show) {
 	s^ = {}
 }
 
-@(private = "file")
+@(private)
 new_id :: proc() -> string {
 	return uuid.to_string(
 		uuid.generate_v4(),

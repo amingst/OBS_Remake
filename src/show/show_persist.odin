@@ -270,9 +270,9 @@ from_dto :: proc(dto: ^Show_DTO) -> Show {
         })
     }
 
-    scenes := make([]Show_Scene, len(dto.scenes))
+    scenes := make([dynamic]Show_Scene, len(dto.scenes))
     for scene_dto, i in dto.scenes {
-        placements := make([]Show_Source_Placement, len(scene_dto.sources))
+        placements := make([dynamic]Show_Source_Placement, len(scene_dto.sources))
         for p_dto, j in scene_dto.sources {
             placements[j] = Show_Source_Placement{
                 id            = strings.clone(p_dto.id),
@@ -323,9 +323,9 @@ from_dto :: proc(dto: ^Show_DTO) -> Show {
         name    = strings.clone(dto.name),
         version = CURRENT_VERSION,
         video   = dto.video,
-        sources = sources[:],
+        sources = sources,
         scenes  = scenes,
-        outputs = outputs[:],
+        outputs = outputs,
         recording = Show_Stream_Recording_Destination{
             path = strings.clone(dto.recording.path),
         },

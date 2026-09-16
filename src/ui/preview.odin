@@ -2,7 +2,7 @@ package ui
 
 import "core:log"
 import im "libs:odin-imgui"
-import "../scene"
+import "../show"
 
 HANDLE_SIZE :: 8.0
 MIN_SIZE :: 10.0
@@ -19,7 +19,7 @@ Preview_State :: struct {
     image_min: [2]f32,
     image_size: [2]f32,
     mode: Drag_Mode,
-    drag_id: u64,
+    drag_id: string, // placement id being dragged
     grab_offset: [2]f32,
     orig: [4]f32,
     drag_start: [2]f32
@@ -35,7 +35,7 @@ draw_preview :: proc(
     sources:  ^Sources_State,
     scenes:   ^Scenes_State,
     controls: ^Controls_State,
-    doc:      ^scene.Collection,
+    s:        ^show.Show,
     tex:      im.TextureRef,
     canvas_w, canvas_h: f32,
 ) {
@@ -68,10 +68,10 @@ draw_preview :: proc(
 
             // Handle Source Selection From Click In Preview
             if im.IsItemHovered() && im.IsMouseClicked(.Left) {
-                begin_drag(state, sources, scenes, doc, canvas_w, canvas_h)
+                begin_drag(state, sources, scenes, s, canvas_w, canvas_h)
             }
-            apply_drag(state, scenes, doc, canvas_w, canvas_h)
-            draw_overlay(state, sources, scenes, doc, canvas_w, canvas_h)
+            apply_drag(state, scenes, s, canvas_w, canvas_h)
+            draw_overlay(state, sources, scenes, s, canvas_w, canvas_h)
             draw_rec_badge(state, controls)
         } else if !state.logged_collapsed {
             log.warn("preview panel collapsed or too small to render")
@@ -132,35 +132,35 @@ begin_drag :: proc(
     state: ^Preview_State,
     sources: ^Sources_State,
     scenes: ^Scenes_State,
-    doc: ^scene.Collection,
+    s: ^show.Show,
     canvas_w, canvas_h: f32,
 ) {
     mouse := im.GetMousePos()
     canvas_pos := screen_to_canvas(state, canvas_w, canvas_h, {mouse.x, mouse.y})
-    sc := scene.find(doc, scenes.selected_id)
+    sc := show.find_scene(s, scenes.selected_id)
     if sc != nil {
-        if src := scene.find_source(sc, sources.selected_id); src != nil {
-            positions := handle_positions(state, canvas_w, canvas_h, src)
+        if p := show.find_placement(sc, sources.selected_id); p != nil {
+            positions := handle_positions(state, canvas_w, canvas_h, p)
             for hp, i in positions {
                 if abs(mouse.x - hp.x) <= HANDLE_HIT/2 && abs(mouse.y - hp.y) <= HANDLE_HIT/2 {
                     state.mode = Drag_Mode(int(Drag_Mode.NW) + i)
-                    state.drag_id = src.id
-                    state.orig = {src.x, src.y, src.w, src.h}
+                    state.drag_id = p.id
+                    state.orig = {p.x, p.y, p.w, p.h}
                     state.drag_start = canvas_pos
                     return
                 }
             }
         }
-        #reverse for &src in sc.sources {
-            if !src.visible do continue
-            if canvas_pos.x >= src.x && canvas_pos.x < src.x + src.w &&
-               canvas_pos.y >= src.y && canvas_pos.y < src.y + src.h {
-                sources.selected_id = src.id
+        #reverse for &p in sc.sources {
+            if !p.visible do continue
+            if canvas_pos.x >= p.x && canvas_pos.x < p.x + p.w &&
+               canvas_pos.y >= p.y && canvas_pos.y < p.y + p.h {
+                sources.selected_id = p.id
                 state.mode = .Move
-                state.drag_id = src.id
+                state.drag_id = p.id
                 state.grab_offset = {
-                    canvas_pos.x - src.x,
-                    canvas_pos.y - src.y
+                    canvas_pos.x - p.x,
+                    canvas_pos.y - p.y
                 }
                 break
             }
@@ -171,7 +171,7 @@ begin_drag :: proc(
 apply_drag :: proc(
     state: ^Preview_State,
     scenes: ^Scenes_State,
-    doc: ^scene.Collection,
+    s: ^show.Show,
     canvas_w, canvas_h: f32,
 ) {
     if state.mode == .None do return
@@ -183,14 +183,14 @@ apply_drag :: proc(
     mouse := im.GetMousePos()
     cp := screen_to_canvas(state, canvas_w, canvas_h, {mouse.x, mouse.y})
 
-    sc := scene.find(doc, scenes.selected_id)
+    sc := show.find_scene(s, scenes.selected_id)
     if sc == nil do return
-    src := scene.find_source(sc, state.drag_id)
-    if src == nil do return
+    p := show.find_placement(sc, state.drag_id)
+    if p == nil do return
 
     if state.mode == .Move {
-        src.x = cp.x - state.grab_offset.x
-        src.y = cp.y - state.grab_offset.y
+        p.x = cp.x - state.grab_offset.x
+        p.y = cp.y - state.grab_offset.y
         return
     }
 
@@ -213,26 +213,26 @@ apply_drag :: proc(
 
     if west {
         if new_w := ow - dx; new_w < MIN_SIZE {
-            src.x = ox + ow - MIN_SIZE
-            src.w = MIN_SIZE
+            p.x = ox + ow - MIN_SIZE
+            p.w = MIN_SIZE
         } else {
-            src.x = ox + dx
-            src.w = new_w
+            p.x = ox + dx
+            p.w = new_w
         }
     } else if east {
-        src.w = max(ow + dx, MIN_SIZE)
+        p.w = max(ow + dx, MIN_SIZE)
     }
 
     if north {
         if new_h := oh - dy; new_h < MIN_SIZE {
-            src.y = oy + oh - MIN_SIZE   // pin the bottom edge
-            src.h = MIN_SIZE
+            p.y = oy + oh - MIN_SIZE   // pin the bottom edge
+            p.h = MIN_SIZE
         } else {
-            src.y = oy + dy
-            src.h = new_h
+            p.y = oy + dy
+            p.h = new_h
         }
     } else if south {
-        src.h = max(oh + dy, MIN_SIZE)
+        p.h = max(oh + dy, MIN_SIZE)
     }
 }
 
@@ -240,17 +240,17 @@ draw_overlay :: proc(
     state: ^Preview_State,
     sources: ^Sources_State,
     scenes: ^Scenes_State,
-    doc: ^scene.Collection,
+    s: ^show.Show,
     canvas_w, canvas_h: f32,
 ) {
-            if sc := scene.find(doc, scenes.selected_id); sc != nil {
-                if src := scene.find_source(sc, sources.selected_id); src != nil {
+            if sc := show.find_scene(s, scenes.selected_id); sc != nil {
+                if p := show.find_placement(sc, sources.selected_id); p != nil {
                     dl := im.GetWindowDrawList()
                     positions := handle_positions(
                         state,
                         canvas_w,
                         canvas_h,
-                        src
+                        p
                     )
 
                     for hp in positions {
@@ -278,11 +278,11 @@ draw_overlay :: proc(
 handle_positions :: proc(
     state: ^Preview_State,
     canvas_w, canvas_h: f32,
-    src: ^scene.Source
+    p: ^show.Show_Source_Placement
 ) -> [8][2]f32 {
-    tl := canvas_to_screen(state, canvas_w, canvas_h, {src.x, src.y})
-    br := canvas_to_screen(state, canvas_w, canvas_h, {src.x + src.w, src.y + src.h})
-    
+    tl := canvas_to_screen(state, canvas_w, canvas_h, {p.x, p.y})
+    br := canvas_to_screen(state, canvas_w, canvas_h, {p.x + p.w, p.y + p.h})
+
     return [8][2]f32{
         {tl.x, tl.y},
         {(tl.x + br.x) * 0.5, tl.y},

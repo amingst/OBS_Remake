@@ -313,13 +313,14 @@ main :: proc() {
 	defer scene.destroy_infos(collection_infos)
 
 	// Active show -- same load-active/pick-first/create-Default shape, but a
-	// parallel, independent system: no migration from profiles/doc into it,
-	// and nothing below yet reads from it to drive rendering.
+	// parallel, independent system: no migration from profiles/doc into it.
+	// It now drives the live preview/scenes/sources/mixer panels; doc/cfg stay
+	// loaded for the legacy Profile/Collection menus only.
 	show_cfg, show_infos := app.load_show(&paths, &app_cfg)
 	defer show.destroy_show(&show_cfg)
 	defer show.destroy_infos(show_infos)
 
-    ui_state := ui.init_state(&doc, APP_VERSION)
+    ui_state := ui.init_state(&show_cfg, APP_VERSION)
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
     defer ui.destroy(&ui_state)
 
@@ -392,10 +393,11 @@ main :: proc() {
 			app.handle_profile_request(req, &ui_state.profiles, &cfg, &app_cfg, &paths, &profile_infos)
 		}
 
-		// Service a pending scene collection request (before sources are touched below).
+		// Service a pending scene collection request. doc stays loaded for the
+		// legacy Collection menu only -- it no longer drives any UI panel, so
+		// this doesn't touch scene/source selection state.
 		if req := ui_state.collections.request; req != .None {
-			app.handle_collection_request(req, &ui_state.collections, &ui_state.scenes, &ui_state.sources,
-				&doc, &app_cfg, &paths, &collection_infos)
+			app.handle_collection_request(req, &ui_state.collections, &doc, &app_cfg, &paths, &collection_infos)
 		}
 
 		// Service a pending show request.
@@ -434,16 +436,14 @@ main :: proc() {
 			log.info("recording finalized")
 		}
 
-		// Neutral fallback clear color when no scene is selected.
+		// Neutral fallback clear color -- Show_Scene has no per-scene color
+		// (that was a scene.Collection-only cosmetic, dropped in the show model).
 		scene_clear := [4]f32{0.10, 0.10, 0.12, 1.0}
-		if sel := scene.find(&doc, ui_state.scenes.selected_id); sel != nil {
-			scene_clear = sel.color
-		}
 
 		// Composite the scene into the offscreen target before ImGui's frame starts.
 		quads := make([dynamic]render.Quad, context.temp_allocator)
 		inputs := make([dynamic]audio.Mix_Input, context.temp_allocator)
-		scene.service_sources(&doc, ui_state.scenes.selected_id, win.device, win.device_context, log_sink, &quads, &inputs)
+		show.service_show(&show_cfg, ui_state.scenes.selected_id, win.device, win.device_context, log_sink, &quads, &inputs)
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 
 		// -- Audio mixer --------------------------------------------------

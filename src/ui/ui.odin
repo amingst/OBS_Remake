@@ -48,15 +48,15 @@ draw :: proc(
     // in favour of the headers drawn inside each card.
     im.DockSpaceOverViewport(0, im.GetMainViewport(), {.PassthruCentralNode, .AutoHideTabBar}, nil)
 
-    draw_preview(&state.preview, &state.sources, &state.scenes, &state.controls, doc, preview_tex, canvas_w, canvas_h)
-    draw_scenes(&state.scenes, doc)
-    draw_sources(&state.sources, &state.scenes, doc, outputs, canvas_w, canvas_h, audio_devices)
-    draw_mixer(&state.mixer, &state.scenes, doc)
+    draw_preview(&state.preview, &state.sources, &state.scenes, &state.controls, show_cfg, preview_tex, canvas_w, canvas_h)
+    draw_scenes(&state.scenes, show_cfg)
+    draw_sources(&state.sources, &state.scenes, show_cfg, outputs, canvas_w, canvas_h, audio_devices)
+    draw_mixer(&state.mixer, &state.scenes, show_cfg)
 
     draw_modals(state, cfg, doc, show_cfg, outputs, state.controls.streaming)
 }
 
-init_state :: proc(doc: ^scene.Collection, version: string) -> State {
+init_state :: proc(show_cfg: ^show.Show, version: string) -> State {
     state := State{
         version = version,
         show_demo = false,
@@ -71,8 +71,8 @@ init_state :: proc(doc: ^scene.Collection, version: string) -> State {
         collections = init_collections_state(),
         shows = init_show_state(),
     }
-    if len(doc.scenes) > 0 {
-        state.scenes.selected_id = doc.scenes[0].id
+    if len(show_cfg.scenes) > 0 {
+        state.scenes.selected_id = show_cfg.scenes[0].id
     }
     return state
 }

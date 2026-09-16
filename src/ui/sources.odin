@@ -6,7 +6,7 @@ import "core:log"
 import "core:strings"
 import im "libs:odin-imgui"
 import "../capture"
-import "../scene"
+import "../show"
 import "../audio"
 import "../platform"
 
@@ -22,7 +22,7 @@ Source_Kind_Choice :: enum i32 {
 }
 
 Sources_State :: struct {
-    selected_id:   u64, // 0 == nothing selected; ids start at 1
+    selected_id:   string, // placement id; "" == nothing selected
     name_buf:      [128]u8,
     kind_choice:   Source_Kind_Choice,
     output_choice: int, // index into the enumerated outputs, for the Add popup
@@ -54,14 +54,14 @@ destroy_sources_state :: proc(state: ^Sources_State) {
 
 // Icon for a source's kind, shown at the head of its row.
 @(private="file")
-source_icon :: proc(data: scene.Source_Data) -> string {
+source_icon :: proc(data: show.Show_Source_Data) -> string {
     switch _ in data {
-    case scene.Color_Data:   return ICON_PALETTE
-    case scene.Display_Data: return ICON_DISPLAY
-    case scene.Audio_Data:   return ICON_MICROPHONE
-    case scene.Image_Data:   return ICON_IMAGE
-    case scene.Window_Data:  return ICON_WINDOW
-    case scene.Camera_Data:  return ICON_CAMERA
+    case show.Color_Source_Data:   return ICON_PALETTE
+    case show.Display_Source_Data: return ICON_DISPLAY
+    case show.Audio_Source_Data:   return ICON_MICROPHONE
+    case show.Image_Source_Data:   return ICON_IMAGE
+    case show.Window_Source_Data:  return ICON_WINDOW
+    case show.Camera_Source_Data:  return ICON_CAMERA
     }
     return ICON_LAYER_GROUP
 }
@@ -98,30 +98,32 @@ audio_devices_for :: proc(devices: []audio.Device_Info, is_loopback: bool) -> []
     return out[:]
 }
 
-// Sizes and centers a source to fill the canvas at its native aspect ratio
-// (letterboxed/pillarboxed as needed). Colour sources use the canvas aspect.
+// Sizes and centers a placement to fill the canvas at its source's native
+// aspect ratio (letterboxed/pillarboxed as needed). Colour sources use the
+// canvas aspect. Geometry writes go to the placement; the aspect ratio is
+// read from the (possibly shared) source.
 @(private="file")
-fit_to_canvas :: proc(src: ^scene.Source, outputs: []capture.Output_Info, canvas_w, canvas_h: f32) {
+fit_to_canvas :: proc(p: ^show.Show_Source_Placement, src: ^show.Show_Source, outputs: []capture.Output_Info, canvas_w, canvas_h: f32) {
     aspect := canvas_w / canvas_h
     switch d in src.data {
-    case scene.Display_Data:
+    case show.Display_Source_Data:
         if i := find_output(outputs, d.adapter_index, d.output_index); i >= 0 && outputs[i].height > 0 {
             aspect = f32(outputs[i].width) / f32(outputs[i].height)
         }
-    case scene.Image_Data:
+    case show.Image_Source_Data:
         if d.width > 0 && d.height > 0 {
             aspect = f32(d.width) / f32(d.height)
         }
-    case scene.Window_Data:
+    case show.Window_Source_Data:
         // No native size until capture starts; doesn't re-fit on later resize.
         if d.capture != nil && d.capture.width > 0 && d.capture.height > 0 {
             aspect = f32(d.capture.width) / f32(d.capture.height)
         }
-    case scene.Camera_Data:
+    case show.Camera_Source_Data:
         if d.cam != nil && d.width > 0 && d.height > 0 {
             aspect = f32(d.width) / f32(d.height)
         }
-    case scene.Color_Data, scene.Audio_Data:
+    case show.Color_Source_Data, show.Audio_Source_Data:
         // no native size, keep canvas aspect
     }
 
@@ -131,14 +133,14 @@ fit_to_canvas :: proc(src: ^scene.Source, outputs: []capture.Output_Info, canvas
         size = {canvas_h * aspect, canvas_h}
     }
 
-    src.w, src.h = size.x, size.y
-    src.x = (canvas_w - size.x) * 0.5
-    src.y = (canvas_h - size.y) * 0.5
+    p.w, p.h = size.x, size.y
+    p.x = (canvas_w - size.x) * 0.5
+    p.y = (canvas_h - size.y) * 0.5
 }
 
 // Combo of enumerated outputs; picking a new one tears down the old capture.
 @(private="file")
-draw_output_picker :: proc(d: ^scene.Display_Data, outputs: []capture.Output_Info) {
+draw_output_picker :: proc(d: ^show.Display_Source_Data, outputs: []capture.Output_Info) {
     if len(outputs) == 0 {
         im.TextDisabled("No outputs available")
         return
@@ -154,7 +156,7 @@ draw_output_picker :: proc(d: ^scene.Display_Data, outputs: []capture.Output_Inf
                     d.adapter_index, d.output_index, o.adapter_index, o.output_index, o.device_name)
                 d.adapter_index = i32(o.adapter_index)
                 d.output_index  = i32(o.output_index)
-                scene.reset_display_capture(d)
+                show.reset_display_capture(d)
             }
         }
         im.EndCombo()
@@ -163,7 +165,7 @@ draw_output_picker :: proc(d: ^scene.Display_Data, outputs: []capture.Output_Inf
 
 // Device combo plus volume/mute. An unplugged device shows as unavailable.
 @(private="file")
-draw_audio_picker :: proc(d: ^scene.Audio_Data, devices: []audio.Device_Info) {
+draw_audio_picker :: proc(d: ^show.Audio_Source_Data, devices: []audio.Device_Info) {
     matching := audio_devices_for(devices, d.is_loopback)
     if len(matching) == 0 {
         im.TextDisabled("No matching audio devices")
@@ -201,7 +203,7 @@ draw_audio_picker :: proc(d: ^scene.Audio_Data, devices: []audio.Device_Info) {
 // Window picker: stops the old capture and stores the new identity, but never
 // starts a capture itself -- the main loop's retry path does that next frame.
 @(private="file")
-draw_window_picker :: proc(d: ^scene.Window_Data, state: ^Sources_State) {
+draw_window_picker :: proc(d: ^show.Window_Source_Data, state: ^Sources_State) {
     if d.title != "" {
         im.TextWrapped(fmt.ctprintf("Window: %v", d.title))
     } else {
@@ -286,7 +288,7 @@ draw_window_picker :: proc(d: ^scene.Window_Data, state: ^Sources_State) {
 draw_sources :: proc(
     state: ^Sources_State,
     scenes: ^Scenes_State,
-    doc: ^scene.Collection,
+    s: ^show.Show,
     outputs: []capture.Output_Info,
     canvas_w, canvas_h: f32,
     devices: []audio.Device_Info,
@@ -299,7 +301,7 @@ draw_sources :: proc(
         add_source := panel_header_button("+", "Add source")
         panel_header_end()
 
-        sc := scene.find(doc, scenes.selected_id)
+        sc := show.find_scene(s, scenes.selected_id)
         if sc == nil {
             im.TextDisabled("No scene selected")
         } else {
@@ -381,12 +383,12 @@ draw_sources :: proc(
                     if len(name) == 0 {
                         log.debug("empty source name rejected")
                     } else {
-                        data: scene.Source_Data
+                        data: show.Show_Source_Data
                         switch state.kind_choice {
                         case .Color:
-                            data = scene.Color_Data{}
+                            data = show.Color_Source_Data{}
                         case .Display:
-                            d := scene.Display_Data{}
+                            d := show.Display_Source_Data{}
                             if len(outputs) > 0 {
                                 o := outputs[state.output_choice]
                                 d.adapter_index = i32(o.adapter_index)
@@ -395,7 +397,7 @@ draw_sources :: proc(
                             data = d
                         case .Audio_Input, .Audio_Output:
                             // volume defaults to 1.0 -- zero would be silent.
-                            a := scene.Audio_Data{
+                            a := show.Audio_Source_Data{
                                 is_loopback = state.kind_choice == .Audio_Output,
                                 params      = {volume = 1.0},
                             }
@@ -405,20 +407,23 @@ draw_sources :: proc(
                             }
                             data = a
                         case .Image:
-                            data = scene.Image_Data{}
+                            data = show.Image_Source_Data{}
                         case .Window:
                             // Empty title until the picker supplies one.
-                            data = scene.Window_Data{}
+                            data = show.Window_Source_Data{}
                         case .Camera:
-                            data = scene.Camera_Data{}
+                            data = show.Camera_Source_Data{}
                         }
 
-                        state.selected_id = scene.create_source(doc, sc, name, data)
+                        source_id := show.create_source(s, name, data)
+                        state.selected_id = show.place_source(sc, source_id)
 
                         // Start a display source at its native aspect, not the default 400x300.
                         if state.kind_choice == .Display {
-                            if src := scene.find_source(sc, state.selected_id); src != nil {
-                                fit_to_canvas(src, outputs, canvas_w, canvas_h)
+                            if placement := show.find_placement(sc, state.selected_id); placement != nil {
+                                if src := show.find_source(s, source_id); src != nil {
+                                    fit_to_canvas(placement, src, outputs, canvas_w, canvas_h)
+                                }
                             }
                         }
 
@@ -446,19 +451,23 @@ draw_sources :: proc(
 
             to_delete := -1
 
-            for &src, i in sc.sources {
-                im.PushIDInt(i32(src.id))
+            for &placement, i in sc.sources {
+                src := show.find_source(s, placement.source_id)
+                if src == nil do continue
+
+                id_cstr := strings.clone_to_cstring(placement.id, context.temp_allocator)
+                im.PushID(id_cstr)
 
                 // Kind icon + name fill the row; the eye toggle overlays its right end.
                 right_x := im.GetCursorPosX() + im.GetContentRegionAvail().x
                 label := fmt.ctprintf("%s  %s", source_icon(src.data), src.name)
-                if !src.visible {
+                if !placement.visible {
                     im.PushStyleColorVec4(.Text, rgba(OUTLINE))
                 }
-                if im.Selectable(label, state.selected_id == src.id, {.AllowOverlap}) {
-                    state.selected_id = src.id
+                if im.Selectable(label, state.selected_id == placement.id, {.AllowOverlap}) {
+                    state.selected_id = placement.id
                 }
-                if !src.visible {
+                if !placement.visible {
                     im.PopStyleColor()
                 }
 
@@ -475,84 +484,86 @@ draw_sources :: proc(
                 im.PushStyleColorVec4(.Button, rgba(0, 0))
                 im.PushStyleColorVec4(.ButtonHovered, rgba(SURFACE_HIGHEST))
                 im.PushStyleColorVec4(.ButtonActive, rgba(OUTLINE_VARIANT))
-                im.PushStyleColorVec4(.Text, rgba(src.visible ? TEXT_VARIANT : OUTLINE))
-                if im.Button(src.visible ? ICON_EYE : ICON_EYE_SLASH, {eye, eye}) {
-                    src.visible = !src.visible
+                im.PushStyleColorVec4(.Text, rgba(placement.visible ? TEXT_VARIANT : OUTLINE))
+                if im.Button(placement.visible ? ICON_EYE : ICON_EYE_SLASH, {eye, eye}) {
+                    placement.visible = !placement.visible
                 }
                 im.PopStyleColor(4)
 
                 im.PopID()
             }
 
-            if src := scene.find_source(sc, state.selected_id); src != nil {
-                im.Separator()
+            if placement := show.find_placement(sc, state.selected_id); placement != nil {
+                if src := show.find_source(s, placement.source_id); src != nil {
+                    im.Separator()
 
-                // Geometry controls are visual-sources-only; audio has no canvas position.
-                _, is_audio := src.data.(scene.Audio_Data)
+                    // Geometry controls are visual-sources-only; audio has no canvas position.
+                    _, is_audio := src.data.(show.Audio_Source_Data)
 
-                if !is_audio {
-                    im.DragFloat("X", &src.x)
-                    im.DragFloat("Y", &src.y)
-                    im.DragFloat("W", &src.w)
-                    im.DragFloat("H", &src.h)
-                }
-
-                // The colour swatch only applies to Color_Data quads.
-                switch &d in src.data {
-                case scene.Color_Data:
-                    im.ColorEdit4("Color", &src.color)
-                case scene.Display_Data:
-                    draw_output_picker(&d, outputs)
-                case scene.Audio_Data:
-                    draw_audio_picker(&d, devices)
-                case scene.Image_Data:
-                    if d.path != "" {
-                        im.TextWrapped(fmt.ctprintf("Path: %v", d.path))
-                    } else {
-                        im.TextDisabled("No path set")
+                    if !is_audio {
+                        im.DragFloat("X", &placement.x)
+                        im.DragFloat("Y", &placement.y)
+                        im.DragFloat("W", &placement.w)
+                        im.DragFloat("H", &placement.h)
                     }
-                    if d.lost {
-                        im.TextDisabled("Failed to load")
-                    } else if d.texture != nil {
-                        im.Text(fmt.ctprintf("%v x %v", d.width, d.height))
-                    }
-                    if im.Button("Browse...") {
-                        if picked, pick_ok := platform.open_image_dialog(); pick_ok {
+
+                    // The colour swatch is a per-placement tint, not part of the shared source.
+                    switch &d in src.data {
+                    case show.Color_Source_Data:
+                        im.ColorEdit4("Color", &placement.color)
+                    case show.Display_Source_Data:
+                        draw_output_picker(&d, outputs)
+                    case show.Audio_Source_Data:
+                        draw_audio_picker(&d, devices)
+                    case show.Image_Source_Data:
+                        if d.path != "" {
+                            im.TextWrapped(fmt.ctprintf("Path: %v", d.path))
+                        } else {
+                            im.TextDisabled("No path set")
+                        }
+                        if d.lost {
+                            im.TextDisabled("Failed to load")
+                        } else if d.texture != nil {
+                            im.Text(fmt.ctprintf("%v x %v", d.width, d.height))
+                        }
+                        if im.Button("Browse...") {
+                            if picked, pick_ok := platform.open_image_dialog(); pick_ok {
+                                if d.srv != nil     { d.srv->Release();     d.srv = nil }
+                                if d.texture != nil { d.texture->Release(); d.texture = nil }
+                                if d.path != "" do delete(d.path)
+                                d.path   = picked
+                                d.width  = 0
+                                d.height = 0
+                                d.lost   = false
+                            }
+                        }
+                        im.SameLine()
+                        if im.Button("Reload") && d.path != "" {
                             if d.srv != nil     { d.srv->Release();     d.srv = nil }
                             if d.texture != nil { d.texture->Release(); d.texture = nil }
-                            if d.path != "" do delete(d.path)
-                            d.path   = picked
                             d.width  = 0
                             d.height = 0
                             d.lost   = false
                         }
-                    }
-                    im.SameLine()
-                    if im.Button("Reload") && d.path != "" {
-                        if d.srv != nil     { d.srv->Release();     d.srv = nil }
-                        if d.texture != nil { d.texture->Release(); d.texture = nil }
-                        d.width  = 0
-                        d.height = 0
-                        d.lost   = false
-                    }
-                case scene.Window_Data:
-                    draw_window_picker(&d, state)
+                    case show.Window_Source_Data:
+                        draw_window_picker(&d, state)
 
-                case scene.Camera_Data:
-                    draw_camera_picker(&d, state)
-                }
-                if !is_audio {
-                    if im.Button("Fit to canvas") {
-                        fit_to_canvas(src, outputs, canvas_w, canvas_h)
+                    case show.Camera_Source_Data:
+                        draw_camera_picker(&d, state)
+                    }
+                    if !is_audio {
+                        if im.Button("Fit to canvas") {
+                            fit_to_canvas(placement, src, outputs, canvas_w, canvas_h)
+                        }
                     }
                 }
             }
 
             if to_delete >= 0 {
-                removed_id := scene.remove_source(sc, to_delete)
+                removed_id := show.remove_placement(sc, to_delete)
 
                 if state.selected_id == removed_id {
-                    state.selected_id = 0
+                    state.selected_id = ""
                     if len(sc.sources) > 0 {
                         state.selected_id = sc.sources[min(to_delete, len(sc.sources) - 1)].id
                     }
@@ -567,7 +578,7 @@ draw_sources :: proc(
 // Camera picker: stops the old reader and stores the new identity, but never
 // starts a reader itself -- the main loop's lazy-start check does that.
 @(private="file")
-draw_camera_picker :: proc(d: ^scene.Camera_Data, state: ^Sources_State) {
+draw_camera_picker :: proc(d: ^show.Camera_Source_Data, state: ^Sources_State) {
     if d.friendly_name != "" {
         im.TextWrapped(fmt.ctprintf("Device: %v", d.friendly_name))
     } else {

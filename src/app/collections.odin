@@ -11,8 +11,6 @@ import "../ui"
 handle_collection_request :: proc(
 	req:     ui.Collection_Request,
 	state:   ^ui.Collection_State,
-	scenes:  ^ui.Scenes_State,
-	sources: ^ui.Sources_State,
 	doc:     ^scene.Collection,
 	app_cfg: ^config.App_Config,
 	paths:   ^config.Paths,
@@ -24,9 +22,7 @@ handle_collection_request :: proc(
 	case .Switch:
 		id := state.switch_to
 		defer { delete(id); state.switch_to = "" }
-		if switch_collection(id, doc, app_cfg, paths) {
-			reset_collection_selection(scenes, sources, doc)
-		}
+		switch_collection(id, doc, app_cfg, paths)
 
 	case .New:
 		name := state.pending_name
@@ -42,7 +38,6 @@ handle_collection_request :: proc(
 			doc^ = created
 			set_active_collection(app_cfg, paths, doc.id)
 			refresh_collection_infos(infos, paths)
-			reset_collection_selection(scenes, sources, doc)
 			log.infof("created and switched to scene collection %v (%v)", doc.name, doc.id)
 		} else {
 			log.warnf("could not create scene collection %q", name)
@@ -59,17 +54,17 @@ handle_collection_request :: proc(
 		}
 
 	case .Delete:
-		delete_active_collection(doc, app_cfg, paths, infos, state, scenes, sources)
+		delete_active_collection(doc, app_cfg, paths, infos, state)
 	}
 }
 
 // Saves and switches the active scene collection.
 @(private = "file")
-switch_collection :: proc(id: string, doc: ^scene.Collection, app_cfg: ^config.App_Config, paths: ^config.Paths) -> bool {
-	if id == doc.id do return false
+switch_collection :: proc(id: string, doc: ^scene.Collection, app_cfg: ^config.App_Config, paths: ^config.Paths) {
+	if id == doc.id do return
 	if paths.collections == "" {
 		log.warn("scene collection switch requested, but no config path is available")
-		return false
+		return
 	}
 
 	scene.save_collection(doc, paths.collections)
@@ -78,7 +73,7 @@ switch_collection :: proc(id: string, doc: ^scene.Collection, app_cfg: ^config.A
 	if !ok {
 		// Don't touch doc -- a failed load must not leave it half-destroyed.
 		log.warnf("could not load scene collection %v; staying on %v", id, doc.id)
-		return false
+		return
 	}
 
 	// Releases the outgoing collection's active captures before the swap.
@@ -87,7 +82,6 @@ switch_collection :: proc(id: string, doc: ^scene.Collection, app_cfg: ^config.A
 	set_active_collection(app_cfg, paths, doc.id)
 
 	log.infof("switched to scene collection %v (%v, %v scene(s))", doc.name, doc.id, len(doc.scenes))
-	return true
 }
 
 @(private = "file")
@@ -97,8 +91,6 @@ delete_active_collection :: proc(
 	paths:   ^config.Paths,
 	infos:   ^[]scene.Collection_Info,
 	state:   ^ui.Collection_State,
-	scenes:  ^ui.Scenes_State,
-	sources: ^ui.Sources_State,
 ) {
 	if paths.collections == "" {
 		log.warn("scene collection delete requested, but no config path is available")
@@ -124,7 +116,6 @@ delete_active_collection :: proc(
 	scene.destroy_all(doc)
 	doc^ = loaded
 	set_active_collection(app_cfg, paths, doc.id)
-	reset_collection_selection(scenes, sources, doc)
 
 	if !scene.remove(paths.collections, prev_id) {
 		log.warnf("switched away from scene collection %v but could not delete its file", prev_id)
@@ -162,14 +153,4 @@ set_active_collection :: proc(app_cfg: ^config.App_Config, paths: ^config.Paths,
 refresh_collection_infos :: proc(infos: ^[]scene.Collection_Info, paths: ^config.Paths) {
 	scene.destroy_infos(infos^)
 	infos^ = paths.collections != "" ? scene.enumerate(paths.collections) : nil
-}
-
-// Repoints scene/source selection at the new collection after a switch.
-@(private = "file")
-reset_collection_selection :: proc(scenes: ^ui.Scenes_State, sources: ^ui.Sources_State, doc: ^scene.Collection) {
-	sources.selected_id = 0
-	scenes.selected_id = 0
-	if len(doc.scenes) > 0 {
-		scenes.selected_id = doc.scenes[0].id
-	}
 }

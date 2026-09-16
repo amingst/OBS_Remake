@@ -1,9 +1,10 @@
 package ui
 
 import im "libs:odin-imgui"
-import "../scene"
+import "../show"
 import "core:fmt"
 import "core:math"
+import "core:strings"
 
 Mixer_State :: struct {
 
@@ -14,36 +15,46 @@ init_mixer_state :: proc() -> Mixer_State {
 }
 
 @(private="file")
-audio_src_label :: proc (o: scene.Source) -> cstring {
-    return fmt.ctprintf("%v", o.name)
+audio_src_label :: proc (name: string) -> cstring {
+    return fmt.ctprintf("%v", name)
 }
 
-draw_mixer :: proc(state: ^Mixer_State, scenes: ^Scenes_State, doc: ^scene.Collection) {
+draw_mixer :: proc(state: ^Mixer_State, scenes: ^Scenes_State, s: ^show.Show) {
     p := panel_begin("Audio Mixer", "AUDIO MIXER")
     if p.visible {
         panel_header_end()
 
-        sc := scene.find(doc, scenes.selected_id)
+        sc := show.find_scene(s, scenes.selected_id)
         if sc == nil {
             im.TextDisabled("No Scenes Selected")
         } else {
             any := false
-            for &src in sc.sources {
-                d, is_audio := &src.data.(scene.Audio_Data)
+            for placement in sc.sources {
+                if !placement.visible do continue
+                src := show.find_source(s, placement.source_id)
+                if src == nil do continue
+
+                d, is_audio := &src.data.(show.Audio_Source_Data)
                 if !is_audio do continue
                 any = true
 
-                im.PushIDInt(i32(src.id))
+                id_cstr := strings.clone_to_cstring(src.id, context.temp_allocator)
+                im.PushID(id_cstr)
 
                 // Name, then the level readout and mute toggle on the right.
                 right_x := im.GetCursorPosX() + im.GetContentRegionAvail().x
-                im.TextUnformatted(audio_src_label(src))
+                im.TextUnformatted(audio_src_label(src.name))
 
                 peak: f32 = d.stream != nil ? d.stream.peak : 0
                 db := peak_db(peak)
 
+                // Placement-level hard mute (mute_override) combines with the
+                // source's own base mute; the button here toggles the base
+                // mute, same as before -- per-scene override isn't exposed here yet.
+                muted := d.params.muted || placement.mute_override
+
                 mute_w := im.GetFrameHeight()
-                readout := d.muted ? cstring("muted") : fmt.ctprintf("%.1f dB", db)
+                readout := muted ? cstring("muted") : fmt.ctprintf("%.1f dB", db)
                 im.PushFontFloat(fonts.mono, FONT_SIZE_TELEMETRY)
                 readout_w := im.CalcTextSize(readout).x
                 im.SameLine()
@@ -58,16 +69,16 @@ draw_mixer :: proc(state: ^Mixer_State, scenes: ^Scenes_State, doc: ^scene.Colle
                 im.PushStyleColorVec4(.Button, rgba(0, 0))
                 im.PushStyleColorVec4(.ButtonHovered, rgba(SURFACE_HIGHEST))
                 im.PushStyleColorVec4(.ButtonActive, rgba(OUTLINE_VARIANT))
-                im.PushStyleColorVec4(.Text, rgba(d.muted ? DANGER : TEXT_VARIANT))
-                if im.Button(d.muted ? ICON_VOLUME_XMARK : ICON_VOLUME_HIGH, {mute_w, mute_w}) {
-                    d.muted = !d.muted
+                im.PushStyleColorVec4(.Text, rgba(muted ? DANGER : TEXT_VARIANT))
+                if im.Button(muted ? ICON_VOLUME_XMARK : ICON_VOLUME_HIGH, {mute_w, mute_w}) {
+                    d.params.muted = !d.params.muted
                 }
                 im.PopStyleColor(4)
 
-                draw_meter(d.muted ? -60 : db)
+                draw_meter(muted ? -60 : db)
 
                 im.PushStyleColorVec4(.FrameBg, rgba(SLATE_SURFACE))
-                im.SliderFloat("##vol", &d.volume, 0, 1, "%.2f")
+                im.SliderFloat("##vol", &d.params.volume, 0, 1, "%.2f")
                 im.PopStyleColor()
 
                 im.Spacing()

@@ -1,5 +1,7 @@
 package show
 
+import "core:log"
+import "core:strings"
 import time "core:time"
 import "vendor:directx/d3d11"
 import "vendor:directx/dxgi"
@@ -78,6 +80,38 @@ Show_Source :: struct {
 	id: string,	// UUID v4
 	name: string, // display name
 	data: Show_Source_Data,
+}
+
+// Adds a source to the show's inventory only -- it isn't visible anywhere
+// until placed into a scene with place_source.
+create_source :: proc(s: ^Show, name: string, data: Show_Source_Data) -> string {
+	id := new_id()
+	append(&s.sources, Show_Source{
+		id   = id,
+		name = strings.clone(name),
+		data = data,
+	})
+	log.debugf("show source created: id=%v name=%q", id, name)
+	return id
+}
+
+// Tears down a display source's capture state (e.g. when its output picker
+// changes) without touching the rest of the source. Mirrors scene.reset_display_capture.
+reset_display_capture :: proc(d: ^Display_Source_Data) {
+	if d.srv != nil {
+		d.srv->Release()
+		d.srv = nil
+	}
+	if d.texture != nil {
+		d.texture->Release()
+		d.texture = nil
+	}
+	capture.stop_duplication(d.dupl)
+	d.dupl = nil
+
+	d.next_retry = {}
+	d.last_frame_time = {}
+	d.stalled = false
 }
 
 // Releases live capture/audio resources in addition to owned strings --
