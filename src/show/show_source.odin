@@ -79,3 +79,50 @@ Show_Source :: struct {
 	name: string, // display name
 	data: Show_Source_Data,
 }
+
+// Releases live capture/audio resources in addition to owned strings --
+// mirrors scene.destroy_source, since Show_Source_Data carries the same
+// runtime handles (D3D views, camera/window capture, audio streams).
+destroy_source :: proc(src: ^Show_Source) {
+	if src == nil do return
+
+	switch &d in src.data {
+	case Color_Source_Data:
+		// Nothing to release
+	case Display_Source_Data:
+		if d.srv != nil {
+			d.srv->Release()
+			d.srv = nil
+		}
+		if d.texture != nil {
+			d.texture->Release()
+			d.texture = nil
+		}
+		capture.stop_duplication(d.dupl)
+		d.dupl = nil
+	case Audio_Source_Data:
+		if d.stream != nil {
+			audio.release_stream(d.device_id)
+			d.stream = nil
+		}
+		delete(d.device_id)
+	case Image_Source_Data:
+		if d.srv != nil do d.srv->Release()
+		if d.texture != nil do d.texture->Release()
+		if d.path != "" do delete(d.path)
+	case Window_Source_Data:
+		if d.capture != nil do capture.stop_window_capture(d.capture)
+		if d.title != "" do delete(d.title)
+		if d.class_name != "" do delete(d.class_name)
+		if d.exe_name != "" do delete(d.exe_name)
+	case Camera_Source_Data:
+		if d.cam != nil do capture.camera_stop(d.cam)
+		if d.texture != nil do d.texture->Release()
+		if d.srv != nil do d.srv->Release()
+		if d.symlink != "" do delete(d.symlink)
+		if d.friendly_name != "" do delete(d.friendly_name)
+	}
+
+	delete(src.id)
+	delete(src.name)
+}

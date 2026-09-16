@@ -118,6 +118,9 @@ load :: proc(s: ^Show, path: string) -> bool {
         return false
     }
 
+    // Free whatever s already held before overwriting it -- load can be
+    // called on a live Show (e.g. a reload), not just a zero-valued one.
+    destroy_show(s)
     s^ = from_dto(&dto)
     return true
 }

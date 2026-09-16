@@ -16,3 +16,19 @@ Show_Scene :: struct {
 	order: int, // layer order
 	sources: []Show_Source_Placement,
 }
+
+destroy_placement :: proc(p: ^Show_Source_Placement) {
+	if p == nil do return
+	delete(p.id)
+	delete(p.source_id)
+}
+
+destroy_scene :: proc(s: ^Show_Scene) {
+	if s == nil do return
+	for &p in s.sources {
+		destroy_placement(&p)
+	}
+	delete(s.sources)
+	delete(s.id)
+	delete(s.name)
+}

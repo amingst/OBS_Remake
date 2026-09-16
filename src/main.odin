@@ -22,6 +22,7 @@ import "settings"
 import "platform"
 import "render"
 import "scene"
+import "show"
 import "ui"
 import "capture"
 import "audio"
@@ -311,6 +312,13 @@ main :: proc() {
 	defer scene.destroy_all(&doc)
 	defer scene.destroy_infos(collection_infos)
 
+	// Active show -- same load-active/pick-first/create-Default shape, but a
+	// parallel, independent system: no migration from profiles/doc into it,
+	// and nothing below yet reads from it to drive rendering.
+	show_cfg, show_infos := app.load_show(&paths, &app_cfg)
+	defer show.destroy_show(&show_cfg)
+	defer show.destroy_infos(show_infos)
+
     ui_state := ui.init_state(&doc, APP_VERSION)
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
     defer ui.destroy(&ui_state)
@@ -388,6 +396,11 @@ main :: proc() {
 		if req := ui_state.collections.request; req != .None {
 			app.handle_collection_request(req, &ui_state.collections, &ui_state.scenes, &ui_state.sources,
 				&doc, &app_cfg, &paths, &collection_infos)
+		}
+
+		// Service a pending show request.
+		if req := ui_state.shows.request; req != .None {
+			app.handle_show_request(req, &ui_state.shows, &show_cfg, &app_cfg, &paths, &show_infos)
 		}
 
 		// Service a pending recording/streaming request.
@@ -505,7 +518,7 @@ main :: proc() {
         ui_state.controls.streaming = output.streaming
         ui_state.controls.finalizing = output.finalizing_sink != nil
 
-        ui.draw(&ui_state, &cfg, &doc, &clear_color, preview_tex, outputs, profile_infos, collection_infos,
+        ui.draw(&ui_state, &cfg, &doc, &show_cfg, &clear_color, preview_tex, outputs, profile_infos, collection_infos, show_infos,
             f32(preview_target.width), f32(preview_target.height), audio_devices)
 
 		// Rendering

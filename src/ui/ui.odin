@@ -7,6 +7,7 @@ import im "libs:odin-imgui"
 import "../capture"
 import "../scene"
 import "../settings"
+import "../show"
 import "../audio"
 
 DEFAULT_LAYOUT :: #load("default_layout.ini", string)
@@ -23,22 +24,25 @@ State :: struct {
     settings: Settings_State,
     profiles: Profile_State,
     collections: Collection_State,
+    shows: Show_State,
 }
 
 draw :: proc(
     state: ^State,
     cfg: ^settings.Profile,
     doc: ^scene.Collection,
+    show_cfg: ^show.Show,
     clear_color: ^im.Vec4,
     preview_tex: im.TextureRef,
     outputs: []capture.Output_Info,
     profiles: []settings.Profile_Info,
     collections: []scene.Collection_Info,
+    shows: []show.Show_Info,
     canvas_w, canvas_h: f32,
     audio_devices: []audio.Device_Info
 ) {
     // Chrome first: it shrinks the viewport work area the dockspace then fills.
-    draw_chrome(state, cfg, doc, profiles, collections)
+    draw_chrome(state, cfg, doc, show_cfg, profiles, collections, shows)
 
     // AutoHideTabBar: every panel is alone in its node, so this drops the dock tabs
     // in favour of the headers drawn inside each card.
@@ -49,7 +53,7 @@ draw :: proc(
     draw_sources(&state.sources, &state.scenes, doc, outputs, canvas_w, canvas_h, audio_devices)
     draw_mixer(&state.mixer, &state.scenes, doc)
 
-    draw_modals(state, cfg, doc, outputs, state.controls.streaming)
+    draw_modals(state, cfg, doc, show_cfg, outputs, state.controls.streaming)
 }
 
 init_state :: proc(doc: ^scene.Collection, version: string) -> State {
@@ -65,6 +69,7 @@ init_state :: proc(doc: ^scene.Collection, version: string) -> State {
         settings = init_settings_state(),
         profiles = init_profiles_state(),
         collections = init_collections_state(),
+        shows = init_show_state(),
     }
     if len(doc.scenes) > 0 {
         state.scenes.selected_id = doc.scenes[0].id

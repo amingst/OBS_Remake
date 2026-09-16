@@ -24,6 +24,20 @@ Show_Stream_Output :: struct {
 	data: Show_Stream_Output_Data,
 }
 
+destroy_output :: proc(o: ^Show_Stream_Output) {
+	if o == nil do return
+
+	switch &d in o.data {
+	case RTMP_Output_Data:
+		delete(d.url)
+		delete(d.key)
+	}
+
+	delete(o.id)
+	delete(o.label)
+	delete(o.platform)
+}
+
 Show_Stream_Recording_Destination :: struct {
 	path: string, // file path, defaults to .../Videos/StreamSmith/{show_id}/
 }

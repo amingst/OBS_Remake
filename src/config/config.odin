@@ -13,6 +13,7 @@ App_Config :: struct {           // app.json
     version:              int,
     active_profile_id:    string,
     active_collection_id: string,
+    active_show_id:       string,
 }
 
 // Every field is an owned string; release with destroy_paths.
@@ -23,6 +24,7 @@ Paths :: struct {
 	profiles:    string,   // root/profiles/
 	collections: string,   // root/collections/
 	videos:      string,   // recording output directory, e.g. %USERPROFILE%\Videos
+	shows:       string,   // root/shows/
 }
 
 destroy_paths :: proc(p: ^Paths) {
@@ -33,6 +35,7 @@ destroy_paths :: proc(p: ^Paths) {
 	if p.profiles    != "" do delete(p.profiles)
 	if p.collections != "" do delete(p.collections)
 	if p.videos      != "" do delete(p.videos)
+	if p.shows       != "" do delete(p.shows)
 	p^ = {}
 }
 
@@ -74,6 +77,9 @@ resolve_paths :: proc() -> (paths: Paths, ok: bool) {
 
 	if !join_into(&paths.collections, paths.root, "collections") do return
 	if !make_dir(paths.collections)                              do return
+
+	if !join_into(&paths.shows, paths.root, "shows") do return
+	if !make_dir(paths.shows)                        do return
 
 	// Recording output directory (the user's Videos folder, not under paths.root).
 	resolve_videos(&paths)

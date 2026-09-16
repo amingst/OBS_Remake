@@ -6,6 +6,7 @@ import im "libs:odin-imgui"
 import "../capture"
 import "../scene"
 import "../settings"
+import "../show"
 
 Save_Trigger :: enum {
     None,
@@ -75,10 +76,12 @@ draw_menus :: proc(
     state: ^State,
     cfg: ^settings.Profile,
     doc: ^scene.Collection,
+    show_cfg: ^show.Show,
     profiles: []settings.Profile_Info,
     collections: []scene.Collection_Info,
+    shows: []show.Show_Info,
 ) {
-    draw_file_menu(state, cfg, doc, profiles, collections)
+    draw_file_menu(state, cfg, doc, show_cfg, profiles, collections, shows)
     draw_view_menu(state)
 }
 
@@ -87,6 +90,7 @@ draw_modals :: proc(
     state: ^State,
     cfg: ^settings.Profile,
     doc: ^scene.Collection,
+    show_cfg: ^show.Show,
     outputs: []capture.Output_Info,
     streaming: bool,
 ) {
@@ -97,6 +101,7 @@ draw_modals :: proc(
 
     draw_profile_popups(&state.profiles, cfg.name)
     draw_collection_popups(&state.collections, doc.name)
+    draw_show_popups(&state.shows, show_cfg.name)
 }
 
 @(private="file")
@@ -104,8 +109,10 @@ draw_file_menu :: proc(
     state: ^State,
     cfg: ^settings.Profile,
     doc: ^scene.Collection,
+    show_cfg: ^show.Show,
     profiles: []settings.Profile_Info,
     collections: []scene.Collection_Info,
+    shows: []show.Show_Info,
 ) {
     if im.BeginMenu("File") {
         if im.MenuItem("Save Settings") {
@@ -116,6 +123,7 @@ draw_file_menu :: proc(
 
         draw_profile_menu(&state.profiles, profiles, cfg.id, cfg.name)
         draw_collection_menu(&state.collections, collections, doc.id, doc.name)
+        draw_show_menu(&state.shows, shows, show_cfg.id, show_cfg.name)
 
         im.Separator()
 
