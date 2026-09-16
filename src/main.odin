@@ -288,10 +288,15 @@ main :: proc() {
 	}
 	defer mf.MFShutdown()
 
-	// Mixer state — allocated once, freed at exit.
-	mixer: audio.Mixer
-	audio.mixer_state_init(&mixer)
-	defer audio.mixer_state_destroy(&mixer)
+	// Audio mixer runs on its own thread so a render-loop stall can't stall
+	// the audio timeline. Stopped (via defer) before audio.shutdown() closes
+	// the streams it reads from.
+	mix_thread: audio.Mix_Thread
+	if !audio.mix_thread_start(&mix_thread) {
+		log.error("could not start the audio mixer thread")
+		return
+	}
+	defer audio.mix_thread_stop(&mix_thread)
 
 	// Per-second audio instrumentation — diffs against previous snapshot.
 	audio_diag_last_tick := time.tick_now()
@@ -385,12 +390,11 @@ main :: proc() {
 
 		// Service a pending recording/streaming request.
 		if req := ui_state.controls.request; req != .None {
-			pre_blocks := mixer.blocks_emitted
+			pre_blocks := audio.mix_blocks_emitted()
 			app.handle_controls_request(req, &ui_state.controls, &output,
-				&paths, &preview_target, show_cfg.video.fps, show.ensure_output(&show_cfg)^, log_sink,
-				&mixer.blocks_emitted)
-			// ensure_encoder resets blocks_emitted; reset diag snapshots to match.
-			if mixer.blocks_emitted < pre_blocks {
+				&paths, &preview_target, show_cfg.video.fps, show.ensure_output(&show_cfg)^, log_sink)
+			// Attaching a new encoder resets the block counter; reset diag snapshots to match.
+			if audio.mix_blocks_emitted() < pre_blocks {
 				audio_diag_last_blocks = 0
 				audio_diag_last_aac_recv = 0
 				audio_diag_last_ps_attempted = 0
@@ -425,7 +429,9 @@ main :: proc() {
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 
 		// -- Audio mixer --------------------------------------------------
-		audio.mix_and_push(&mixer, inputs[:], output.enc)
+		// Hand this frame's input list to the mixer thread; mixing itself
+		// no longer happens here.
+		audio.mix_publish_inputs(inputs[:])
 
 		// Per-second audio instrumentation.
 		if time.duration_seconds(time.tick_since(audio_diag_last_tick)) >= 1.0 {
@@ -442,7 +448,8 @@ main :: proc() {
 				audio_diag_last_ps_attempted = 0
 				audio_diag_last_ps_dropped = 0
 			}
-			d_blocks := mixer.blocks_emitted - audio_diag_last_blocks
+			blocks_now := audio.mix_blocks_emitted()
+			d_blocks := blocks_now - audio_diag_last_blocks
 			d_aac := aac_recv - audio_diag_last_aac_recv
 			d_attempts := ps_attempted - audio_diag_last_ps_attempted
 			d_drops := ps_dropped - audio_diag_last_ps_dropped
@@ -450,7 +457,7 @@ main :: proc() {
 				log.infof("audio/sec: mixed_blocks=%v aac_to_sink=%v ps_attempts=%v ps_drops=%v",
 					d_blocks, d_aac, d_attempts, d_drops)
 			}
-			audio_diag_last_blocks = mixer.blocks_emitted
+			audio_diag_last_blocks = blocks_now
 			audio_diag_last_aac_recv = aac_recv
 			audio_diag_last_ps_attempted = ps_attempted
 			audio_diag_last_ps_dropped = ps_dropped

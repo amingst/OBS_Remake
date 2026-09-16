@@ -218,7 +218,7 @@ MF_ACCESSMODE_READWRITE :: 3
 MF_OPENMODE_DELETE_IF_EXIST :: 4
 MF_FILEFLAGS_NONE :: 0
 
-MF_E_NOTACCEPTING :: windows.HRESULT(-1072875083) // 0xC00D36B5
+MF_E_NOTACCEPTING :: windows.HRESULT(-1072875851) // 0xC00D36B5 (was -1072875083 = 0xC00D39B5, so the retry never matched)
 
 // Diagnostics only (recon for the streaming-degrades-on-second-consumer /
 // video-track-missing investigation). No behavioural meaning -- purely
@@ -231,7 +231,6 @@ Sample_Stats :: struct {
     not_accepting:       u64,
     other_fail:          u64,
     sample_logged:       int, // rate-limits the first-10-samples debug log
-    notaccepting_logged: int, // rate-limits the GetEvent-on-NOTACCEPTING debug log
 }
 
 IID_IMFFinalizableMediaSink := windows.GUID{0xeaecb74a, 0x9a50, 0x42ce, {0x95, 0x41, 0x6a, 0x7f, 0x57, 0xaa, 0x4a, 0xd7}}
@@ -515,32 +514,25 @@ mp4_sink_wait_started :: proc(stream_sink: ^IMFStreamSink, max_events: u32) -> b
 
 @(private)
 process_sample_retrying :: proc(stream_sink: ^IMFStreamSink, sample: ^IMFSample, stats: ^Sample_Stats, stream_name: string) -> windows.HRESULT {
-    // MF_E_NOTACCEPTING is expected backpressure (the sink's internal queue
-    // is full), not an error -- confirmed in the probe. GetEvent(flags=0)
-    // blocks for the sink's next readiness signal, then we retry.
-    for {
-        hr := stream_sink.ProcessSample(stream_sink, sample)
-        if hr != MF_E_NOTACCEPTING do return hr
+    // MF_E_NOTACCEPTING is backpressure: the stream sink's internal queue is
+    // full. The MPEG4 media sink interleaves audio and video by timestamp, so
+    // one stream stops accepting when it is waiting on the OTHER stream to
+    // catch up. Blocking here on GetEvent (as this used to attempt, before the
+    // constant was fixed) deadlocks: this feeder thread is the only source of
+    // both streams, so it would wait for a readiness event that can only be
+    // produced by samples it is no longer sending.
+    //
+    // Until the sink is replaced with an IMFSinkWriter (which owns the
+    // request-sample protocol and interleaving), a refused sample is counted
+    // and returned to the caller, which logs and drops it. See stats.not_accepting.
+    hr := stream_sink.ProcessSample(stream_sink, sample)
+    if hr == MF_E_NOTACCEPTING {
         stats.not_accepting += 1
-        event: ^IMFMediaEvent
-        ev_hr := stream_sink.GetEvent(stream_sink, MF_EVENT_FLAG_NONE, &event)
-        // Diagnostics only, rate-limited: what GetEvent actually handed back
-        // on the NOTACCEPTING retry path.
-        if stats.notaccepting_logged < 20 {
-            stats.notaccepting_logged += 1
-            if ev_hr < 0 {
-                log.debugf("mp4 sink %v NOTACCEPTING retry: GetEvent failed: 0x%08X", stream_name, u32(ev_hr))
-            } else if event == nil {
-                log.debugf("mp4 sink %v NOTACCEPTING retry: GetEvent returned S_OK with no event", stream_name)
-            } else {
-                event_type: u32
-                event.GetType(event, &event_type)
-                log.debugf("mp4 sink %v NOTACCEPTING retry: GetEvent returned event type %v", stream_name, event_type)
-            }
+        if stats.not_accepting <= 10 || stats.not_accepting % 1000 == 0 {
+            log.warnf("mp4 sink %v: NOTACCEPTING (#%v) -- sample will be dropped", stream_name, stats.not_accepting)
         }
-        if event != nil do event.Release(event)
-        if ev_hr < 0 do return hr
     }
+    return hr
 }
 
 @(private)

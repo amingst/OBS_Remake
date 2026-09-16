@@ -254,6 +254,7 @@ stream_thread :: proc(t: ^thread.Thread) {
     for intrinsics.atomic_load_explicit(&s.running, .Acquire) {
         if windows.WaitForSingleObject(s.event, 200) != windows.WAIT_OBJECT_0 do continue
         drain_packets(s)
+        mix_signal_data()
         // Clear the per-thread temp arena core:log allocates into each iteration.
         free_all(context.temp_allocator)
     }

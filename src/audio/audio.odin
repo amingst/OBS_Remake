@@ -48,12 +48,19 @@ shutdown :: proc() {
     }
 
     for id, entry in g_streams {
-        log.debug("Releasing device with id %v", id)
+        log.debugf("Releasing device with id %v", id)
+        mix_forget_stream(entry.stream)
         close_stream(entry.stream)
         free(entry.stream)
         delete(entry.key)
     }
     delete(g_streams)
+    // delete() frees the map's storage but leaves the header pointing at it.
+    // main's defer order runs show teardown AFTER this, and its
+    // release_stream calls would otherwise look up freed memory, find stale
+    // entries, and close/free each stream a second time (crash at exit).
+    g_streams = {}
+    g_shut_down = true
 }
 
 @(private="file") RPC_E_CHANGED_MODE  :: windows.HRESULT(-2147417850) // 0x80010106

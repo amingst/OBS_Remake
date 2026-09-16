@@ -6,6 +6,7 @@ import "core:path/filepath"
 import "core:time"
 
 import "../applog"
+import "../audio"
 import "../config"
 import "../encode"
 import "../mp4"
@@ -28,6 +29,7 @@ Output_State :: struct {
 // the encoder must stay alive until the sink is reaped.
 maybe_release_encoder :: proc(output: ^Output_State) {
 	if output.recording || output.streaming || output.finalizing_sink != nil do return
+	audio.mix_set_encoder(nil) // detach the mixer thread before the encoder goes away
 	encode.encoder_release()
 	output.enc = nil
 }
@@ -46,7 +48,6 @@ handle_controls_request :: proc(
 	fps:               i32,
 	stream_output:     show.Show_Stream_Output,
 	log_sink:          ^applog.Sink,
-	blocks_emitted:    ^u64,
 ) {
 	state.request = .None
 
@@ -54,7 +55,6 @@ handle_controls_request :: proc(
 	ensure_encoder :: proc(
 		output: ^Output_State, target: ^render.Target, fps: i32,
 		bitrate_kbps: int, log_sink: ^applog.Sink,
-		blocks_emitted: ^u64,
 	) -> bool {
 		if output.enc != nil do return true
 		if fps <= 0 {
@@ -75,7 +75,7 @@ handle_controls_request :: proc(
 		enc, enc_ok := encode.encoder_acquire(encoder_cfg)
 		if !enc_ok do return false
 		output.enc = enc
-		blocks_emitted^ = 0
+		audio.mix_set_encoder(enc) // also restarts the audio block counter for the new timeline
 		return true
 	}
 
@@ -91,8 +91,7 @@ handle_controls_request :: proc(
 			return
 		}
 
-		if !ensure_encoder(output, target, fps, stream_output.bitrate_kbps, log_sink,
-			blocks_emitted) {
+		if !ensure_encoder(output, target, fps, stream_output.bitrate_kbps, log_sink) {
 			log.warn("recording requested, but encoder_acquire failed")
 			return
 		}
@@ -146,8 +145,7 @@ handle_controls_request :: proc(
 			return
 		}
 
-		if !ensure_encoder(output, target, fps, stream_output.bitrate_kbps, log_sink,
-			blocks_emitted) {
+		if !ensure_encoder(output, target, fps, stream_output.bitrate_kbps, log_sink) {
 			log.warn("streaming requested, but encoder_acquire failed")
 			return
 		}

@@ -11,6 +11,7 @@ Stream_Entry :: struct {
 }
 
 @(private) g_streams: map[string]Stream_Entry
+@(private) g_shut_down: bool // set by shutdown(); later releases are expected no-ops
 
 acquire_stream :: proc(device_id: string, is_loopback: bool) -> ^Stream {
     if device_id == "" do return nil
@@ -35,7 +36,11 @@ acquire_stream :: proc(device_id: string, is_loopback: bool) -> ^Stream {
 release_stream :: proc(device_id: string) {
     entry, found := &g_streams[device_id]
     if !found {
-        log.warnf("release_stream: no stream for %v", device_id)
+        if g_shut_down {
+            log.debugf("release_stream(%v) after audio shutdown, already closed", device_id)
+        } else {
+            log.warnf("release_stream: no stream for %v", device_id)
+        }
         return
     }
 
@@ -43,6 +48,7 @@ release_stream :: proc(device_id: string) {
     if entry.refcount > 0 do return
 
     key := entry.key
+    mix_forget_stream(entry.stream) // the mixer thread must drop it before it is closed
     close_stream(entry.stream)
     free(entry.stream)
     delete_key(&g_streams, device_id)

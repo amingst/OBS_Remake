@@ -234,6 +234,28 @@ Mp4_Sink :: struct {
 	pts_base:             i64,
 	pts_base_set:         bool,
 	negative_clamp_count: u64,
+
+	// A/V drift diagnostics: last PTS handed to each stream sink (rebased,
+	// 100ns) and when the delta was last logged. Feeder-thread-only.
+	last_video_pts:   i64,
+	last_audio_pts:   i64,
+	sent_video:       bool,
+	sent_audio:       bool,
+	drift_log_last:   time.Tick,
+}
+
+// Logs video PTS minus audio PTS once per second so drift between the two
+// streams shows up in the log before the muxer starts refusing samples.
+@(private = "file")
+log_av_drift :: proc(s: ^Mp4_Sink) {
+	if !s.sent_video || !s.sent_audio do return
+	now := time.tick_now()
+	if s.drift_log_last != {} && time.tick_diff(s.drift_log_last, now) < time.Second do return
+	s.drift_log_last = now
+	delta_ms := f64(s.last_video_pts - s.last_audio_pts) / 10_000.0
+	log.infof("a/v drift: video_pts=%vms audio_pts=%vms video-audio=%.1fms not_accepting(v/a)=%v/%v",
+		s.last_video_pts / 10_000, s.last_audio_pts / 10_000, delta_ms,
+		s.diag.video_stats.not_accepting, s.diag.audio_stats.not_accepting)
 }
 
 // Max unrelated events to wait through per stream sink before giving up.
@@ -433,6 +455,7 @@ put_audio :: proc(ctx: rawptr, g: ^encode.Frame_Group) {
 drain_audio :: proc(s: ^Mp4_Sink) {
 	for entry in audio_spill_take_all(&s.audio_ring) {
 		pts := rebase_pts(s, entry.pts)
+		s.last_audio_pts, s.sent_audio = pts, true
 		sample, payload_len, sample_ok := mf.mp4_sink_build_audio_sample(entry.buf, pts, entry.duration)
 		delete(entry.buf)
 		if sample_ok {
@@ -446,6 +469,7 @@ drain_audio :: proc(s: ^Mp4_Sink) {
 		g, take_ok := audio_ring_take(&s.audio_ring)
 		if !take_ok do break
 		pts, duration := rebase_pts(s, g.pts), g.duration
+		s.last_audio_pts, s.sent_audio = pts, true
 		sample, payload_len, sample_ok := mf.mp4_sink_build_audio_sample(g.buf[:], pts, duration)
 		encode.group_release(g)
 		if sample_ok {
@@ -465,6 +489,7 @@ drain_video :: proc(s: ^Mp4_Sink) {
 			nalus[i] = entry.buf[span.start:][:span.length]
 		}
 		pts := rebase_pts(s, entry.pts)
+		s.last_video_pts, s.sent_video = pts, true
 		sample, payload_len, sample_ok := mf.mp4_sink_build_video_sample(nalus, pts, entry.duration)
 		delete(entry.buf)
 		delete(entry.offsets)
@@ -479,6 +504,7 @@ drain_video :: proc(s: ^Mp4_Sink) {
 		g, take_ok := video_ring_take(&s.video_ring)
 		if !take_ok do break
 		pts, duration := rebase_pts(s, g.pts), g.duration
+		s.last_video_pts, s.sent_video = pts, true
 		sample, payload_len, sample_ok := mf.mp4_sink_build_video_sample(g.nalus[:], pts, duration)
 		encode.group_release(g)
 		if sample_ok {
@@ -505,6 +531,7 @@ feeder_thread :: proc(t: ^thread.Thread) {
 		// Audio before video on each wake, same order as RTMP.
 		drain_audio(s)
 		drain_video(s)
+		log_av_drift(s)
 
 		if intrinsics.atomic_load_explicit(&s.spillover_breach, .Acquire) {
 			log.error("spillover ceiling exceeded (>256 MiB), auto-stopping recording")
