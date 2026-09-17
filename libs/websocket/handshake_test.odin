@@ -112,42 +112,7 @@ http_status_for_errors :: proc(t: ^testing.T) {
 }
 
 // ---- Socket tests ----
-
-@(private="file")
-Loopback :: struct {
-	listener: net.TCP_Socket,
-	client:   net.TCP_Socket,
-	server:   net.TCP_Socket,
-}
-
-@(private="file")
-loopback_open :: proc(t: ^testing.T) -> (lb: Loopback, ok: bool) {
-	listen_err: net.Network_Error
-	lb.listener, listen_err = net.listen_tcp({net.IP4_Loopback, 0})
-	if !testing.expect_value(t, listen_err, nil) do return
-
-	ep, ep_err := net.bound_endpoint(lb.listener)
-	if !testing.expect_value(t, ep_err, nil) do return
-
-	dial_err: net.Network_Error
-	lb.client, dial_err = net.dial_tcp(ep)
-	if !testing.expect_value(t, dial_err, nil) do return
-
-	accept_err: net.Accept_Error
-	lb.server, _, accept_err = net.accept_tcp(lb.listener)
-	if !testing.expect_value(t, accept_err, nil) do return
-
-	// Fail instead of hanging if a read never completes.
-	net.set_option(lb.server, .Receive_Timeout, 2 * time.Second)
-	return lb, true
-}
-
-@(private="file")
-loopback_close :: proc(lb: ^Loopback) {
-	if lb.client != 0 do net.close(lb.client)
-	if lb.server != 0 do net.close(lb.server)
-	if lb.listener != 0 do net.close(lb.listener)
-}
+// Loopback helpers live in support_test.odin.
 
 @(private="file")
 Delayed_Send :: struct {
