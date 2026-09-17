@@ -9,6 +9,14 @@ setlocal
 set FLAGS=-collection:libs=libs -vet -vet-shadowing -debug
 set FAILED=0
 
+echo === action ===
+odin test src/action %FLAGS%
+if errorlevel 1 set FAILED=1
+
+echo === app ===
+odin test src/app %FLAGS%
+if errorlevel 1 set FAILED=1
+
 echo === applog ===
 odin test src/applog %FLAGS%
 if errorlevel 1 set FAILED=1
@@ -31,6 +39,10 @@ if errorlevel 1 set FAILED=1
 
 echo === rtmp ===
 odin test src/rtmp %FLAGS%
+if errorlevel 1 set FAILED=1
+
+echo === websocket ===
+odin test libs/websocket %FLAGS%
 if errorlevel 1 set FAILED=1
 
 if %FAILED%==1 (
