@@ -4,6 +4,7 @@ import "core:os"
 import "core:log"
 import im "libs:odin-imgui"
 
+import "../action"
 import "../capture"
 import "../show"
 import "../audio"
@@ -12,6 +13,7 @@ DEFAULT_LAYOUT :: #load("default_layout.ini", string)
 
 State :: struct {
     version: string, // shown in the status bar; supplied by main
+    actions: ^action.Envelope_Queue, // owned by main; panels push actions here instead of editing live state
     show_demo: bool,
     show_settings: bool,
     scenes: Scenes_State,
@@ -41,16 +43,17 @@ draw :: proc(
     im.DockSpaceOverViewport(0, im.GetMainViewport(), {.PassthruCentralNode, .AutoHideTabBar}, nil)
 
     draw_preview(&state.preview, &state.sources, &state.scenes, &state.controls, show_cfg, preview_tex, canvas_w, canvas_h)
-    draw_scenes(&state.scenes, show_cfg)
-    draw_sources(&state.sources, &state.scenes, show_cfg, outputs, canvas_w, canvas_h, audio_devices)
-    draw_mixer(&state.mixer, &state.scenes, show_cfg)
+    draw_scenes(&state.scenes, show_cfg, state.actions)
+    draw_sources(&state.sources, &state.scenes, show_cfg, outputs, canvas_w, canvas_h, audio_devices, state.actions)
+    draw_mixer(&state.mixer, &state.scenes, show_cfg, state.actions)
 
     draw_modals(state, show_cfg, outputs, state.controls.streaming)
 }
 
-init_state :: proc(show_cfg: ^show.Show, version: string) -> State {
+init_state :: proc(version: string, actions: ^action.Envelope_Queue) -> State {
     state := State{
         version = version,
+        actions = actions,
         show_demo = false,
         show_settings = false,
         scenes = init_scenes_state(),
@@ -61,10 +64,12 @@ init_state :: proc(show_cfg: ^show.Show, version: string) -> State {
         settings = init_settings_state(),
         shows = init_show_state(),
     }
-    if len(show_cfg.scenes) > 0 {
-        state.scenes.selected_id = show_cfg.scenes[0].id
-    }
     return state
+}
+
+// Queues an action from a UI control; main dispatches it next frame.
+push_action :: proc(q: ^action.Envelope_Queue, a: action.Action) {
+    action.queue_push(q, action.Envelope{action = a, origin = .UI})
 }
 
 load_layout :: proc() {

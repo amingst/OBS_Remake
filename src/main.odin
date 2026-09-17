@@ -16,6 +16,7 @@ import "libs:wgc"
 import time "core:time"
 
 // Import from platform module
+import "action"
 import "app"
 import "config"
 import "platform"
@@ -315,7 +316,18 @@ main :: proc() {
 	}
 	defer wgc.wgc_shutdown()
 
-    ui_state := ui.init_state(&show_cfg, APP_VERSION)
+	// UI, and later hotkeys and the remote server, push actions here; the main
+	// loop dispatches them once per frame.
+	actions: action.Envelope_Queue
+	action.queue_init(&actions)
+	action_batch := make([dynamic]action.Envelope, 0, 16, actions.allocator)
+	defer action.queue_destroy(&actions, &action_batch)
+
+	// Owned; set by Set_Scene and repaired by app.ensure_active_scene.
+	active_scene_id: string
+	defer delete(active_scene_id)
+
+    ui_state := ui.init_state(APP_VERSION, &actions)
 	clear_color := im.Vec4{0.45, 0.55, 0.60, 1.00}
     defer ui.destroy(&ui_state)
 
@@ -388,11 +400,26 @@ main :: proc() {
 			app.handle_show_request(req, &ui_state.shows, &show_cfg, &app_cfg, &paths, &show_infos)
 		}
 
-		// Service a pending recording/streaming request.
-		if req := ui_state.controls.request; req != .None {
+		// Dispatch queued actions. Runs after the show request, so actions aimed
+		// at a show that was just switched away from fail with Not_Found.
+		{
 			pre_blocks := audio.mix_blocks_emitted()
-			app.handle_controls_request(req, &ui_state.controls, &output,
-				&paths, &preview_target, show_cfg.video.fps, show.ensure_output(&show_cfg)^, log_sink)
+			// Rebuilt each frame: a show switch replaces show_cfg.
+			dispatch_ctx := app.Dispatch_Context{
+				output          = &output,
+				paths           = &paths,
+				target          = &preview_target,
+				show_cfg        = &show_cfg,
+				active_scene_id = &active_scene_id,
+				log_sink        = log_sink,
+			}
+			action.queue_drain(&actions, &action_batch)
+			for &env in action_batch {
+				_ = app.dispatch_action(&env, &dispatch_ctx) // failures are logged by dispatch
+			}
+			action.queue_release(&actions, &action_batch)
+			app.ensure_active_scene(&active_scene_id, &show_cfg)
+
 			// Attaching a new encoder resets the block counter; reset diag snapshots to match.
 			if audio.mix_blocks_emitted() < pre_blocks {
 				audio_diag_last_blocks = 0
@@ -425,7 +452,7 @@ main :: proc() {
 		// Composite the scene into the offscreen target before ImGui's frame starts.
 		quads := make([dynamic]render.Quad, context.temp_allocator)
 		inputs := make([dynamic]audio.Mix_Input, context.temp_allocator)
-		show.service_show(&show_cfg, ui_state.scenes.selected_id, win.device, win.device_context, log_sink, &quads, &inputs)
+		show.service_show(&show_cfg, active_scene_id, win.device, win.device_context, log_sink, &quads, &inputs)
 		render.draw_scene(win.device_context, &preview_target, &pipeline, quads[:], scene_clear)
 
 		// -- Audio mixer --------------------------------------------------
@@ -502,6 +529,7 @@ main :: proc() {
         ui_state.controls.recording = output.recording
         ui_state.controls.streaming = output.streaming
         ui_state.controls.finalizing = output.finalizing_sink != nil
+        ui_state.scenes.active_id = active_scene_id
 
         ui.draw(&ui_state, &show_cfg, &clear_color, preview_tex, outputs, show_infos,
             f32(preview_target.width), f32(preview_target.height), audio_devices)

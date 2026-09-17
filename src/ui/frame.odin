@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:time"
 import im "libs:odin-imgui"
 
+import "../action"
 import "../show"
 
 // Fixed chrome around the dockspace: top bar, left sidebar, bottom status bar.
@@ -127,11 +128,11 @@ draw_sidebar :: proc(state: ^State, pos, size: im.Vec2) {
         // Streaming
         if c.streaming {
             if wide_button(fmt.ctprintf("%s  Stop Stream", ICON_TOWER_BROADCAST), DANGER, 0xf87171, button_h) {
-                c.request = .Stop_Streaming
+                push_action(state.actions, action.Action_Stop_Streaming{})
             }
         } else {
             if wide_button(fmt.ctprintf("%s  Go Live", ICON_TOWER_BROADCAST), PRIMARY, PRIMARY_DEEP, button_h) {
-                c.request = .Start_Streaming
+                push_action(state.actions, action.Action_Start_Streaming{})
             }
         }
 
@@ -142,11 +143,11 @@ draw_sidebar :: proc(state: ^State, pos, size: im.Vec2) {
             im.EndDisabled()
         } else if c.recording {
             if wide_button(fmt.ctprintf("%s  Stop Recording", ICON_STOP), SURFACE_HIGHEST, OUTLINE_VARIANT, button_h) {
-                c.request = .Stop_Recording
+                push_action(state.actions, action.Action_Stop_Recording{})
             }
         } else {
             if wide_button(fmt.ctprintf("%s  Start Recording", ICON_RECORD), SURFACE_HIGHEST, OUTLINE_VARIANT, button_h) {
-                c.request = .Start_Recording
+                push_action(state.actions, action.Action_Start_Recording{})
             }
         }
 
