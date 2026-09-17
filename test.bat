@@ -37,6 +37,14 @@ echo === mf ===
 odin test libs/mf %FLAGS%
 if errorlevel 1 set FAILED=1
 
+echo === remote ===
+odin test src/remote %FLAGS%
+if errorlevel 1 set FAILED=1
+
+echo === protocol ===
+odin test src/remote/protocol %FLAGS%
+if errorlevel 1 set FAILED=1
+
 echo === rtmp ===
 odin test src/rtmp %FLAGS%
 if errorlevel 1 set FAILED=1
